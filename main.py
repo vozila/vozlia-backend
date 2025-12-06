@@ -287,15 +287,8 @@ async def twilio_stream(websocket: WebSocket):
         openai_ws = await create_realtime_session()
 
         async def twilio_to_openai():
-            nonlocal (
-                stream_sid,
-                ai_speaking,
-                cancel_in_progress,
-                barge_in_enabled,
-                speech_active,
-                suppress_assistant_audio,
-                openai_ws,
-            )
+            nonlocal stream_sid, ai_speaking, cancel_in_progress, barge_in_enabled
+            nonlocal speech_active, suppress_assistant_audio, openai_ws
 
             while True:
                 try:
@@ -373,15 +366,8 @@ async def twilio_stream(websocket: WebSocket):
                     logger.info("Twilio reports call connected")
 
         async def openai_to_twilio():
-            nonlocal (
-                stream_sid,
-                ai_speaking,
-                cancel_in_progress,
-                barge_in_enabled,
-                speech_active,
-                suppress_assistant_audio,
-                openai_ws,
-            )
+            nonlocal stream_sid, ai_speaking, cancel_in_progress, barge_in_enabled
+            nonlocal speech_active, suppress_assistant_audio, openai_ws
 
             async for msg in openai_ws:
                 try:
