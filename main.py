@@ -19,6 +19,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vozlia")
 logger.setLevel(logging.INFO)
 
+# ---------- Constants ----------
+MIN_SPEECH_FRAMES = 40  # minimum frames (while VAD-active) to treat as a spoken turn
+
 # ---------- OpenAI config ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -128,7 +131,6 @@ async def twilio_inbound(request: Request):
 
     resp = VoiceResponse()
 
-    # Directly connect to media stream; let Coral/Vozlia greet the caller.
     connect = Connect()
     stream_url = os.getenv(
         "TWILIO_STREAM_URL",
@@ -190,7 +192,6 @@ async def create_realtime_session():
         extra_headers=OPENAI_REALTIME_HEADERS,
     )
 
-    # Session config
     session_update = {
         "type": "session.update",
         "session": {
@@ -199,7 +200,6 @@ async def create_realtime_session():
             "modalities": ["text", "audio"],
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
-            # Use server-side VAD for speech detection
             "turn_detection": {"type": "server_vad"},
         },
     }
@@ -207,7 +207,6 @@ async def create_realtime_session():
     await openai_ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime")
 
-    # Proactive greeting so the AI talks first
     await send_initial_greeting(openai_ws)
 
     return openai_ws
@@ -241,7 +240,7 @@ async def twilio_stream(websocket: WebSocket):
     # AI / call state
     ai_speaking = False
     cancel_in_progress = False
-    barge_in_enabled = False  # Only after first full response
+    barge_in_enabled = False  # only after first full AI response
 
     # Turn-taking state
     awaiting_user = False  # True when we expect the caller to speak next
@@ -249,21 +248,13 @@ async def twilio_stream(websocket: WebSocket):
     # VAD state (from OpenAI)
     speech_active = False
     speech_frame_count = 0
-    MIN_SPEECH_FRAMES = 40  # Rough threshold to treat as real speech turn
 
     try:
         openai_ws = await create_realtime_session()
 
         async def twilio_to_openai():
-            nonlocal (
-                stream_sid,
-                ai_speaking,
-                cancel_in_progress,
-                barge_in_enabled,
-                awaiting_user,
-                speech_active,
-                speech_frame_count,
-            )
+            nonlocal stream_sid, ai_speaking, cancel_in_progress, barge_in_enabled
+            nonlocal awaiting_user, speech_active, speech_frame_count
 
             while True:
                 try:
@@ -291,7 +282,6 @@ async def twilio_stream(websocket: WebSocket):
                         continue
 
                     # ----- BARGE-IN -----
-                    # After first AI response, allow user speech to cancel ongoing audio.
                     if barge_in_enabled and ai_speaking and not cancel_in_progress:
                         try:
                             await openai_ws.send(
@@ -300,7 +290,6 @@ async def twilio_stream(websocket: WebSocket):
                             cancel_in_progress = True
                             ai_speaking = False
 
-                            # After barge-in, we expect the user to speak a new turn.
                             awaiting_user = True
                             speech_active = False
                             speech_frame_count = 0
@@ -327,15 +316,8 @@ async def twilio_stream(websocket: WebSocket):
                     break
 
         async def openai_to_twilio():
-            nonlocal (
-                stream_sid,
-                ai_speaking,
-                cancel_in_progress,
-                barge_in_enabled,
-                awaiting_user,
-                speech_active,
-                speech_frame_count,
-            )
+            nonlocal stream_sid, ai_speaking, cancel_in_progress, barge_in_enabled
+            nonlocal awaiting_user, speech_active, speech_frame_count
 
             async for msg in openai_ws:
                 try:
@@ -361,7 +343,6 @@ async def twilio_stream(websocket: WebSocket):
                         )
                         continue
 
-                    # Round-trip base64 (as in Twilio examples)
                     try:
                         raw_bytes = base64.b64decode(audio_chunk_b64)
                         audio_payload = base64.b64encode(raw_bytes).decode("utf-8")
@@ -371,9 +352,7 @@ async def twilio_stream(websocket: WebSocket):
                     twilio_msg = {
                         "event": "media",
                         "streamSid": stream_sid,
-                        "media": {
-                            "payload": audio_payload,
-                        },
+                        "media": {"payload": audio_payload},
                     }
                     await websocket.send_text(json.dumps(twilio_msg))
 
@@ -382,12 +361,10 @@ async def twilio_stream(websocket: WebSocket):
                     ai_speaking = False
                     cancel_in_progress = False
 
-                    # After the first full response is done, enable barge-in
                     if not barge_in_enabled:
                         barge_in_enabled = True
                         logger.info("Barge-in is now ENABLED for subsequent responses.")
 
-                    # Now we expect the caller to speak
                     awaiting_user = True
                     speech_active = False
                     speech_frame_count = 0
@@ -403,7 +380,7 @@ async def twilio_stream(websocket: WebSocket):
                     if text:
                         logger.info(f"AI full text response: {text}")
 
-                # ----- VAD EVENTS (server-side speech detection) -----
+                # ----- VAD EVENTS -----
                 elif etype == "input_audio_buffer.speech_started":
                     logger.info("OpenAI detected speech START in input buffer")
                     speech_active = True
@@ -412,10 +389,6 @@ async def twilio_stream(websocket: WebSocket):
                 elif etype == "input_audio_buffer.speech_stopped":
                     logger.info("OpenAI detected speech STOP in input buffer")
 
-                    # Only treat this as a user turn if:
-                    #  - we were actually expecting user speech (awaiting_user)
-                    #  - speech was active
-                    #  - we saw enough frames to consider it real speech
                     if (
                         awaiting_user
                         and speech_active
@@ -438,22 +411,16 @@ async def twilio_stream(websocket: WebSocket):
                         finally:
                             awaiting_user = False
 
-                    # Reset VAD state
                     speech_active = False
                     speech_frame_count = 0
 
                 # ----- ERROR EVENTS -----
                 elif etype == "error":
                     logger.error(f"OpenAI error event: {event}")
-                    # response_cancel_not_active or similar are usually harmless
-                    # We'll just log them and keep the stream running.
+                    # Often benign (e.g. response_cancel_not_active) — keep stream alive
                     continue
 
-                # Optional: log other event types for debugging
-                else:
-                    # Uncomment for very verbose logging:
-                    # logger.debug(f"Unhandled OpenAI event type: {etype}")
-                    pass
+                # Other event types ignored or logged if you want extra verbosity.
 
         await asyncio.gather(
             twilio_to_openai(),
