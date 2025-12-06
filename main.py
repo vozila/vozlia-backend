@@ -1,5 +1,3 @@
-# main.py
-
 import os
 import json
 import asyncio
@@ -18,10 +16,6 @@ import websockets
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vozlia")
 logger.setLevel(logging.INFO)
-
-# ---------- Constants ----------
-# We used to use MIN_SPEECH_FRAMES for manual VAD; no longer needed
-# MIN_SPEECH_FRAMES = 40
 
 # ---------- OpenAI config ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -75,6 +69,46 @@ SYSTEM_PROMPT = (
     "Pause briefly to let callers speak, and be attentive to interruptions. "
     "Your goal is to make callers feel welcome, understood, and supported."
 )
+
+# ---------- Barge-in audio level threshold ----------
+# If barge-in feels too "hard" to trigger, LOWER this number.
+# If it triggers too often on background noise, RAISE it.
+BARGE_LEVEL_THRESHOLD = int(os.getenv("BARGE_LEVEL_THRESHOLD", "8000"))
+
+
+def mulaw_to_linear(sample: int) -> int:
+    """
+    Convert a single 8-bit μ-law sample to 16-bit-ish linear PCM.
+    This is approximate but good enough for amplitude detection.
+    """
+    sample = ~sample & 0xFF
+    sign = sample & 0x80
+    exponent = (sample >> 4) & 0x07
+    mantissa = sample & 0x0F
+    magnitude = ((mantissa << 3) + 0x84) << exponent
+    return -magnitude if sign else magnitude
+
+
+def estimate_level_from_mulaw(raw: bytes) -> float:
+    """
+    Estimate average absolute amplitude from μ-law bytes.
+    We subsample to keep it cheap.
+    """
+    if not raw:
+        return 0.0
+
+    total = 0
+    # Use at most ~80 samples per frame to keep it light
+    step = max(1, len(raw) // 80)
+    count = 0
+
+    for i in range(0, len(raw), step):
+        s = mulaw_to_linear(raw[i])
+        total += abs(s)
+        count += 1
+
+    return total / max(1, count)
+
 
 # ---------- FastAPI app ----------
 app = FastAPI()
@@ -201,8 +235,10 @@ async def create_realtime_session():
             "modalities": ["text", "audio"],
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
-            # Keep server VAD, but we will NOT manually commit / create responses.
-            "turn_detection": {"type": "server_vad"},
+            # Keep server VAD for turn-taking, but we don't manually commit.
+            "turn_detection": {
+                "type": "server_vad",
+            },
         },
     }
 
@@ -225,11 +261,10 @@ async def twilio_stream(websocket: WebSocket):
       * Open a second WebSocket to OpenAI Realtime.
       * Forward Twilio audio → OpenAI.
       * Forward OpenAI audio → Twilio.
-      * Use OpenAI server VAD only as a signal that the user is speaking (for barge-in),
-        but we do NOT manually commit audio or create responses.
-      * Implement barge-in:
-           - If the user speaks (per VAD) while AI is talking, send response.cancel
-             ONCE per response, then let the model handle the new user audio.
+      * Use Twilio audio amplitude (plus Realtime state) for barge-in:
+           - If the user speaks loudly enough while AI is talking,
+             send response.cancel ONCE and locally mute assistant audio so
+             the caller stops hearing the current response.
     """
     await websocket.accept()
     logger.info("Twilio media stream connected")
@@ -242,15 +277,25 @@ async def twilio_stream(websocket: WebSocket):
     cancel_in_progress = False
     barge_in_enabled = False  # only after first full AI response
 
-    # VAD-based user speaking flag.
+    # We still track VAD events for logging, but barge-in uses amplitude
     speech_active = False
+
+    # Local mute for assistant audio during barge-in
+    suppress_assistant_audio = False
 
     try:
         openai_ws = await create_realtime_session()
 
         async def twilio_to_openai():
-            nonlocal stream_sid, ai_speaking, cancel_in_progress, barge_in_enabled
-            nonlocal speech_active
+            nonlocal (
+                stream_sid,
+                ai_speaking,
+                cancel_in_progress,
+                barge_in_enabled,
+                speech_active,
+                suppress_assistant_audio,
+                openai_ws,
+            )
 
             while True:
                 try:
@@ -267,7 +312,6 @@ async def twilio_stream(websocket: WebSocket):
 
                 event_type = data.get("event")
 
-                # This was very noisy in logs; downgrade to debug for 'media'
                 if event_type != "media":
                     logger.info(f"Twilio stream event: {event_type}")
                 else:
@@ -282,15 +326,20 @@ async def twilio_stream(websocket: WebSocket):
                     if not payload_b64:
                         continue
 
-                    # ----- BARGE-IN -----
-                    # Only treat as barge-in if:
-                    #   - barge-in is enabled (after first response),
-                    #   - AI is currently speaking,
-                    #   - AND OpenAI's VAD says the user is actually speaking.
+                    # Estimate loudness of this frame (user speech vs silence/mute)
+                    try:
+                        raw_bytes = base64.b64decode(payload_b64)
+                    except Exception:
+                        raw_bytes = b""
+
+                    level = estimate_level_from_mulaw(raw_bytes)
+                    is_speaking = level >= BARGE_LEVEL_THRESHOLD
+
+                    # ----- BARGE-IN (amplitude based) -----
                     if (
                         barge_in_enabled
                         and ai_speaking
-                        and speech_active
+                        and is_speaking
                         and not cancel_in_progress
                     ):
                         try:
@@ -299,14 +348,17 @@ async def twilio_stream(websocket: WebSocket):
                             )
                             cancel_in_progress = True
                             ai_speaking = False
+                            suppress_assistant_audio = True  # HARD MUTE locally
+
                             logger.info(
-                                "BARGE-IN: user speech detected (via VAD), "
-                                "sent response.cancel to OpenAI"
+                                f"BARGE-IN: loud user audio detected "
+                                f"(level={level:.0f} >= {BARGE_LEVEL_THRESHOLD}), "
+                                "sent response.cancel and suppressed assistant audio"
                             )
                         except Exception as e:
                             logger.error(f"Error sending response.cancel: {e}")
 
-                    # Always forward raw μ-law audio to OpenAI
+                    # Always forward the μ-law audio to OpenAI
                     audio_event = {
                         "type": "input_audio_buffer.append",
                         "audio": payload_b64,
@@ -318,12 +370,18 @@ async def twilio_stream(websocket: WebSocket):
                     break
 
                 elif event_type == "connected":
-                    # Optional: Twilio 'connected' event
                     logger.info("Twilio reports call connected")
 
         async def openai_to_twilio():
-            nonlocal stream_sid, ai_speaking, cancel_in_progress, barge_in_enabled
-            nonlocal speech_active
+            nonlocal (
+                stream_sid,
+                ai_speaking,
+                cancel_in_progress,
+                barge_in_enabled,
+                speech_active,
+                suppress_assistant_audio,
+                openai_ws,
+            )
 
             async for msg in openai_ws:
                 try:
@@ -341,8 +399,13 @@ async def twilio_stream(websocket: WebSocket):
                         continue
 
                     ai_speaking = True
-                    # Do NOT reset cancel_in_progress here; we only clear it
-                    # after the response is done or an error indicates no active response.
+
+                    # If we are in barge-in mode for this response, don't send audio
+                    if suppress_assistant_audio:
+                        logger.debug(
+                            "Suppressing assistant audio delta due to active barge-in"
+                        )
+                        continue
 
                     if not stream_sid:
                         logger.warning(
@@ -350,6 +413,7 @@ async def twilio_stream(websocket: WebSocket):
                         )
                         continue
 
+                    # Just normalize to base64 -> base64 in case OpenAI changes encoding
                     try:
                         raw_bytes = base64.b64decode(audio_chunk_b64)
                         audio_payload = base64.b64encode(raw_bytes).decode("utf-8")
@@ -366,8 +430,8 @@ async def twilio_stream(websocket: WebSocket):
                 elif etype == "response.audio.done":
                     logger.info("OpenAI finished an audio response")
                     ai_speaking = False
-                    # Once the response is done, we can allow a new barge-in next time
                     cancel_in_progress = False
+                    suppress_assistant_audio = False  # allow next response to play
 
                     if not barge_in_enabled:
                         barge_in_enabled = True
@@ -384,7 +448,7 @@ async def twilio_stream(websocket: WebSocket):
                     if text:
                         logger.info(f"AI full text response: {text}")
 
-                # ----- VAD EVENTS (used ONLY as barge-in signal) -----
+                # ----- VAD EVENTS (logging only now) -----
                 elif etype == "input_audio_buffer.speech_started":
                     logger.info("OpenAI detected speech START in input buffer")
                     speech_active = True
@@ -392,8 +456,6 @@ async def twilio_stream(websocket: WebSocket):
                 elif etype == "input_audio_buffer.speech_stopped":
                     logger.info("OpenAI detected speech STOP in input buffer")
                     speech_active = False
-                    # IMPORTANT: we do NOT call input_audio_buffer.commit or response.create here.
-                    # We let server_vad manage user turns automatically.
 
                 # ----- ERROR EVENTS -----
                 elif etype == "error":
@@ -402,13 +464,10 @@ async def twilio_stream(websocket: WebSocket):
                     code = err.get("code")
 
                     # If we get response_cancel_not_active, there's no active response,
-                    # so we can safely clear cancel_in_progress.
+                    # so we can safely clear cancel_in_progress and mute flag.
                     if code == "response_cancel_not_active":
                         cancel_in_progress = False
-
-                    # If we get conversation_already_has_active_response, it likely came
-                    # from too many response.create calls; we no longer do that,
-                    # so this should go away in practice.
+                        suppress_assistant_audio = False
 
                 # Other event types ignored or logged if needed.
 
