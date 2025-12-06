@@ -2,5 +2,6 @@ fastapi
 uvicorn[standard]
 twilio
 python-multipart
-openai
-
+openai>=1.0.0
+websockets
+httpx
