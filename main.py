@@ -1,53 +1,16 @@
 # main.py
-# main.py
 
-from fastapi import FastAPI, Form
+import json
+import logging
+
+from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, JSONResponse
 
+# Basic logging setup so you can see stream events in Render logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vozlia")
+
 app = FastAPI()
-
-
-def generate_ai_reply(speech: str, from_number: str = "", to_number: str = "") -> str:
-    """
-    Placeholder AI logic for Vozlia.
-
-    Right now this is simple rule-based behavior so you can test the flow end-to-end.
-    Later, you'll replace this with a real LLM call (OpenAI, etc.).
-    """
-
-    if not speech:
-        return (
-            "I didn't quite catch that. "
-            "In the future, I will be able to help you with scheduling, messages, and other tasks."
-        )
-
-    # Very basic intent-feel behavior
-    lower_speech = speech.lower()
-
-    if "appointment" in lower_speech or "schedule" in lower_speech:
-        return (
-            "It sounds like you want to schedule something. "
-            "In the production version, I will check your calendar and suggest available times."
-        )
-
-    if "message" in lower_speech or "tell" in lower_speech:
-        return (
-            "You want to leave a message. "
-            "In the future, I will record this for the subscriber and send them a summary by text."
-        )
-
-    if "who is this" in lower_speech or "what is this" in lower_speech:
-        return (
-            "I am the Vozlia voice assistant, here to screen calls, take messages, "
-            "and help with personal and business tasks 24 hours a day."
-        )
-
-    # Default generic helpful reply
-    return (
-        f"You said: {speech}. "
-        "Thank you for calling the Vozlia assistant. "
-        "Soon I will be able to act on this, like booking appointments or sending messages."
-    )
 
 
 @app.get("/")
@@ -74,41 +37,81 @@ async def twilio_inbound(
     CallSid: str = Form(default="")
 ):
     """
-    First endpoint Twilio calls when someone dials your number.
-    Greets the caller and starts collecting speech using <Gather>.
-
-    After the caller speaks, Twilio will POST the transcript to /twilio/continue.
+    Twilio hits this when a call comes in.
+    We greet the caller, then hand off the audio stream to /twilio/stream
+    using <Connect><Stream>.
     """
 
-    # IMPORTANT: Twilio needs a full absolute URL here for the action
-    action_url = "https://vozlia-backend.onrender.com/twilio/continue"
+    logger.info(f"Incoming call: From={From}, To={To}, CallSid={CallSid}")
+
+    # IMPORTANT: Twilio requires a wss:// URL for streaming
+    stream_url = "wss://vozlia-backend.onrender.com/twilio/stream"
 
     twiml = f"""
     <Response>
         <Say voice="alice">
-            Hi, this is your Vozlia A I assistant. How can I help you today?
+            Hi, this is your Vozlia A I assistant. I am connecting our secure audio stream now.
         </Say>
-
-        <Gather input="speech" action="{action_url}" method="POST" timeout="5">
-            <Say voice="alice">
-                Please tell me how I can assist you, then pause for a moment.
-            </Say>
-        </Gather>
-
-        <!-- Fallback if no speech was detected -->
-        <Say voice="alice">
-            I did not hear anything. Please call again when you're ready.
-        </Say>
-        <Hangup/>
+        <Connect>
+            <Stream url="{stream_url}" />
+        </Connect>
     </Response>
     """
 
     return Response(content=twiml.strip(), media_type="application/xml")
 
 
-@app.post("/twilio/continue")
-async def twilio_continue(
-    SpeechResult: str = Form(default=""),
-    Fro
-::contentReference[oaicite:0]{index=0}
-0.0.0.0", port=8000, reload=True)
+@app.websocket("/twilio/stream")
+async def twilio_stream(ws: WebSocket):
+    """
+    WebSocket endpoint for Twilio Media Streams.
+
+    Twilio will send JSON messages like:
+      - event: "start"
+      - event: "media"  (with base64-encoded audio payload)
+      - event: "stop"
+
+    For now, we just accept the stream and log the events.
+    Later, this is where you'll bridge audio to/from OpenAI Realtime.
+    """
+
+    await ws.accept()
+    logger.info("Twilio stream connected")
+
+    try:
+        while True:
+            # Twilio sends JSON text frames
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+
+            event_type = msg.get("event", "unknown")
+            logger.info(f"Twilio stream event: {event_type}")
+
+            if event_type == "start":
+                logger.info(f"Stream start: {msg}")
+            elif event_type == "media":
+                # This contains audio in base64 at msg["media"]["payload"]
+                # We won't decode yet; just log that we received media
+                # payload_len = len(msg.get("media", {}).get("payload", ""))
+                # logger.info(f"Media frame received, payload length={payload_len}")
+                pass
+            elif event_type == "stop":
+                logger.info("Stream stop event received. Closing WebSocket.")
+                break
+
+            # OPTIONAL: you could send marks or other messages back to Twilio if needed.
+            # For now, we don't send anything back.
+
+    except WebSocketDisconnect:
+        logger.info("Twilio WebSocket disconnected")
+    except Exception as e:
+        logger.exception(f"Error in Twilio stream: {e}")
+    finally:
+        await ws.close()
+        logger.info("Twilio stream closed")
+
+
+# Optional: Local dev entrypoint for running `python main.py`
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
