@@ -2,17 +2,61 @@
 
 import json
 import logging
+import os
 
-from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import Response, JSONResponse
 
-# Basic logging setup so you can see stream events in Render logs
+from openai import OpenAI
+
+# ========= Logging Setup =========
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vozlia")
+
+# ========= OpenAI Client =========
+# Requires OPENAI_API_KEY in your environment (e.g. in Render)
+client = OpenAI()
 
 app = FastAPI()
 
 
+# ========= GPT Helper =========
+def generate_gpt_reply(user_text: str) -> str:
+    """
+    Call GPT from the Vozlia backend.
+    This is a simple one-shot chat completion for now.
+
+    Later, you can upgrade this to:
+      - keep conversation context
+      - use tools
+      - use different models per use case
+    """
+    if not user_text:
+        return "I didn't receive any text to respond to."
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Or gpt-4o, etc., depending on your access
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Vozlia, a friendly but efficient AI voice assistant. "
+                        "You answer as if you're speaking on a phone call: natural, concise, and helpful."
+                    ),
+                },
+                {"role": "user", "content": user_text},
+            ],
+        )
+
+        return response.choices[0].message.content
+
+    except Exception as e:
+        logger.exception(f"Error calling OpenAI: {e}")
+        return "I'm having trouble connecting to my brain right now. Please try again later."
+
+
+# ========= Basic Endpoints =========
 @app.get("/")
 async def root():
     """
@@ -30,6 +74,25 @@ async def health():
     return {"status": "ok"}
 
 
+# ========= Debug GPT Endpoint =========
+@app.post("/debug/gpt")
+async def debug_gpt(payload: dict = Body(...)):
+    """
+    Simple debugging endpoint to check GPT connectivity from the backend.
+
+    Example curl:
+    curl -X POST https://vozlia-backend.onrender.com/debug/gpt \
+      -H "Content-Type: application/json" \
+      -d '{"text": "Hi Vozlia, what can you do?"}'
+    """
+    user_text = payload.get("text", "")
+    logger.info(f"/debug/gpt called with text: {user_text!r}")
+
+    reply = generate_gpt_reply(user_text)
+    return {"reply": reply}
+
+
+# ========= Twilio Voice Webhook =========
 @app.post("/twilio/inbound")
 async def twilio_inbound(
     From: str = Form(default=""),
@@ -45,6 +108,7 @@ async def twilio_inbound(
     logger.info(f"Incoming call: From={From}, To={To}, CallSid={CallSid}")
 
     # IMPORTANT: Twilio requires a wss:// URL for streaming
+    # This must match your Render HTTPS domain, with wss:// instead of https://
     stream_url = "wss://vozlia-backend.onrender.com/twilio/stream"
 
     twiml = f"""
@@ -61,6 +125,7 @@ async def twilio_inbound(
     return Response(content=twiml.strip(), media_type="application/xml")
 
 
+# ========= Twilio Media Stream WebSocket =========
 @app.websocket("/twilio/stream")
 async def twilio_stream(ws: WebSocket):
     """
@@ -71,7 +136,9 @@ async def twilio_stream(ws: WebSocket):
       - event: "media"  (with base64-encoded audio payload)
       - event: "stop"
 
-    For now, we just accept the stream and log the events.
+    For now, we:
+      - accept the stream
+      - log the events
     Later, this is where you'll bridge audio to/from OpenAI Realtime.
     """
 
@@ -89,18 +156,20 @@ async def twilio_stream(ws: WebSocket):
 
             if event_type == "start":
                 logger.info(f"Stream start: {msg}")
+
             elif event_type == "media":
                 # This contains audio in base64 at msg["media"]["payload"]
-                # We won't decode yet; just log that we received media
-                # payload_len = len(msg.get("media", {}).get("payload", ""))
-                # logger.info(f"Media frame received, payload length={payload_len}")
+                payload = msg.get("media", {}).get("payload", "")
+                # Optional: log payload length so you can see traffic volume
+                # logger.info(f"Media frame received, payload length={len(payload)}")
                 pass
+
             elif event_type == "stop":
                 logger.info("Stream stop event received. Closing WebSocket.")
                 break
 
-            # OPTIONAL: you could send marks or other messages back to Twilio if needed.
-            # For now, we don't send anything back.
+            # OPTIONAL: you can send messages back to Twilio here (marks, etc.)
+            # For now, we do not send anything.
 
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket disconnected")
@@ -111,7 +180,7 @@ async def twilio_stream(ws: WebSocket):
         logger.info("Twilio stream closed")
 
 
-# Optional: Local dev entrypoint for running `python main.py`
+# ========= Local Dev Entrypoint =========
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
