@@ -37,8 +37,8 @@ OPENAI_REALTIME_HEADERS = {
     "OpenAI-Beta": "realtime=v1",
 }
 
-# Use Sky voice via env var: OPENAI_REALTIME_VOICE=sky
-VOICE_NAME = os.getenv("OPENAI_REALTIME_VOICE", "sky")
+# Use Coral voice via env var: OPENAI_REALTIME_VOICE=sky
+VOICE_NAME = os.getenv("OPENAI_REALTIME_VOICE", "coral")
 
 SYSTEM_PROMPT = (
     "You are Vozlia, a warm, friendly, highly capable AI phone assistant with the Sky "
