@@ -1,9 +1,53 @@
 # main.py
+# main.py
 
 from fastapi import FastAPI, Form
 from fastapi.responses import Response, JSONResponse
 
 app = FastAPI()
+
+
+def generate_ai_reply(speech: str, from_number: str = "", to_number: str = "") -> str:
+    """
+    Placeholder AI logic for Vozlia.
+
+    Right now this is simple rule-based behavior so you can test the flow end-to-end.
+    Later, you'll replace this with a real LLM call (OpenAI, etc.).
+    """
+
+    if not speech:
+        return (
+            "I didn't quite catch that. "
+            "In the future, I will be able to help you with scheduling, messages, and other tasks."
+        )
+
+    # Very basic intent-feel behavior
+    lower_speech = speech.lower()
+
+    if "appointment" in lower_speech or "schedule" in lower_speech:
+        return (
+            "It sounds like you want to schedule something. "
+            "In the production version, I will check your calendar and suggest available times."
+        )
+
+    if "message" in lower_speech or "tell" in lower_speech:
+        return (
+            "You want to leave a message. "
+            "In the future, I will record this for the subscriber and send them a summary by text."
+        )
+
+    if "who is this" in lower_speech or "what is this" in lower_speech:
+        return (
+            "I am the Vozlia voice assistant, here to screen calls, take messages, "
+            "and help with personal and business tasks 24 hours a day."
+        )
+
+    # Default generic helpful reply
+    return (
+        f"You said: {speech}. "
+        "Thank you for calling the Vozlia assistant. "
+        "Soon I will be able to act on this, like booking appointments or sending messages."
+    )
 
 
 @app.get("/")
@@ -31,11 +75,12 @@ async def twilio_inbound(
 ):
     """
     First endpoint Twilio calls when someone dials your number.
-    Greet the caller and start collecting speech using <Gather>.
+    Greets the caller and starts collecting speech using <Gather>.
+
     After the caller speaks, Twilio will POST the transcript to /twilio/continue.
     """
 
-    # IMPORTANT: Twilio needs a full absolute URL here.
+    # IMPORTANT: Twilio needs a full absolute URL here for the action
     action_url = "https://vozlia-backend.onrender.com/twilio/continue"
 
     twiml = f"""
@@ -64,32 +109,6 @@ async def twilio_inbound(
 @app.post("/twilio/continue")
 async def twilio_continue(
     SpeechResult: str = Form(default=""),
-    From: str = Form(default=""),
-    To: str = Form(default=""),
-    CallSid: str = Form(default="")
-):
-    """
-    Twilio posts the transcribed speech here after the user talks.
-    For now, we simply repeat back what the caller said.
-    Later, this is where your real AI logic will live.
-    """
-
-    if SpeechResult:
-        reply_text = f"You said: {SpeechResult}. Thanks for speaking with the Vozlia assistant."
-    else:
-        reply_text = "I did not catch that. Let's try again another time."
-
-    twiml = f"""
-    <Response>
-        <Say voice="alice">{reply_text}</Say>
-        <Hangup/>
-    </Response>
-    """
-
-    return Response(content=twiml.strip(), media_type="application/xml")
-
-
-# Optional: Local dev entrypoint for running `python main.py`
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    Fro
+::contentReference[oaicite:0]{index=0}
+0.0.0.0", port=8000, reload=True)
