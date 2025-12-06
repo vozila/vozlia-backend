@@ -4,6 +4,7 @@ import os
 import json
 import asyncio
 import logging
+import base64
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import PlainTextResponse, Response, JSONResponse
@@ -27,7 +28,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 OPENAI_REALTIME_MODEL = os.getenv(
     "OPENAI_REALTIME_MODEL",
-    "gpt-4o-mini-realtime-preview-2024-12-17",  # adjust to your model
+    "gpt-4o-mini-realtime-preview-2024-12-17",  # adjust if needed
 )
 OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
@@ -101,6 +102,7 @@ async def twilio_inbound(request: Request):
 
     resp = VoiceResponse()
 
+    # Twilio handles this greeting using its own TTS
     resp.say(
         "Hi, this is your Vozlia A.I. assistant. "
         "Please hold for a moment while I connect you.",
@@ -120,6 +122,35 @@ async def twilio_inbound(request: Request):
     logger.debug(f"Generated TwiML:\n{xml}")
 
     return Response(content=xml, media_type="application/xml")
+
+
+# ---------- Helper: initial greeting via Realtime ----------
+async def send_initial_greeting(openai_ws):
+    """
+    Ask the model to greet the caller once the audio bridge is ready.
+    """
+    try:
+        convo_item = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Greet the caller as Vozlia, a friendly AI phone assistant. "
+                            "Briefly introduce yourself and invite them to say what they need help with."
+                        ),
+                    }
+                ],
+            },
+        }
+        await openai_ws.send(json.dumps(convo_item))
+        await openai_ws.send(json.dumps({"type": "response.create"}))
+        logger.info("Sent initial greeting request to OpenAI Realtime")
+    except Exception as e:
+        logger.error(f"Error sending initial greeting: {e}")
 
 
 # ---------- Helper: OpenAI Realtime session via websockets ----------
@@ -154,6 +185,9 @@ async def create_realtime_session():
     await openai_ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime")
 
+    # Proactive greeting so the AI talks first
+    await send_initial_greeting(openai_ws)
+
     return openai_ws
 
 
@@ -173,11 +207,14 @@ async def twilio_stream(websocket: WebSocket):
     logger.info("Twilio media stream connected")
 
     openai_ws = None
+    stream_sid = None  # Twilio stream ID needed for outbound audio
 
     try:
         openai_ws = await create_realtime_session()
 
         async def twilio_to_openai():
+            nonlocal stream_sid
+
             while True:
                 try:
                     msg_text = await websocket.receive_text()
@@ -203,6 +240,7 @@ async def twilio_stream(websocket: WebSocket):
                     if not payload_b64:
                         continue
 
+                    # Forward raw μ-law audio to OpenAI
                     audio_event = {
                         "type": "input_audio_buffer.append",
                         "audio": payload_b64,
@@ -211,17 +249,12 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif event_type == "stop":
                     logger.info("Twilio sent stop; closing call.")
-                    try:
-                        await openai_ws.send(
-                            json.dumps({"type": "input_audio_buffer.commit"})
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Error sending commit to OpenAI on stop: {e}"
-                        )
+                    # In server_vad mode we do NOT manually commit buffer.
                     break
 
         async def openai_to_twilio():
+            nonlocal stream_sid
+
             async for msg in openai_ws:
                 try:
                     event = json.loads(msg)
@@ -236,10 +269,26 @@ async def twilio_stream(websocket: WebSocket):
                     if not audio_chunk_b64:
                         continue
 
+                    # Make sure we have the stream SID before sending
+                    if not stream_sid:
+                        logger.warning(
+                            "Got audio from OpenAI but stream_sid is not set yet."
+                        )
+                        continue
+
+                    # Round-trip the base64 like in Twilio's working examples
+                    try:
+                        raw_bytes = base64.b64decode(audio_chunk_b64)
+                        audio_payload = base64.b64encode(raw_bytes).decode("utf-8")
+                    except Exception:
+                        # Fallback: if anything weird happens, just pass through
+                        audio_payload = audio_chunk_b64
+
                     twilio_msg = {
                         "event": "media",
+                        "streamSid": stream_sid,
                         "media": {
-                            "payload": audio_chunk_b64,
+                            "payload": audio_payload,
                         },
                     }
                     await websocket.send_text(json.dumps(twilio_msg))
@@ -259,6 +308,8 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif etype == "error":
                     logger.error(f"OpenAI error event: {event}")
+                    # Don’t necessarily break the whole loop on soft errors,
+                    # but for now we log and break so it’s obvious.
                     break
 
         await asyncio.gather(
