@@ -37,13 +37,18 @@ OPENAI_REALTIME_HEADERS = {
     "OpenAI-Beta": "realtime=v1",
 }
 
-VOICE_NAME = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
+# Use Sky voice via env var: OPENAI_REALTIME_VOICE=sky
+VOICE_NAME = os.getenv("OPENAI_REALTIME_VOICE", "sky")
 
 SYSTEM_PROMPT = (
-    "You are Vozlia, a friendly, efficient AI phone assistant. "
-    "You are talking to callers over a standard phone line. "
-    "Keep your answers concise, clear, and conversational. "
-    "You can ask clarifying questions, but avoid long monologues."
+    "You are Vozlia, a warm, friendly, highly capable AI phone assistant with the Sky "
+    "voice persona. Speak naturally, confidently, and in a professional tone, similar "
+    "to a helpful customer support agent. "
+    "You greet callers immediately at the start of the call, introduce yourself as "
+    "Vozlia, and invite them to describe what they need help with. "
+    "Keep your responses concise but conversational. Avoid long monologues. "
+    "Pause briefly to let callers speak, and be attentive to interruptions. "
+    "Your goal is to make callers feel welcome, understood, and supported."
 )
 
 # ---------- FastAPI app ----------
@@ -102,14 +107,8 @@ async def twilio_inbound(request: Request):
 
     resp = VoiceResponse()
 
-    # Twilio handles this greeting using its own TTS
-    resp.say(
-        "Hi, this is your Vozlia A.I. assistant. "
-        "Please hold for a moment while I connect you.",
-        voice="alice",
-        language="en-US",
-    )
-
+    # No Twilio TTS here — connect directly to media stream,
+    # let Sky/Vozlia handle the greeting.
     connect = Connect()
     stream_url = os.getenv(
         "TWILIO_STREAM_URL",
@@ -139,7 +138,7 @@ async def send_initial_greeting(openai_ws):
                     {
                         "type": "input_text",
                         "text": (
-                            "Greet the caller as Vozlia, a friendly AI phone assistant. "
+                            "Greet the caller as Vozlia, a friendly AI phone assistant with the Sky voice. "
                             "Briefly introduce yourself and invite them to say what they need help with."
                         ),
                     }
@@ -191,7 +190,7 @@ async def create_realtime_session():
     return openai_ws
 
 
-# ---------- Twilio media stream ↔ OpenAI Realtime (with barge-in) ----------
+# ---------- Twilio media stream ↔ OpenAI Realtime (with smarter barge-in) ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
     """
@@ -202,22 +201,24 @@ async def twilio_stream(websocket: WebSocket):
       * Open a second WebSocket to OpenAI Realtime.
       * Forward Twilio audio → OpenAI.
       * Forward OpenAI audio → Twilio.
-      * Support barge-in: if the user speaks while AI is speaking,
-        we cancel the current AI response.
+      * Support barge-in AFTER the first response: if the user speaks while AI is
+        speaking, we cancel the current AI response.
     """
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
     openai_ws = None
     stream_sid = None  # Twilio stream ID needed for outbound audio
+
     ai_speaking = False
-    cancel_in_progress = False  # avoid spamming cancel
+    cancel_in_progress = False
+    barge_in_enabled = False  # Only enabled after the first full response
 
     try:
         openai_ws = await create_realtime_session()
 
         async def twilio_to_openai():
-            nonlocal stream_sid, ai_speaking, cancel_in_progress
+            nonlocal stream_sid, ai_speaking, cancel_in_progress, barge_in_enabled
 
             while True:
                 try:
@@ -245,8 +246,8 @@ async def twilio_stream(websocket: WebSocket):
                         continue
 
                     # --- BARGE-IN LOGIC ---
-                    if ai_speaking and not cancel_in_progress:
-                        # User is talking while AI is talking -> cancel current response
+                    # Only allow barge-in after the first full response
+                    if barge_in_enabled and ai_speaking and not cancel_in_progress:
                         try:
                             cancel_evt = {"type": "response.cancel"}
                             await openai_ws.send(json.dumps(cancel_evt))
@@ -269,7 +270,7 @@ async def twilio_stream(websocket: WebSocket):
                     break
 
         async def openai_to_twilio():
-            nonlocal stream_sid, ai_speaking, cancel_in_progress
+            nonlocal stream_sid, ai_speaking, cancel_in_progress, barge_in_enabled
 
             async for msg in openai_ws:
                 try:
@@ -286,7 +287,7 @@ async def twilio_stream(websocket: WebSocket):
                         continue
 
                     ai_speaking = True
-                    cancel_in_progress = False  # if we were cancelling, new audio = new turn
+                    cancel_in_progress = False  # new audio = new turn if we were cancelling
 
                     if not stream_sid:
                         logger.warning(
@@ -315,6 +316,11 @@ async def twilio_stream(websocket: WebSocket):
                     ai_speaking = False
                     cancel_in_progress = False
 
+                    # After the first full response is done, enable barge-in
+                    if not barge_in_enabled:
+                        barge_in_enabled = True
+                        logger.info("Barge-in is now ENABLED for subsequent responses.")
+
                 elif etype == "response.text.delta":
                     delta = event.get("delta", "")
                     if delta:
@@ -327,6 +333,8 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif etype == "error":
                     logger.error(f"OpenAI error event: {event}")
+                    # 'response_cancel_not_active' is harmless; we just log it.
+                    # You can choose not to break here if you want to be more tolerant.
                     break
 
         await asyncio.gather(
