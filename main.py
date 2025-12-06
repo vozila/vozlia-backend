@@ -11,7 +11,7 @@ from fastapi.responses import PlainTextResponse, Response, JSONResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect
 
 from openai import OpenAI
-import httpx
+import websockets
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -27,11 +27,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 OPENAI_REALTIME_MODEL = os.getenv(
     "OPENAI_REALTIME_MODEL",
-    "gpt-4o-mini-realtime-preview-2024-12-17",  # adjust if needed
+    "gpt-4o-mini-realtime-preview-2024-12-17",  # adjust to whatever model you have access to
 )
-OPENAI_REALTIME_URL = (
-    f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
-)
+OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
 OPENAI_REALTIME_HEADERS = {
     "Authorization": f"Bearer {OPENAI_API_KEY}" if OPENAI_API_KEY else "",
@@ -124,25 +122,20 @@ async def twilio_inbound(request: Request):
     return Response(content=xml, media_type="application/xml")
 
 
-# ---------- Helper: OpenAI Realtime session via httpx websockets ----------
+# ---------- Helper: OpenAI Realtime session via websockets ----------
 async def create_realtime_session():
     """
-    Opens a WebSocket to the OpenAI Realtime API using httpx.AsyncClient.websocket
+    Opens a WebSocket to the OpenAI Realtime API using websockets.connect
     and sends a session.update so it knows to use g711_ulaw.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set; cannot use Realtime API.")
 
-    logger.info("Connecting to OpenAI Realtime WebSocket via httpx...")
+    logger.info("Connecting to OpenAI Realtime WebSocket via websockets...")
 
-    client_ws = httpx.AsyncClient()
-
-    # NOTE: httpx uses `.websocket(method, url, ...)`, not `.ws_connect`
-    ws = await client_ws.websocket(
-        "GET",
+    openai_ws = await websockets.connect(
         OPENAI_REALTIME_URL,
-        headers=OPENAI_REALTIME_HEADERS,
-        timeout=None,
+        extra_headers=OPENAI_REALTIME_HEADERS,
     )
 
     session_update = {
@@ -161,11 +154,10 @@ async def create_realtime_session():
         },
     }
 
-    await ws.send_text(json.dumps(session_update))
+    await openai_ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime")
 
-    # Return both so we can close them later
-    return client_ws, ws
+    return openai_ws
 
 
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
@@ -176,18 +168,17 @@ async def twilio_stream(websocket: WebSocket):
 
     We:
       * Accept the WebSocket from Twilio.
-      * Open a second WebSocket to OpenAI Realtime (via httpx).
+      * Open a second WebSocket to OpenAI Realtime.
       * Forward Twilio audio → OpenAI.
       * Forward OpenAI audio → Twilio.
     """
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
-    openai_client = None
     openai_ws = None
 
     try:
-        openai_client, openai_ws = await create_realtime_session()
+        openai_ws = await create_realtime_session()
 
         async def twilio_to_openai():
             while True:
@@ -219,12 +210,12 @@ async def twilio_stream(websocket: WebSocket):
                         "type": "input_audio_buffer.append",
                         "audio": payload_b64,
                     }
-                    await openai_ws.send_text(json.dumps(audio_event))
+                    await openai_ws.send(json.dumps(audio_event))
 
                 elif event_type == "stop":
                     logger.info("Twilio sent stop; closing call.")
                     try:
-                        await openai_ws.send_text(
+                        await openai_ws.send(
                             json.dumps({"type": "input_audio_buffer.commit"})
                         )
                     except Exception as e:
@@ -234,14 +225,7 @@ async def twilio_stream(websocket: WebSocket):
                     break
 
         async def openai_to_twilio():
-            # httpx WebSocket: `.receive_text()` inside a loop
-            while True:
-                try:
-                    msg = await openai_ws.receive_text()
-                except Exception as e:
-                    logger.warning(f"OpenAI WS closed or errored: {e}")
-                    break
-
+            async for msg in openai_ws:
                 try:
                     event = json.loads(msg)
                 except json.JSONDecodeError:
@@ -290,13 +274,7 @@ async def twilio_stream(websocket: WebSocket):
     finally:
         if openai_ws is not None:
             try:
-                await openai_ws.aclose()
-            except Exception:
-                pass
-
-        if openai_client is not None:
-            try:
-                await openai_client.aclose()
+                await openai_ws.close()
             except Exception:
                 pass
 
