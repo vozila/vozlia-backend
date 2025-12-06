@@ -3,4 +3,4 @@ uvicorn[standard]
 twilio
 python-multipart
 openai>=1.0.0
-httpx
+httpx>=0.24.0
