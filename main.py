@@ -27,7 +27,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 OPENAI_REALTIME_MODEL = os.getenv(
     "OPENAI_REALTIME_MODEL",
-    "gpt-4o-mini-realtime-preview-2024-12-17",  # adjust to whatever model you have access to
+    "gpt-4o-mini-realtime-preview-2024-12-17",  # adjust to your model
 )
 OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
@@ -138,6 +138,7 @@ async def create_realtime_session():
         extra_headers=OPENAI_REALTIME_HEADERS,
     )
 
+    # Minimal session config to avoid parameter errors
     session_update = {
         "type": "session.update",
         "session": {
@@ -147,10 +148,6 @@ async def create_realtime_session():
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "turn_detection": {"type": "server_vad"},
-            "input_audio_transcription": {
-                "model": "gpt-4o-mini-transcribe"
-            },
-            "temperature": 0.5,
         },
     }
 
