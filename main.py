@@ -191,7 +191,7 @@ async def create_realtime_session():
     return openai_ws
 
 
-# ---------- Twilio media stream ↔ OpenAI Realtime ----------
+# ---------- Twilio media stream ↔ OpenAI Realtime (with barge-in) ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
     """
@@ -202,18 +202,22 @@ async def twilio_stream(websocket: WebSocket):
       * Open a second WebSocket to OpenAI Realtime.
       * Forward Twilio audio → OpenAI.
       * Forward OpenAI audio → Twilio.
+      * Support barge-in: if the user speaks while AI is speaking,
+        we cancel the current AI response.
     """
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
     openai_ws = None
     stream_sid = None  # Twilio stream ID needed for outbound audio
+    ai_speaking = False
+    cancel_in_progress = False  # avoid spamming cancel
 
     try:
         openai_ws = await create_realtime_session()
 
         async def twilio_to_openai():
-            nonlocal stream_sid
+            nonlocal stream_sid, ai_speaking, cancel_in_progress
 
             while True:
                 try:
@@ -240,6 +244,18 @@ async def twilio_stream(websocket: WebSocket):
                     if not payload_b64:
                         continue
 
+                    # --- BARGE-IN LOGIC ---
+                    if ai_speaking and not cancel_in_progress:
+                        # User is talking while AI is talking -> cancel current response
+                        try:
+                            cancel_evt = {"type": "response.cancel"}
+                            await openai_ws.send(json.dumps(cancel_evt))
+                            cancel_in_progress = True
+                            ai_speaking = False
+                            logger.info("BARGE-IN: user spoke, sent response.cancel to OpenAI")
+                        except Exception as e:
+                            logger.error(f"Error sending response.cancel: {e}")
+
                     # Forward raw μ-law audio to OpenAI
                     audio_event = {
                         "type": "input_audio_buffer.append",
@@ -253,7 +269,7 @@ async def twilio_stream(websocket: WebSocket):
                     break
 
         async def openai_to_twilio():
-            nonlocal stream_sid
+            nonlocal stream_sid, ai_speaking, cancel_in_progress
 
             async for msg in openai_ws:
                 try:
@@ -269,7 +285,9 @@ async def twilio_stream(websocket: WebSocket):
                     if not audio_chunk_b64:
                         continue
 
-                    # Make sure we have the stream SID before sending
+                    ai_speaking = True
+                    cancel_in_progress = False  # if we were cancelling, new audio = new turn
+
                     if not stream_sid:
                         logger.warning(
                             "Got audio from OpenAI but stream_sid is not set yet."
@@ -281,7 +299,6 @@ async def twilio_stream(websocket: WebSocket):
                         raw_bytes = base64.b64decode(audio_chunk_b64)
                         audio_payload = base64.b64encode(raw_bytes).decode("utf-8")
                     except Exception:
-                        # Fallback: if anything weird happens, just pass through
                         audio_payload = audio_chunk_b64
 
                     twilio_msg = {
@@ -295,6 +312,8 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif etype == "response.audio.done":
                     logger.info("OpenAI finished an audio response")
+                    ai_speaking = False
+                    cancel_in_progress = False
 
                 elif etype == "response.text.delta":
                     delta = event.get("delta", "")
@@ -308,8 +327,6 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif etype == "error":
                     logger.error(f"OpenAI error event: {event}")
-                    # Don’t necessarily break the whole loop on soft errors,
-                    # but for now we log and break so it’s obvious.
                     break
 
         await asyncio.gather(
