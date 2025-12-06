@@ -8,7 +8,7 @@ import logging
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import PlainTextResponse, Response, JSONResponse
 
-from twilio.twiml.voice_response import VoiceResponse, Connect, Stream as TwilioStream
+from twilio.twiml.voice_response import VoiceResponse, Connect
 
 from openai import OpenAI
 import httpx
@@ -62,7 +62,7 @@ async def health():
     return {"status": "ok"}
 
 
-# ---------- Debug GPT (text) ----------
+# ---------- Debug GPT (text only) ----------
 async def generate_gpt_reply(text: str) -> str:
     logger.info(f"/debug/gpt called with text: {text!r}")
 
@@ -127,7 +127,7 @@ async def twilio_inbound(request: Request):
 # ---------- Helper: OpenAI Realtime session via httpx websockets ----------
 async def create_realtime_session():
     """
-    Opens a WebSocket to the OpenAI Realtime API using httpx
+    Opens a WebSocket to the OpenAI Realtime API using httpx.AsyncClient.websocket
     and sends a session.update so it knows to use g711_ulaw.
     """
     if not OPENAI_API_KEY:
@@ -137,7 +137,9 @@ async def create_realtime_session():
 
     client_ws = httpx.AsyncClient()
 
-    ws = await client_ws.ws_connect(
+    # NOTE: httpx uses `.websocket(method, url, ...)`, not `.ws_connect`
+    ws = await client_ws.websocket(
+        "GET",
         OPENAI_REALTIME_URL,
         headers=OPENAI_REALTIME_HEADERS,
         timeout=None,
@@ -232,7 +234,14 @@ async def twilio_stream(websocket: WebSocket):
                     break
 
         async def openai_to_twilio():
-            async for msg in openai_ws.iter_text():
+            # httpx WebSocket: `.receive_text()` inside a loop
+            while True:
+                try:
+                    msg = await openai_ws.receive_text()
+                except Exception as e:
+                    logger.warning(f"OpenAI WS closed or errored: {e}")
+                    break
+
                 try:
                     event = json.loads(msg)
                 except json.JSONDecodeError:
