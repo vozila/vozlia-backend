@@ -3,6 +3,8 @@ import json
 import asyncio
 import logging
 import base64
+import audioop
+import time
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import PlainTextResponse, Response, JSONResponse
@@ -26,7 +28,7 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 OPENAI_REALTIME_MODEL = os.getenv(
     "OPENAI_REALTIME_MODEL",
-    "gpt-4o-mini-realtime-preview-2024-12-17",  # default; override via env if needed
+    "gpt-4o-mini-realtime-preview-2024-12-17",
 )
 OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
@@ -78,7 +80,6 @@ SYSTEM_PROMPT = (
 app = FastAPI()
 
 
-# ---------- Basic endpoints ----------
 @app.get("/")
 async def root():
     return PlainTextResponse("OK")
@@ -129,8 +130,8 @@ async def twilio_inbound(request: Request):
     )
 
     resp = VoiceResponse()
-
     connect = Connect()
+
     stream_url = os.getenv(
         "TWILIO_STREAM_URL",
         "wss://vozlia-backend.onrender.com/twilio/stream",
@@ -146,9 +147,6 @@ async def twilio_inbound(request: Request):
 
 # ---------- Helper: initial greeting via Realtime ----------
 async def send_initial_greeting(openai_ws):
-    """
-    Ask the model to greet the caller once the audio bridge is ready.
-    """
     try:
         convo_item = {
             "type": "conversation.item.create",
@@ -176,11 +174,6 @@ async def send_initial_greeting(openai_ws):
 
 # ---------- Helper: OpenAI Realtime session via websockets ----------
 async def create_realtime_session():
-    """
-    Opens a WebSocket to the OpenAI Realtime API using websockets.connect,
-    configures the session for μ-law audio, server-side VAD, and Coral voice,
-    then sends an initial greeting.
-    """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set; cannot use Realtime API.")
 
@@ -199,7 +192,6 @@ async def create_realtime_session():
             "modalities": ["text", "audio"],
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
-            # Server-side VAD handles turn segmentation automatically
             "turn_detection": {
                 "type": "server_vad",
             },
@@ -214,67 +206,53 @@ async def create_realtime_session():
     return openai_ws
 
 
-# ---------- Simple amplitude-based speech detector ----------
+# ---------- Proper μ-law amplitude-based speech detector ----------
 def estimate_twilio_frame_level_ulaw(payload_b64: str) -> float:
     """
-    Rough speech detector for μ-law audio from Twilio media frames.
-
-    We decode the base64 into bytes and treat 128 as "silence-ish".
-    The average absolute deviation from 128 is a proxy for loudness.
+    Decode μ-law to 16-bit PCM and compute RMS amplitude.
+    This is much more reliable than the old 'distance from 128' hack.
     """
     try:
         raw = base64.b64decode(payload_b64)
     except Exception:
         return 0.0
-
     if not raw:
         return 0.0
 
-    total = 0
-    for b in raw:
-        total += abs(b - 128)
-    return total / len(raw)
+    try:
+        # Convert μ-law bytes to 16-bit linear PCM
+        pcm16 = audioop.ulaw2lin(raw, 2)  # width=2 bytes/sample
+        rms = audioop.rms(pcm16, 2)       # root-mean-square amplitude
+        return float(rms)
+    except Exception:
+        return 0.0
 
 
-# Thresholds are conservative to avoid false triggers on background noise.
-# You can tweak these based on real-world behavior.
-SPEECH_LEVEL_THRESHOLD = 18.0   # avg deviation from 128 to consider as speech
-SPEECH_FRAMES_FOR_BARGE = 3     # consecutive frames above threshold (~60ms)
+# Tuned fairly conservatively; we can adjust up/down based on behavior.
+SPEECH_RMS_THRESHOLD = 1200.0      # how loud it must be to count as speech
+SPEECH_FRAMES_FOR_BARGE = 4        # consecutive frames above threshold (~80ms)
 
 
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
-    """
-    Twilio connects here via Media Streams (WebSocket).
-
-    We:
-      * Accept the WebSocket from Twilio.
-      * Open a second WebSocket to OpenAI Realtime.
-      * Forward Twilio audio → OpenAI.
-      * Forward OpenAI audio → Twilio.
-      * Use OpenAI server VAD + Twilio amplitude to implement barge-in:
-           - If the user starts speaking (based on Twilio audio level)
-             while the AI is talking (and barge-in is enabled),
-             send response.cancel, and suppress any further assistant audio
-             for that response so the caller stops hearing it immediately.
-    """
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
     openai_ws = None
-    stream_sid = None  # Twilio stream ID for outbound audio
+    stream_sid = None
 
     # AI / call state
     ai_speaking = False
-    barge_in_enabled = False  # only after first full AI response
+    barge_in_enabled = False  # after first full response
     cancel_in_progress = False
-
-    # Local mute for assistant audio during barge-in
     suppress_assistant_audio = False
 
-    # Simple Twilio-side speech detector state
+    # Twilio-side speech detector state
     consecutive_speech_frames = 0
+
+    # Server VAD-based user speech flag
+    user_speaking_vad = False
 
     try:
         openai_ws = await create_realtime_session()
@@ -282,6 +260,7 @@ async def twilio_stream(websocket: WebSocket):
         async def twilio_to_openai():
             nonlocal stream_sid, ai_speaking, barge_in_enabled, cancel_in_progress
             nonlocal suppress_assistant_audio, consecutive_speech_frames, openai_ws
+            nonlocal user_speaking_vad
 
             while True:
                 try:
@@ -310,10 +289,15 @@ async def twilio_stream(websocket: WebSocket):
                     if not payload_b64:
                         continue
 
-                    # ---- Twilio-side barge-in detection (fast) ----
-                    if barge_in_enabled and ai_speaking and not cancel_in_progress:
+                    # ---- Twilio-side barge-in detection (now gated by VAD + RMS) ----
+                    if (
+                        barge_in_enabled
+                        and ai_speaking
+                        and not cancel_in_progress
+                        and user_speaking_vad  # only if OpenAI VAD says user is speaking
+                    ):
                         level = estimate_twilio_frame_level_ulaw(payload_b64)
-                        if level >= SPEECH_LEVEL_THRESHOLD:
+                        if level >= SPEECH_RMS_THRESHOLD:
                             consecutive_speech_frames += 1
                         else:
                             consecutive_speech_frames = 0
@@ -329,8 +313,8 @@ async def twilio_stream(websocket: WebSocket):
                                 consecutive_speech_frames = 0
 
                                 logger.info(
-                                    "BARGE-IN (Twilio amplitude): "
-                                    "user speech detected while AI speaking; "
+                                    "BARGE-IN (Twilio+VAD): "
+                                    f"RMS={level:.1f}, user speech while AI speaking; "
                                     "sent response.cancel and suppressed assistant audio"
                                 )
                             except Exception as e:
@@ -352,7 +336,7 @@ async def twilio_stream(websocket: WebSocket):
 
         async def openai_to_twilio():
             nonlocal stream_sid, ai_speaking, barge_in_enabled, cancel_in_progress
-            nonlocal suppress_assistant_audio, openai_ws
+            nonlocal suppress_assistant_audio, openai_ws, user_speaking_vad
 
             async for msg in openai_ws:
                 try:
@@ -371,7 +355,6 @@ async def twilio_stream(websocket: WebSocket):
 
                     ai_speaking = True
 
-                    # If we are in barge-in mode for this response, don't send audio
                     if suppress_assistant_audio:
                         logger.debug(
                             "Suppressing assistant audio delta due to active barge-in"
@@ -384,7 +367,6 @@ async def twilio_stream(websocket: WebSocket):
                         )
                         continue
 
-                    # Normalize base64 -> base64 in case OpenAI changes encoding
                     try:
                         raw_bytes = base64.b64decode(audio_chunk_b64)
                         audio_payload = base64.b64encode(raw_bytes).decode("utf-8")
@@ -402,7 +384,7 @@ async def twilio_stream(websocket: WebSocket):
                     logger.info("OpenAI finished an audio response")
                     ai_speaking = False
                     cancel_in_progress = False
-                    suppress_assistant_audio = False  # allow next response to play
+                    suppress_assistant_audio = False
 
                     if not barge_in_enabled:
                         barge_in_enabled = True
@@ -419,12 +401,14 @@ async def twilio_stream(websocket: WebSocket):
                     if text:
                         logger.info(f"AI full text response: {text}")
 
-                # ----- VAD EVENTS (for logging only) -----
+                # ----- VAD EVENTS: drive user_speaking_vad -----
                 elif etype == "input_audio_buffer.speech_started":
-                    logger.info("OpenAI detected speech START in input buffer")
+                    user_speaking_vad = True
+                    logger.info("OpenAI VAD: user speech START")
 
                 elif etype == "input_audio_buffer.speech_stopped":
-                    logger.info("OpenAI detected speech STOP in input buffer")
+                    user_speaking_vad = False
+                    logger.info("OpenAI VAD: user speech STOP")
 
                 # ----- ERROR EVENTS -----
                 elif etype == "error":
@@ -433,11 +417,8 @@ async def twilio_stream(websocket: WebSocket):
                     code = err.get("code")
 
                     if code == "response_cancel_not_active":
-                        # Nothing to cancel; clear flags so future barge-in works.
                         cancel_in_progress = False
                         suppress_assistant_audio = False
-
-                # Other event types ignored or logged if needed.
 
         await asyncio.gather(
             twilio_to_openai(),
