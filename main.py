@@ -317,15 +317,15 @@ async def twilio_stream(websocket: WebSocket):
                         raw_bytes = None
 
                     if raw_bytes:
-                        # break into 20 ms μ-law frames
+                        # Break into 20 ms μ-law frames (160 bytes at 8kHz).
                         for i in range(0, len(raw_bytes), FRAME_SIZE):
                             frame = raw_bytes[i : i + FRAME_SIZE]
                             if not frame:
                                 continue
-                            # keep even partial frames; Twilio can handle short last frame
                             frame_b64 = base64.b64encode(frame).decode("utf-8")
                             outgoing_audio.append(frame_b64)
                     else:
+                        # Fallback: just enqueue the chunk as-is.
                         outgoing_audio.append(audio_chunk_b64)
 
                 elif etype == "response.audio.done":
@@ -393,57 +393,52 @@ async def twilio_stream(websocket: WebSocket):
                         suppress_assistant_audio = False
 
         async def twilio_audio_sender():
-            nonlocal assistant_last_audio_time
+            """
+            Send exactly ONE 20 ms frame to Twilio every ~20 ms,
+            using a time-based scheduler to keep cadence stable.
+            """
+            nonlocal assistant_last_audio_time, stream_sid
+
+            next_send_time = time.monotonic()
+
             try:
                 while True:
-                    if outgoing_audio:
-                        backlog = len(outgoing_audio)
+                    now = time.monotonic()
 
-                        # Dynamically choose how many frames to send this tick:
-                        # - 1 frame when queue is small (steady state)
-                        # - 2–3 frames if backlog builds, to avoid stutter
-                        frames_this_tick = 1
-                        if backlog > 15:
-                            frames_this_tick = 3
-                        elif backlog > 8:
-                            frames_this_tick = 2
+                    if outgoing_audio and stream_sid and now >= next_send_time:
+                        frame_b64 = outgoing_audio.popleft()
 
-                        sent_any = False
-                        for _ in range(frames_this_tick):
-                            if not outgoing_audio:
-                                break
-                            frame_b64 = outgoing_audio.popleft()
-                            if not stream_sid:
-                                continue
+                        twilio_msg = {
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": frame_b64},
+                        }
 
-                            twilio_msg = {
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": frame_b64},
-                            }
-                            try:
-                                await websocket.send_text(json.dumps(twilio_msg))
-                                assistant_last_audio_time = time.monotonic()
-                                sent_any = True
-                            except WebSocketDisconnect:
-                                logger.info(
-                                    "WebSocket disconnected while sending audio"
-                                )
-                                return
-                            except Exception as e:
-                                logger.error(
-                                    f"Error sending audio frame to Twilio: {e}"
-                                )
-                                break
+                        try:
+                            await websocket.send_text(json.dumps(twilio_msg))
+                            assistant_last_audio_time = now
+                        except WebSocketDisconnect:
+                            logger.info("WebSocket disconnected while sending audio")
+                            return
+                        except Exception as e:
+                            logger.error(f"Error sending audio frame to Twilio: {e}")
+                            # Don't crash the loop; try again on next tick.
 
-                        # Sleep roughly proportional to frames sent
-                        if sent_any:
-                            await asyncio.sleep(FRAME_INTERVAL * frames_this_tick)
-                        else:
-                            await asyncio.sleep(0.005)
-                    else:
-                        # No audio queued; short sleep to avoid busy loop
-                        await asyncio.sleep(0.005)
+                        next_send_time += FRAME_INTERVAL
+
+                        # If we're falling behind (e.g., clock drift), reset.
+                        if next_send_time < now - 0.1:
+                            next_send_time = now + FRAME_INTERVAL
+
+                    # Sleep until next frame time or a small fallback.
+                    sleep_for = max(0.0, next_send_time - time.monotonic())
+                    # If no audio queued, don't busy-wait.
+                    if not outgoing_audio:
+                        sleep_for = min(sleep_for, FRAME_INTERVAL)
+                        if sleep_for == 0.0:
+                            sleep_for = FRAME_INTERVAL / 2
+
+                    await asyncio.sleep(sleep_for)
             except asyncio.CancelledError:
                 logger.info("twilio_audio_sender cancelled")
             except Exception as e:
