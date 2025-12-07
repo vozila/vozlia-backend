@@ -6,6 +6,7 @@ import base64
 import time
 from typing import List
 from datetime import datetime, timedelta
+from uuid import UUID  # <-- NEW
 
 import httpx  # <-- for Google OAuth + Gmail API
 
@@ -349,14 +350,23 @@ async def google_auth_callback(
 
 # ---------- Gmail helpers (token refresh + account fetch) ----------
 def _get_gmail_account_or_404(
-    account_id: int,
+    account_id: str,
     current_user: User,
     db: Session,
 ) -> EmailAccount:
+    """
+    Look up a Gmail account owned by the current user.
+    account_id is expected to be a UUID string (like the one returned by /auth/google/callback).
+    """
+    try:
+        account_uuid = UUID(account_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid account_id format")
+
     account = (
         db.query(EmailAccount)
         .filter(
-            EmailAccount.id == account_id,
+            EmailAccount.id == account_uuid,
             EmailAccount.user_id == current_user.id,
         )
         .first()
@@ -462,7 +472,7 @@ def _extract_headers(message_json: dict) -> dict:
 
 @app.get("/email/accounts/{account_id}/messages")
 def list_gmail_messages(
-    account_id: int,
+    account_id: str,
     max_results: int = 20,
     query: str | None = None,
     db: Session = Depends(get_db),
@@ -472,9 +482,9 @@ def list_gmail_messages(
     List recent Gmail messages for this account with basic metadata + snippet.
 
     Example queries:
-      - /email/accounts/1/messages
-      - /email/accounts/1/messages?max_results=10
-      - /email/accounts/1/messages?query=from:amazon OR subject:invoice
+      - /email/accounts/{id}/messages
+      - /email/accounts/{id}/messages?max_results=10
+      - /email/accounts/{id}/messages?query=from:amazon OR subject:invoice
     """
     account = _get_gmail_account_or_404(account_id, current_user, db)
     access_token = ensure_gmail_access_token(account, db)
@@ -551,7 +561,7 @@ def list_gmail_messages(
 
 @app.get("/email/accounts/{account_id}/stats")
 def gmail_stats(
-    account_id: int,
+    account_id: str,
     window_days: int = 1,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -561,9 +571,9 @@ def gmail_stats(
     Uses Gmail search 'newer_than:{N}d'.
 
     Examples:
-      - /email/accounts/1/stats?window_days=1   -> "today-ish"
-      - /email/accounts/1/stats?window_days=7   -> last week
-      - /email/accounts/1/stats?window_days=30  -> last month-ish
+      - /email/accounts/{id}/stats?window_days=1   -> "today-ish"
+      - /email/accounts/{id}/stats?window_days=7   -> last week
+      - /email/accounts/{id}/stats?window_days=30  -> last month-ish
     """
     if window_days <= 0:
         raise HTTPException(
