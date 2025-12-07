@@ -357,4 +357,42 @@ async def twilio_stream(websocket: WebSocket):
 
                             logger.info(
                                 "BARGE-IN (VAD only): user speech started while AI "
-                                "speaking; sent response.canc
+                                "speaking; sent response.cancel and suppressed audio"
+                            )
+                        except Exception as e:
+                            logger.error(f"Error sending response.cancel: {e}")
+
+                elif etype == "input_audio_buffer.speech_stopped":
+                    user_speaking_vad = False
+                    logger.info("OpenAI VAD: user speech STOP")
+
+                # ----- ERROR EVENTS -----
+                elif etype == "error":
+                    logger.error(f"OpenAI error event: {event}")
+                    err = event.get("error") or {}
+                    code = err.get("code")
+
+                    if code == "response_cancel_not_active":
+                        cancel_in_progress = False
+                        suppress_assistant_audio = False
+
+        await asyncio.gather(
+            twilio_to_openai(),
+            openai_to_twilio(),
+        )
+
+    except Exception as e:
+        logger.exception(f"Error in /twilio/stream: {e}")
+    finally:
+        if openai_ws is not None:
+            try:
+                await openai_ws.close()
+            except Exception:
+                pass
+
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+        logger.info("Twilio stream closed")
