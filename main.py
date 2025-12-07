@@ -231,11 +231,22 @@ async def google_auth_callback(
         token_resp = await client_http.post(GOOGLE_TOKEN_URL, data=data)
         if token_resp.status_code != 200:
             logger.error(
-                f"Google token exchange failed: {token_resp.status_code} {token_resp.text}"
+                "Google token exchange failed: %s %s",
+                token_resp.status_code,
+                token_resp.text,
             )
+            try:
+                google_error = token_resp.json()
+            except Exception:
+                google_error = {"raw": token_resp.text}
+
             raise HTTPException(
                 status_code=500,
-                detail="Failed to exchange code for tokens with Google",
+                detail={
+                    "message": "Failed to exchange code for tokens with Google",
+                    "google_status": token_resp.status_code,
+                    "google_error": google_error,
+                },
             )
 
         token_data = token_resp.json()
@@ -259,11 +270,22 @@ async def google_auth_callback(
 
         if profile_resp.status_code != 200:
             logger.error(
-                f"Gmail profile request failed: {profile_resp.status_code} {profile_resp.text}"
+                "Gmail profile request failed: %s %s",
+                profile_resp.status_code,
+                profile_resp.text,
             )
+            try:
+                google_error = profile_resp.json()
+            except Exception:
+                google_error = {"raw": profile_resp.text}
+
             raise HTTPException(
                 status_code=500,
-                detail="Failed to fetch Gmail profile",
+                detail={
+                    "message": "Failed to fetch Gmail profile",
+                    "google_status": profile_resp.status_code,
+                    "google_error": google_error,
+                },
             )
 
         profile = profile_resp.json()
