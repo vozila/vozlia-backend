@@ -72,6 +72,8 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
 # For now: read-only Gmail scope (you can expand later)
 GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 
 
 # Create tables on startup (simple MVP, later use Alembic)
@@ -217,7 +219,6 @@ async def google_auth_callback(
         raise HTTPException(status_code=400, detail="Missing 'code' in callback")
 
     # 1. Exchange code for tokens
-    token_url = "https://oauth2.googleapis.com/token"
     data = {
         "code": code,
         "client_id": GOOGLE_CLIENT_ID,
@@ -227,7 +228,7 @@ async def google_auth_callback(
     }
 
     async with httpx.AsyncClient() as client_http:
-        token_resp = await client_http.post(token_url, data=data)
+        token_resp = await client_http.post(GOOGLE_TOKEN_URL, data=data)
         if token_resp.status_code != 200:
             logger.error(
                 f"Google token exchange failed: {token_resp.status_code} {token_resp.text}"
@@ -250,7 +251,7 @@ async def google_auth_callback(
             )
 
         # 2. Use access token to get Gmail profile (email address)
-        profile_url = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+        profile_url = f"{GMAIL_API_BASE}/users/me/profile"
         profile_resp = await client_http.get(
             profile_url,
             headers={"Authorization": f"Bearer {access_token}"},
@@ -321,6 +322,263 @@ async def google_auth_callback(
         "message": "Gmail account connected",
         "email_address": email_address,
         "account_id": str(account.id),
+    }
+
+
+# ---------- Gmail helpers (token refresh + account fetch) ----------
+def _get_gmail_account_or_404(
+    account_id: int,
+    current_user: User,
+    db: Session,
+) -> EmailAccount:
+    account = (
+        db.query(EmailAccount)
+        .filter(
+            EmailAccount.id == account_id,
+            EmailAccount.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Email account not found")
+
+    if account.provider_type != "gmail" or account.oauth_provider != "google":
+        raise HTTPException(
+            status_code=400,
+            detail="Email account is not a Gmail account linked via Google OAuth",
+        )
+
+    if not account.oauth_access_token:
+        raise HTTPException(
+            status_code=400,
+            detail="No OAuth access token stored for this account",
+        )
+
+    return account
+
+
+def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
+    """
+    Returns a valid Gmail access token, refreshing with the stored refresh token
+    if needed. Updates DB if a refresh occurs.
+    """
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="Google OAuth not configured on server",
+        )
+
+    access_token = decrypt_str(account.oauth_access_token)
+    refresh_token = decrypt_str(account.oauth_refresh_token)
+    now = datetime.utcnow()
+
+    # If token is still valid for at least 60s, reuse it
+    if account.oauth_expires_at and access_token:
+        if account.oauth_expires_at > now + timedelta(seconds=60):
+            return access_token
+
+    # Need to refresh
+    if not refresh_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Gmail access token expired and no refresh token available. "
+                   "Please reconnect your Gmail account.",
+        )
+
+    data = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+
+    with httpx.Client(timeout=10.0) as client_http:
+        resp = client_http.post(GOOGLE_TOKEN_URL, data=data)
+        if resp.status_code != 200:
+            logger.error(
+                f"Failed to refresh Gmail token: {resp.status_code} {resp.text}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Failed to refresh Gmail access token with Google",
+            )
+
+        token_data = resp.json()
+        new_access_token = token_data.get("access_token")
+        expires_in = token_data.get("expires_in")
+
+        if not new_access_token:
+            raise HTTPException(
+                status_code=500,
+                detail="Google did not return a new access token during refresh",
+            )
+
+        account.oauth_access_token = encrypt_str(new_access_token)
+        if expires_in:
+            account.oauth_expires_at = now + timedelta(seconds=expires_in)
+        db.commit()
+        db.refresh(account)
+
+        return new_access_token
+
+
+def _extract_headers(message_json: dict) -> dict:
+    headers_list = (
+        message_json.get("payload", {})
+        .get("headers", [])
+    )
+    h = {hdr.get("name", "").lower(): hdr.get("value", "") for hdr in headers_list}
+    return {
+        "subject": h.get("subject"),
+        "from": h.get("from"),
+        "to": h.get("to"),
+        "date": h.get("date"),
+    }
+
+
+# ---------- Gmail API usage endpoints ----------
+
+@app.get("/email/accounts/{account_id}/messages")
+def list_gmail_messages(
+    account_id: int,
+    max_results: int = 20,
+    query: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List recent Gmail messages for this account with basic metadata + snippet.
+
+    Example queries:
+      - /email/accounts/1/messages
+      - /email/accounts/1/messages?max_results=10
+      - /email/accounts/1/messages?query=from:amazon OR subject:invoice
+    """
+    account = _get_gmail_account_or_404(account_id, current_user, db)
+    access_token = ensure_gmail_access_token(account, db)
+
+    params = {
+        "maxResults": max_results,
+    }
+    if query:
+        params["q"] = query
+
+    with httpx.Client(timeout=10.0) as client_http:
+        # 1) List message IDs
+        list_url = f"{GMAIL_API_BASE}/users/me/messages"
+        list_resp = client_http.get(
+            list_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+        )
+        if list_resp.status_code != 200:
+            logger.error(
+                f"Gmail list messages failed: {list_resp.status_code} {list_resp.text}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Failed to list Gmail messages",
+            )
+
+        list_data = list_resp.json()
+        messages = list_data.get("messages", [])
+        size_estimate = list_data.get("resultSizeEstimate", len(messages))
+
+        # 2) Fetch details for each message (up to max_results)
+        detailed = []
+        for msg in messages:
+            msg_id = msg.get("id")
+            if not msg_id:
+                continue
+
+            msg_url = f"{GMAIL_API_BASE}/users/me/messages/{msg_id}"
+            msg_resp = client_http.get(
+                msg_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"format": "metadata"},
+            )
+            if msg_resp.status_code != 200:
+                logger.warning(
+                    f"Failed to fetch Gmail message {msg_id}: "
+                    f"{msg_resp.status_code} {msg_resp.text}"
+                )
+                continue
+
+            msg_json = msg_resp.json()
+            headers = _extract_headers(msg_json)
+            detailed.append(
+                {
+                    "id": msg_json.get("id"),
+                    "threadId": msg_json.get("threadId"),
+                    "snippet": msg_json.get("snippet"),
+                    "subject": headers.get("subject"),
+                    "from": headers.get("from"),
+                    "to": headers.get("to"),
+                    "date": headers.get("date"),
+                }
+            )
+
+    return {
+        "account_id": account_id,
+        "email_address": account.email_address,
+        "query": query,
+        "resultSizeEstimate": size_estimate,
+        "messages": detailed,
+    }
+
+
+@app.get("/email/accounts/{account_id}/stats")
+def gmail_stats(
+    account_id: int,
+    window_days: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Approximate count of messages received in the last N days.
+    Uses Gmail search 'newer_than:{N}d'.
+
+    Examples:
+      - /email/accounts/1/stats?window_days=1   -> "today-ish"
+      - /email/accounts/1/stats?window_days=7   -> last week
+      - /email/accounts/1/stats?window_days=30  -> last month-ish
+    """
+    if window_days <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="window_days must be >= 1",
+        )
+
+    account = _get_gmail_account_or_404(account_id, current_user, db)
+    access_token = ensure_gmail_access_token(account, db)
+
+    query = f"newer_than:{window_days}d"
+
+    with httpx.Client(timeout=10.0) as client_http:
+        list_url = f"{GMAIL_API_BASE}/users/me/messages"
+        list_resp = client_http.get(
+            list_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"q": query, "maxResults": 1},
+        )
+        if list_resp.status_code != 200:
+            logger.error(
+                f"Gmail stats list failed: {list_resp.status_code} {list_resp.text}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Failed to compute Gmail stats",
+            )
+
+        data = list_resp.json()
+        size_estimate = data.get("resultSizeEstimate", 0)
+
+    return {
+        "account_id": account_id,
+        "email_address": account.email_address,
+        "window_days": window_days,
+        "query": query,
+        "approx_message_count": size_estimate,
     }
 
 
