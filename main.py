@@ -79,10 +79,12 @@ SYSTEM_PROMPT = (
 SAMPLE_RATE = 8000        # Hz
 FRAME_MS = 20             # 20 ms per frame
 BYTES_PER_FRAME = int(SAMPLE_RATE * FRAME_MS / 1000)  # 160 bytes
-FRAME_INTERVAL = FRAME_MS / 1000.0  # 0.02 seconds
 
-# Prebuffer at start of each utterance to smooth jitter (5 frames = 100ms)
-PREBUFFER_FRAMES = 5
+# Send slightly faster than real-time (18 ms) to keep Twilio buffered
+FRAME_INTERVAL = (FRAME_MS / 1000.0) * 0.9  # ~0.018 seconds
+
+# Prebuffer at start of each utterance to smooth jitter (8 frames = 160ms)
+PREBUFFER_FRAMES = 8
 PREBUFFER_BYTES = PREBUFFER_FRAMES * BYTES_PER_FRAME
 
 
@@ -391,8 +393,12 @@ async def twilio_stream(websocket: WebSocket):
             """
             nonlocal assistant_last_audio_time, stream_sid, audio_buffer, prebuffer_active
 
+            next_send_time = time.monotonic()
+
             try:
                 while True:
+                    now = time.monotonic()
+
                     if stream_sid and len(audio_buffer) >= BYTES_PER_FRAME:
                         # If we're still prebuffering this utterance, wait until we have enough
                         if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
@@ -422,10 +428,14 @@ async def twilio_stream(websocket: WebSocket):
                         except Exception as e:
                             logger.error(f"Error sending audio frame to Twilio: {e}")
 
-                        # Pace the frames ~real-time
-                        await asyncio.sleep(FRAME_INTERVAL)
+                        # Schedule next frame slightly in the future
+                        next_send_time += FRAME_INTERVAL
+                        sleep_for = max(0.0, next_send_time - time.monotonic())
+                        await asyncio.sleep(sleep_for)
                     else:
-                        # Nothing (or not enough) to send, avoid busy loop
+                        # Nothing (or not enough) to send, avoid busy loop and
+                        # keep next_send_time aligned with "now"
+                        next_send_time = time.monotonic()
                         await asyncio.sleep(0.005)
             except asyncio.CancelledError:
                 logger.info("twilio_audio_sender cancelled")
