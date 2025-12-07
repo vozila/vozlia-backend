@@ -80,12 +80,17 @@ SAMPLE_RATE = 8000        # Hz
 FRAME_MS = 20             # 20 ms per frame
 BYTES_PER_FRAME = int(SAMPLE_RATE * FRAME_MS / 1000)  # 160 bytes
 
-# Send slightly faster than real-time (18 ms) to keep Twilio buffered
-FRAME_INTERVAL = (FRAME_MS / 1000.0) * 0.9  # ~0.018 seconds
+# Real-time pacing: one 20ms frame every 20ms
+FRAME_INTERVAL = FRAME_MS / 1000.0  # 0.020 seconds
 
-# Prebuffer at start of each utterance to smooth jitter (8 frames = 160ms)
-PREBUFFER_FRAMES = 8
+# Prebuffer at start of each utterance to smooth jitter
+# 4 frames = 80 ms
+PREBUFFER_FRAMES = 4
 PREBUFFER_BYTES = PREBUFFER_FRAMES * BYTES_PER_FRAME
+
+# Limit how far ahead we've sent audio to Twilio (in seconds)
+# This directly bounds the maximum "tail" after barge-in.
+MAX_TWILIO_BACKLOG_SECONDS = 1.0
 
 
 # ---------- FastAPI app ----------
@@ -388,16 +393,32 @@ async def twilio_stream(websocket: WebSocket):
         async def twilio_audio_sender():
             """
             Convert the continuous μ-law audio buffer into fixed 20 ms frames
-            and send them to Twilio at a steady cadence, with a small prebuffer
-            per utterance to avoid choppiness.
+            and send them to Twilio at a steady cadence, with:
+              - a small prebuffer per utterance to avoid choppiness
+              - an explicit cap on how far ahead we've sent audio (backlog)
             """
             nonlocal assistant_last_audio_time, stream_sid, audio_buffer, prebuffer_active
 
+            # Real-time pacing variables
             next_send_time = time.monotonic()
+            call_start_time = time.monotonic()
+            frames_sent = 0
 
             try:
                 while True:
                     now = time.monotonic()
+
+                    # Compute how far ahead Twilio is scheduled to play vs. wall clock.
+                    audio_sent_duration = frames_sent * (FRAME_MS / 1000.0)
+                    call_elapsed = max(0.0, now - call_start_time)
+                    backlog_seconds = audio_sent_duration - call_elapsed
+
+                    if backlog_seconds > MAX_TWILIO_BACKLOG_SECONDS:
+                        # We've sent too far ahead. Pause sending and let real time catch up.
+                        await asyncio.sleep(0.01)
+                        # Reset next_send_time to "now" so we don't try to rush later.
+                        next_send_time = time.monotonic()
+                        continue
 
                     if stream_sid and len(audio_buffer) >= BYTES_PER_FRAME:
                         # If we're still prebuffering this utterance, wait until we have enough
@@ -422,13 +443,14 @@ async def twilio_stream(websocket: WebSocket):
                         try:
                             await websocket.send_text(json.dumps(twilio_msg))
                             assistant_last_audio_time = time.monotonic()
+                            frames_sent += 1
                         except WebSocketDisconnect:
                             logger.info("WebSocket disconnected while sending audio")
                             return
                         except Exception as e:
                             logger.error(f"Error sending audio frame to Twilio: {e}")
 
-                        # Schedule next frame slightly in the future
+                        # Schedule next frame at real-time
                         next_send_time += FRAME_INTERVAL
                         sleep_for = max(0.0, next_send_time - time.monotonic())
                         await asyncio.sleep(sleep_for)
