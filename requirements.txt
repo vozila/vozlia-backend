@@ -5,3 +5,6 @@ python-multipart
 openai>=1.0.0
 websockets==13.1
 httpx
+sqlalchemy
+psycopg2-binary
+cryptography
