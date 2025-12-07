@@ -8,3 +8,4 @@ httpx
 sqlalchemy
 psycopg2-binary
 cryptography
+email-validator
