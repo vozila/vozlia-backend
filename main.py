@@ -40,17 +40,17 @@ def get_current_user(db: Session) -> User:
     return user
 
 
-@app.get("/email/accounts", response_model=List[EmailAccountRead])
-def list_email_accounts(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    accounts = (
-        db.query(EmailAccount)
-        .filter(EmailAccount.user_id == current_user.id)
-        .all()
-    )
-    return accounts
+#@app.get("/email/accounts", response_model=List[EmailAccountRead])
+#def list_email_accounts(
+ #   db: Session = Depends(get_db),
+  #  current_user: User = Depends(get_current_user),
+#):
+ #   accounts = (
+  #      db.query(EmailAccount)
+   #     .filter(EmailAccount.user_id == current_user.id)
+    #    .all()
+    #)
+    #return accounts
 
 
 @app.post("/email/accounts", response_model=EmailAccountRead)
