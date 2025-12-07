@@ -472,6 +472,12 @@ def _gmail_list_messages_core(
     Core logic to list Gmail messages for an account.
     Returns the same JSON structure used by the /messages endpoint.
     """
+    # Safety clamp: avoid accidentally slamming Gmail with huge requests
+    if max_results <= 0:
+        max_results = 1
+    if max_results > 50:
+        max_results = 50
+
     account = _get_gmail_account_or_404(account_id, current_user, db)
     access_token = ensure_gmail_access_token(account, db)
 
@@ -647,6 +653,12 @@ def summarize_gmail_messages_for_assistant(
         "query": ...
       }
     """
+    # Clamp here too, in case it's called directly
+    if max_results <= 0:
+        max_results = 1
+    if max_results > 50:
+        max_results = 50
+
     if not OPENAI_API_KEY or client is None:
         # Fallback: just return a plain-text description using subjects
         data = _gmail_list_messages_core(
@@ -663,7 +675,8 @@ def summarize_gmail_messages_for_assistant(
             subjects = [m.get("subject") or "(no subject)" for m in messages]
             joined = "; ".join(subjects[:5])
             summary = (
-                f"You have {len(messages)} recent emails. Some subjects include: {joined}."
+                f"You have {len(messages)} recent emails. "
+                f"Some subjects include: {joined}."
             )
         data["summary"] = summary
         return data
@@ -716,7 +729,8 @@ def summarize_gmail_messages_for_assistant(
             subjects = [m.get("subject") or "(no subject)" for m in messages]
             joined = "; ".join(subjects[:5])
             summary_text = (
-                f"You have {len(messages)} recent emails. Some subjects include: {joined}."
+                f"You have {len(messages)} recent emails. "
+                f"Some subjects include: {joined}."
             )
 
     data["summary"] = summary_text
