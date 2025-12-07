@@ -13,6 +13,89 @@ from twilio.twiml.voice_response import VoiceResponse, Connect
 from openai import OpenAI
 import websockets
 
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+from uuid import UUID
+from db import Base, engine
+from models import User, EmailAccount
+from schemas import EmailAccountCreate, EmailAccountRead
+from deps import get_db
+
+# Create tables if not using Alembic yet
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI()
+
+
+# TODO: replace with real auth
+def get_current_user(db: Session) -> User:
+    # For now, just fetch first user or create a dummy
+    user = db.query(User).first()
+    if not user:
+        user = User(email="demo@vozlia.com")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+@app.get("/email/accounts", response_model=List[EmailAccountRead])
+def list_email_accounts(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    accounts = (
+        db.query(EmailAccount)
+        .filter(EmailAccount.user_id == current_user.id)
+        .all()
+    )
+    return accounts
+
+
+@app.post("/email/accounts", response_model=EmailAccountRead)
+def create_email_account(
+    payload: EmailAccountCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Example: if provider_type == "imap_custom" and payload.password is set,
+    # encrypt the password before saving:
+    password_enc = None
+    if payload.provider_type == "imap_custom" and payload.password:
+        from cryptography.fernet import Fernet
+
+        key = os.getenv("ENCRYPTION_KEY")
+        if not key:
+            raise HTTPException(status_code=500, detail="ENCRYPTION_KEY not configured")
+
+        f = Fernet(key.encode() if not key.startswith("gAAAA") else key)
+        password_enc = f.encrypt(payload.password.encode()).decode()
+
+    account = EmailAccount(
+        user_id=current_user.id,
+        provider_type=payload.provider_type,
+        email_address=str(payload.email_address),
+        display_name=payload.display_name,
+        is_primary=payload.is_primary,
+        is_active=payload.is_active,
+        imap_host=payload.imap_host,
+        imap_port=payload.imap_port,
+        imap_ssl=payload.imap_ssl,
+        smtp_host=payload.smtp_host,
+        smtp_port=payload.smtp_port,
+        smtp_ssl=payload.smtp_ssl,
+        username=payload.username,
+        password_enc=password_enc,
+    )
+
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+
+    return account
+
+
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vozlia")
