@@ -6,7 +6,6 @@ import base64
 import time
 from typing import List
 from datetime import datetime, timedelta
-from uuid import UUID  # <-- NEW
 
 import httpx  # <-- for Google OAuth + Gmail API
 
@@ -354,19 +353,10 @@ def _get_gmail_account_or_404(
     current_user: User,
     db: Session,
 ) -> EmailAccount:
-    """
-    Look up a Gmail account owned by the current user.
-    account_id is expected to be a UUID string (like the one returned by /auth/google/callback).
-    """
-    try:
-        account_uuid = UUID(account_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid account_id format")
-
     account = (
         db.query(EmailAccount)
         .filter(
-            EmailAccount.id == account_uuid,
+            EmailAccount.id == account_id,
             EmailAccount.user_id == current_user.id,
         )
         .first()
@@ -413,8 +403,10 @@ def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
     if not refresh_token:
         raise HTTPException(
             status_code=401,
-            detail="Gmail access token expired and no refresh token available. "
-                   "Please reconnect your Gmail account.",
+            detail=(
+                "Gmail access token expired and no refresh token available. "
+                "Please reconnect your Gmail account."
+            ),
         )
 
     data = {
@@ -468,23 +460,17 @@ def _extract_headers(message_json: dict) -> dict:
     }
 
 
-# ---------- Gmail API usage endpoints ----------
-
-@app.get("/email/accounts/{account_id}/messages")
-def list_gmail_messages(
+# ---------- Core Gmail listing logic (reusable by endpoints and helper) ----------
+def _gmail_list_messages_core(
     account_id: str,
-    max_results: int = 20,
-    query: str | None = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    max_results: int,
+    query: str | None,
+    db: Session,
+    current_user: User,
 ):
     """
-    List recent Gmail messages for this account with basic metadata + snippet.
-
-    Example queries:
-      - /email/accounts/{id}/messages
-      - /email/accounts/{id}/messages?max_results=10
-      - /email/accounts/{id}/messages?query=from:amazon OR subject:invoice
+    Core logic to list Gmail messages for an account.
+    Returns the same JSON structure used by the /messages endpoint.
     """
     account = _get_gmail_account_or_404(account_id, current_user, db)
     access_token = ensure_gmail_access_token(account, db)
@@ -559,6 +545,33 @@ def list_gmail_messages(
     }
 
 
+# ---------- Gmail API usage endpoints ----------
+
+@app.get("/email/accounts/{account_id}/messages")
+def list_gmail_messages(
+    account_id: str,
+    max_results: int = 20,
+    query: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List recent Gmail messages for this account with basic metadata + snippet.
+
+    Example queries:
+      - /email/accounts/{account_id}/messages
+      - /email/accounts/{account_id}/messages?max_results=10
+      - /email/accounts/{account_id}/messages?query=from:amazon OR subject:invoice
+    """
+    return _gmail_list_messages_core(
+        account_id=account_id,
+        max_results=max_results,
+        query=query,
+        db=db,
+        current_user=current_user,
+    )
+
+
 @app.get("/email/accounts/{account_id}/stats")
 def gmail_stats(
     account_id: str,
@@ -571,9 +584,9 @@ def gmail_stats(
     Uses Gmail search 'newer_than:{N}d'.
 
     Examples:
-      - /email/accounts/{id}/stats?window_days=1   -> "today-ish"
-      - /email/accounts/{id}/stats?window_days=7   -> last week
-      - /email/accounts/{id}/stats?window_days=30  -> last month-ish
+      - /email/accounts/{account_id}/stats?window_days=1   -> "today-ish"
+      - /email/accounts/{account_id}/stats?window_days=7   -> last week
+      - /email/accounts/{account_id}/stats?window_days=30  -> last month-ish
     """
     if window_days <= 0:
         raise HTTPException(
@@ -612,6 +625,130 @@ def gmail_stats(
         "query": query,
         "approx_message_count": size_estimate,
     }
+
+
+# ---------- Gmail summary helper for Vozlia (core logic) ----------
+def summarize_gmail_messages_for_assistant(
+    account_id: str,
+    db: Session,
+    current_user: User,
+    max_results: int = 20,
+    query: str | None = None,
+) -> dict:
+    """
+    Helper for Vozlia's voice logic.
+
+    Returns a dict:
+      {
+        "summary": "<short spoken-style summary>",
+        "messages": [... up to max_results messages ...],
+        "account_id": ...,
+        "email_address": ...,
+        "query": ...
+      }
+    """
+    if not OPENAI_API_KEY or client is None:
+        # Fallback: just return a plain-text description using subjects
+        data = _gmail_list_messages_core(
+            account_id=account_id,
+            max_results=max_results,
+            query=query,
+            db=db,
+            current_user=current_user,
+        )
+        messages = data.get("messages", [])
+        if not messages:
+            summary = "You have no recent emails matching that filter."
+        else:
+            subjects = [m.get("subject") or "(no subject)" for m in messages]
+            joined = "; ".join(subjects[:5])
+            summary = (
+                f"You have {len(messages)} recent emails. Some subjects include: {joined}."
+            )
+        data["summary"] = summary
+        return data
+
+    # Use OpenAI to create a tight, spoken-style summary.
+    data = _gmail_list_messages_core(
+        account_id=account_id,
+        max_results=max_results,
+        query=query,
+        db=db,
+        current_user=current_user,
+    )
+    messages = data.get("messages", [])
+
+    if not messages:
+        summary_text = "You have no recent emails matching that filter."
+    else:
+        # Truncate for prompt safety
+        messages_for_prompt = messages[: max_results]
+
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Vozlia, an AI phone secretary. "
+                            "Given a list of email metadata (subject, sender, snippet, date), "
+                            "produce a VERY short spoken-style summary for the caller. "
+                            "1–3 short sentences. Mention approximate counts and the most important themes, "
+                            "like bills, important notices, or personal messages. "
+                            "Do NOT read email addresses or long codes out loud."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Here is the list of recent emails:\n"
+                            + json.dumps(messages_for_prompt, indent=2)
+                            + "\n\nRespond with a short spoken summary only."
+                        ),
+                    },
+                ],
+            )
+            summary_text = resp.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Error generating Gmail summary via OpenAI: {e}")
+            # Fallback to simple subject-based summary
+            subjects = [m.get("subject") or "(no subject)" for m in messages]
+            joined = "; ".join(subjects[:5])
+            summary_text = (
+                f"You have {len(messages)} recent emails. Some subjects include: {joined}."
+            )
+
+    data["summary"] = summary_text
+    return data
+
+
+@app.get("/email/accounts/{account_id}/summary")
+def gmail_summary(
+    account_id: str,
+    max_results: int = 20,
+    query: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    High-level Gmail summary for this account, suitable for Vozlia to speak.
+
+    Example:
+      - /email/accounts/{account_id}/summary
+      - /email/accounts/{account_id}/summary?query=is:unread&max_results=10
+    """
+    data = summarize_gmail_messages_for_assistant(
+        account_id=account_id,
+        db=db,
+        current_user=current_user,
+        max_results=max_results,
+        query=query,
+    )
+
+    # Optionally trim the messages list to keep response lighter
+    data["messages"] = data.get("messages", [])[: max_results]
+    return data
 
 
 # ---------- OpenAI config ----------
