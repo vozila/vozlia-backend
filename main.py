@@ -228,9 +228,14 @@ async def twilio_stream(websocket: WebSocket):
     outgoing_audio = deque()
     assistant_last_audio_time = 0.0
 
+    # μ-law specifics
+    SAMPLE_RATE = 8000          # 8 kHz
+    FRAME_MS = 20               # 20 ms frames
+    FRAME_SIZE = int(SAMPLE_RATE * FRAME_MS / 1000)  # 160 bytes
+
     def assistant_actively_speaking() -> bool:
         """
-        Heuristic: AI is actively 'speaking' if we've sent audio in the last ~1s
+        AI is 'speaking' if we've sent audio in the last ~1s
         or there's audio in the queue waiting to go out.
         """
         if outgoing_audio:
@@ -269,7 +274,6 @@ async def twilio_stream(websocket: WebSocket):
                     if not payload_b64:
                         continue
 
-                    # Forward μ-law audio to OpenAI
                     audio_event = {
                         "type": "input_audio_buffer.append",
                         "audio": payload_b64,
@@ -285,12 +289,12 @@ async def twilio_stream(websocket: WebSocket):
 
         async def twilio_audio_sender():
             """
-            Drip-feed audio from outgoing_audio to Twilio so their buffer
-            never gets too far ahead. This is what makes barge-in effective.
+            Drip-feed 20ms μ-law frames from outgoing_audio to Twilio.
+            This keeps Twilio's buffer small so barge-in can actually work.
             """
             nonlocal assistant_last_audio_time, stream_sid
 
-            FRAME_INTERVAL = 0.02  # ~20ms per frame
+            FRAME_INTERVAL = FRAME_MS / 1000.0  # 0.02 s
 
             while True:
                 if stream_sid is None:
@@ -331,7 +335,7 @@ async def twilio_stream(websocket: WebSocket):
 
                 etype = event.get("type")
 
-                # ----- AUDIO FROM OPENAI → TWILIO (queued) -----
+                # ----- AUDIO FROM OPENAI → TWILIO (queued as 20ms frames) -----
                 if etype == "response.audio.delta":
                     audio_chunk_b64 = event.get("delta")
                     if not audio_chunk_b64:
@@ -351,15 +355,25 @@ async def twilio_stream(websocket: WebSocket):
                         )
                         continue
 
-                    # Normalize payload to base64 μ-law
+                    # Decode μ-law bytes
                     try:
                         raw_bytes = base64.b64decode(audio_chunk_b64)
-                        audio_payload = base64.b64encode(raw_bytes).decode("utf-8")
-                    except Exception:
-                        audio_payload = audio_chunk_b64
+                    except Exception as e:
+                        logger.error(
+                            f"Error base64-decoding audio chunk; dropping. Error: {e}"
+                        )
+                        continue
 
-                    # Enqueue instead of sending immediately
-                    outgoing_audio.append(audio_payload)
+                    # Slice into 20 ms frames (160 bytes) and enqueue each frame
+                    if not raw_bytes:
+                        continue
+
+                    for i in range(0, len(raw_bytes), FRAME_SIZE):
+                        frame = raw_bytes[i : i + FRAME_SIZE]
+                        if not frame:
+                            continue
+                        frame_b64 = base64.b64encode(frame).decode("utf-8")
+                        outgoing_audio.append(frame_b64)
 
                 elif etype == "response.audio.done":
                     logger.info("OpenAI finished an audio response")
@@ -387,7 +401,7 @@ async def twilio_stream(websocket: WebSocket):
                     user_speaking_vad = True
                     logger.info("OpenAI VAD: user speech START")
 
-                    # Pure VAD-based barge-in:
+                    # VAD-based barge-in:
                     if (
                         barge_in_enabled
                         and assistant_actively_speaking()
@@ -399,14 +413,14 @@ async def twilio_stream(websocket: WebSocket):
                             )
                             cancel_in_progress = True
 
-                            # Hard barge-in: stop sending audio and flush queue
+                            # Hard barge-in: drop queued frames & suppress deltas
                             outgoing_audio.clear()
                             suppress_assistant_audio = True
 
                             logger.info(
-                                "BARGE-IN (VAD only): user speech started while AI "
-                                "speaking; sent response.cancel, cleared queue, "
-                                "and suppressed audio"
+                                "BARGE-IN: user speech started while AI speaking; "
+                                "sent response.cancel, cleared audio queue, "
+                                "and suppressed further assistant audio."
                             )
                         except Exception as e:
                             logger.error(f"Error sending response.cancel: {e}")
@@ -422,7 +436,6 @@ async def twilio_stream(websocket: WebSocket):
                     code = err.get("code")
 
                     if code == "response_cancel_not_active":
-                        # Cancel came too late or no active response — reset flags
                         cancel_in_progress = False
                         suppress_assistant_audio = False
 
