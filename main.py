@@ -5,6 +5,9 @@ import logging
 import base64
 import time
 from typing import List
+from datetime import datetime, timedelta
+
+import httpx  # <-- for Google OAuth + Gmail API
 
 from fastapi import (
     FastAPI,
@@ -14,13 +17,15 @@ from fastapi import (
     Depends,
     HTTPException,
 )
-from fastapi.responses import PlainTextResponse, Response, JSONResponse
+from fastapi.responses import PlainTextResponse, Response, JSONResponse, RedirectResponse
 
 from sqlalchemy.orm import Session
 
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from openai import OpenAI
 import websockets
+
+from cryptography.fernet import Fernet  # centralized crypto
 
 from db import Base, engine
 from models import User, EmailAccount
@@ -35,6 +40,38 @@ logger.setLevel(logging.INFO)
 
 # ---------- FastAPI app ----------
 app = FastAPI()
+
+
+# ---------- Crypto helpers (for passwords & OAuth tokens) ----------
+def get_fernet() -> Fernet:
+    key = os.getenv("ENCRYPTION_KEY")
+    if not key:
+        raise RuntimeError("ENCRYPTION_KEY is not configured")
+    # ENCRYPTION_KEY should be something like Fernet.generate_key().decode()
+    return Fernet(key.encode() if not key.startswith("gAAAA") else key)
+
+
+def encrypt_str(value: str | None) -> str | None:
+    if value is None:
+        return None
+    f = get_fernet()
+    return f.encrypt(value.encode()).decode()
+
+
+def decrypt_str(value: str | None) -> str | None:
+    if not value:
+        return None
+    f = get_fernet()
+    return f.decrypt(value.encode()).decode()
+
+
+# ---------- Google / Gmail OAuth config ----------
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+
+# For now: read-only Gmail scope (you can expand later)
+GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 
 # Create tables on startup (simple MVP, later use Alembic)
@@ -85,8 +122,6 @@ def create_email_account(
     For provider_type == 'imap_custom', password (if provided) is encrypted
     before storing in password_enc.
     """
-    from cryptography.fernet import Fernet
-
     password_enc = None
     if payload.provider_type == "imap_custom" and payload.password:
         key = os.getenv("ENCRYPTION_KEY")
@@ -95,9 +130,8 @@ def create_email_account(
                 status_code=500,
                 detail="ENCRYPTION_KEY not configured on server",
             )
-
-        f = Fernet(key.encode() if not key.startswith("gAAAA") else key)
-        password_enc = f.encrypt(payload.password.encode()).decode()
+        # Use shared helper for consistency
+        password_enc = encrypt_str(payload.password)
 
     account = EmailAccount(
         user_id=current_user.id,
@@ -121,6 +155,173 @@ def create_email_account(
     db.refresh(account)
 
     return account
+
+
+# ---------- Google OAuth: start flow ----------
+@app.get("/auth/google/start")
+def google_auth_start(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Starts Gmail OAuth flow for the current user.
+    Returns a redirect to Google's consent screen.
+    """
+    if not GOOGLE_CLIENT_ID or not GOOGLE_REDIRECT_URI:
+        raise HTTPException(
+            status_code=500,
+            detail="Google OAuth not configured on server",
+        )
+
+    # For MVP, embed user id in state (no DB-backed state yet)
+    state = f"user-{current_user.id}"
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": GOOGLE_GMAIL_SCOPE,
+        "access_type": "offline",  # ask for refresh_token
+        "include_granted_scopes": "true",
+        "prompt": "consent",       # force showing consent to reliably get refresh_token
+        "state": state,
+    }
+
+    url = httpx.URL("https://accounts.google.com/o/oauth2/v2/auth", params=params)
+    return RedirectResponse(str(url))
+
+
+# ---------- Google OAuth: callback handler ----------
+@app.get("/auth/google/callback")
+async def google_auth_callback(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Handles Google's OAuth callback.
+    Exchanges 'code' for tokens, gets Gmail profile, and stores/updates EmailAccount.
+    """
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not GOOGLE_REDIRECT_URI:
+        raise HTTPException(
+            status_code=500,
+            detail="Google OAuth not configured on server",
+        )
+
+    params = dict(request.query_params)
+    error = params.get("error")
+    if error:
+        raise HTTPException(status_code=400, detail=f"Google OAuth error: {error}")
+
+    code = params.get("code")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing 'code' in callback")
+
+    # 1. Exchange code for tokens
+    token_url = "https://oauth2.googleapis.com/token"
+    data = {
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }
+
+    async with httpx.AsyncClient() as client_http:
+        token_resp = await client_http.post(token_url, data=data)
+        if token_resp.status_code != 200:
+            logger.error(
+                f"Google token exchange failed: {token_resp.status_code} {token_resp.text}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to exchange code for tokens with Google",
+            )
+
+        token_data = token_resp.json()
+
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")  # may be None on re-consent
+        expires_in = token_data.get("expires_in")
+
+        if not access_token:
+            raise HTTPException(
+                status_code=500,
+                detail="No access_token returned from Google",
+            )
+
+        # 2. Use access token to get Gmail profile (email address)
+        profile_url = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+        profile_resp = await client_http.get(
+            profile_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+
+        if profile_resp.status_code != 200:
+            logger.error(
+                f"Gmail profile request failed: {profile_resp.status_code} {profile_resp.text}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to fetch Gmail profile",
+            )
+
+        profile = profile_resp.json()
+        email_address = profile.get("emailAddress")
+        if not email_address:
+            raise HTTPException(
+                status_code=500,
+                detail="Gmail profile did not include emailAddress",
+            )
+
+    oauth_expires_at = (
+        datetime.utcnow() + timedelta(seconds=expires_in)
+        if expires_in
+        else None
+    )
+
+    # 3. Store or update EmailAccount row for this Gmail address
+    account = (
+        db.query(EmailAccount)
+        .filter(
+            EmailAccount.user_id == current_user.id,
+            EmailAccount.email_address == email_address,
+            EmailAccount.provider_type == "gmail",
+        )
+        .first()
+    )
+
+    if not account:
+        account = EmailAccount(
+            user_id=current_user.id,
+            provider_type="gmail",
+            oauth_provider="google",
+            email_address=email_address,
+            display_name=email_address,
+            is_primary=False,  # you can adjust via UI later
+            is_active=True,
+        )
+        db.add(account)
+
+    # Encrypt tokens and store
+    account.oauth_access_token = encrypt_str(access_token)
+    if refresh_token:
+        account.oauth_refresh_token = encrypt_str(refresh_token)
+    account.oauth_expires_at = oauth_expires_at
+
+    db.commit()
+    db.refresh(account)
+
+    logger.info(
+        f"Linked Gmail account for user_id={current_user.id}, email={email_address}"
+    )
+
+    # For now, just return JSON; later redirect back to your landing page/front-end
+    return {
+        "status": "ok",
+        "message": "Gmail account connected",
+        "email_address": email_address,
+        "account_id": str(account.id),
+    }
 
 
 # ---------- OpenAI config ----------
