@@ -60,18 +60,21 @@ if voice_env not in SUPPORTED_VOICES:
 
 VOICE_NAME = voice_env
 
+# ----- System behavior prompt -----
 SYSTEM_PROMPT = (
     "You are Vozlia, a warm, friendly, highly capable AI phone assistant using the "
     "Coral voice persona. Speak naturally, confidently, and in a professional tone, "
     "similar to a helpful customer support agent. "
     "You greet callers immediately at the start of the call, introduce yourself as "
     "Vozlia, and invite them to describe what they need help with. "
-    "Keep your responses very concise: usually no more than 2–3 short sentences "
-    "(around 5–7 seconds of speech) before pausing. "
-    "If the caller asks for a long explanation or story, summarize the key points "
-    "briefly and offer to go deeper only if they ask. "
-    "Be attentive to interruptions: if the caller starts speaking while you are "
-    "talking, immediately stop and listen. "
+    "Keep your responses VERY short and concise: usually 1–2 short sentences and "
+    "no more than about 5 seconds of speech before pausing. "
+    "If the caller asks for a long explanation or story, summarize only the key "
+    "points and ask if they want more details. "
+    "Be highly attentive to interruptions: if the caller starts speaking while you "
+    "are talking, you must immediately stop talking and listen. "
+    "If the caller says the word 'stop' while you are speaking, treat that as an "
+    "immediate instruction to stop talking. "
     "Your goal is to make callers feel welcome, understood, and supported."
 )
 
@@ -158,7 +161,7 @@ async def send_initial_greeting(openai_ws):
                         "text": (
                             "Greet the caller as Vozlia, a friendly AI phone assistant using "
                             "the Coral voice. Briefly introduce yourself and invite them to "
-                            "say what they need help with."
+                            "say what they need help with. Keep it to 1–2 short sentences."
                         ),
                     }
                 ],
@@ -223,6 +226,10 @@ async def twilio_stream(websocket: WebSocket):
     # Server VAD-based user speech flag
     user_speaking_vad = False
 
+    # Track last STOP-trigger time to avoid spamming cancels
+    last_stop_barge_in_ts = 0.0
+    STOP_COOLDOWN_SECONDS = 1.0
+
     try:
         openai_ws = await create_realtime_session()
 
@@ -272,6 +279,7 @@ async def twilio_stream(websocket: WebSocket):
         async def openai_to_twilio():
             nonlocal stream_sid, ai_speaking, barge_in_enabled, cancel_in_progress
             nonlocal suppress_assistant_audio, openai_ws, user_speaking_vad
+            nonlocal last_stop_barge_in_ts
 
             async for msg in openai_ws:
                 try:
@@ -336,6 +344,44 @@ async def twilio_stream(websocket: WebSocket):
                     if text:
                         logger.info(f"AI full text response: {text}")
 
+                # ----- USER TRANSCRIPT (for STOP keyword) -----
+                elif etype.startswith("input_text."):
+                    # Realtime may send input_text.delta / input_text.completed etc.
+                    text = event.get("delta") or event.get("text") or ""
+                    if text:
+                        logger.info(f"User transcript: {text!r}")
+                        lower = text.lower()
+
+                        # Check for explicit STOP keyword
+                        if "stop" in lower:
+                            now_ts = time.time()
+                            if (
+                                now_ts - last_stop_barge_in_ts
+                                > STOP_COOLDOWN_SECONDS
+                            ):
+                                last_stop_barge_in_ts = now_ts
+                                if (
+                                    barge_in_enabled
+                                    and ai_speaking
+                                    and not cancel_in_progress
+                                ):
+                                    try:
+                                        await openai_ws.send(
+                                            json.dumps({"type": "response.cancel"})
+                                        )
+                                        cancel_in_progress = True
+                                        ai_speaking = False
+                                        suppress_assistant_audio = True
+                                        logger.info(
+                                            "BARGE-IN (STOP keyword): user said 'stop' "
+                                            "while AI speaking; sent response.cancel "
+                                            "and suppressed audio"
+                                        )
+                                    except Exception as e:
+                                        logger.error(
+                                            f"Error sending response.cancel (STOP): {e}"
+                                        )
+
                 # ----- VAD EVENTS: drive user_speaking_vad & barge-in -----
                 elif etype == "input_audio_buffer.speech_started":
                     user_speaking_vad = True
@@ -373,6 +419,8 @@ async def twilio_stream(websocket: WebSocket):
                     code = err.get("code")
 
                     if code == "response_cancel_not_active":
+                        # This just means we tried to cancel when there was
+                        # no active response; we can safely clear flags.
                         cancel_in_progress = False
                         suppress_assistant_audio = False
 
