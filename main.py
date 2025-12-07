@@ -95,7 +95,7 @@ PREBUFFER_BYTES = PREBUFFER_FRAMES * BYTES_PER_FRAME
 
 # Limit how far ahead we've sent audio to Twilio (in seconds)
 # This directly bounds the maximum "tail" after barge-in.
-MAX_TWILIO_BACKLOG_SECONDS = 0.7
+MAX_TWILIO_BACKLOG_SECONDS = 1.0
 
 
 # ---------- FastAPI app ----------
