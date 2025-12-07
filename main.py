@@ -4,7 +4,6 @@ import asyncio
 import logging
 import base64
 import time
-from collections import deque
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response, JSONResponse
@@ -76,11 +75,15 @@ SYSTEM_PROMPT = (
     "Your goal is to make callers feel welcome, understood, and supported."
 )
 
-# Audio framing constants for G.711 μ-law at 8kHz
-SAMPLE_RATE = 8000          # Hz
-FRAME_MS = 20               # 20 ms per frame
+# ---------- Audio framing for G.711 μ-law ----------
+SAMPLE_RATE = 8000        # Hz
+FRAME_MS = 20             # 20 ms per frame
 BYTES_PER_FRAME = int(SAMPLE_RATE * FRAME_MS / 1000)  # 160 bytes
-FRAME_INTERVAL = FRAME_MS / 1000.0                    # 0.02 seconds
+FRAME_INTERVAL = FRAME_MS / 1000.0  # 0.02 seconds
+
+# Prebuffer at start of each utterance to smooth jitter (5 frames = 100ms)
+PREBUFFER_FRAMES = 5
+PREBUFFER_BYTES = PREBUFFER_FRAMES * BYTES_PER_FRAME
 
 
 # ---------- FastAPI app ----------
@@ -233,6 +236,9 @@ async def twilio_stream(websocket: WebSocket):
     audio_buffer = bytearray()
     assistant_last_audio_time = 0.0
 
+    # Prebuffer state: we hold back sending until we have PREBUFFER_BYTES
+    prebuffer_active = False
+
     def assistant_actively_speaking() -> bool:
         # If there's buffered audio, or we've sent audio very recently,
         # treat the assistant as actively speaking.
@@ -288,7 +294,7 @@ async def twilio_stream(websocket: WebSocket):
 
         async def openai_to_twilio():
             nonlocal stream_sid, barge_in_enabled, cancel_in_progress
-            nonlocal user_speaking_vad, assistant_last_audio_time, audio_buffer
+            nonlocal user_speaking_vad, assistant_last_audio_time, audio_buffer, prebuffer_active
 
             async for msg in openai_ws:
                 try:
@@ -305,12 +311,15 @@ async def twilio_stream(websocket: WebSocket):
                     if not audio_chunk_b64:
                         continue
 
-                    # Decode the μ-law audio and append to our continuous buffer.
                     try:
                         raw_bytes = base64.b64decode(audio_chunk_b64)
                     except Exception as e:
                         logger.error(f"Error decoding audio delta: {e}")
                         continue
+
+                    # If we were idle (no buffered audio), this is a new utterance:
+                    if len(audio_buffer) == 0:
+                        prebuffer_active = True
 
                     audio_buffer.extend(raw_bytes)
 
@@ -351,6 +360,7 @@ async def twilio_stream(websocket: WebSocket):
 
                             # Drop any queued assistant audio so Twilio tail is minimal
                             audio_buffer.clear()
+                            prebuffer_active = False
 
                             logger.info(
                                 "BARGE-IN: user speech started while AI speaking; "
@@ -376,13 +386,21 @@ async def twilio_stream(websocket: WebSocket):
         async def twilio_audio_sender():
             """
             Convert the continuous μ-law audio buffer into fixed 20 ms frames
-            and send them to Twilio at a steady cadence.
+            and send them to Twilio at a steady cadence, with a small prebuffer
+            per utterance to avoid choppiness.
             """
-            nonlocal assistant_last_audio_time, stream_sid, audio_buffer
+            nonlocal assistant_last_audio_time, stream_sid, audio_buffer, prebuffer_active
 
             try:
                 while True:
                     if stream_sid and len(audio_buffer) >= BYTES_PER_FRAME:
+                        # If we're still prebuffering this utterance, wait until we have enough
+                        if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
+                            await asyncio.sleep(0.005)
+                            continue
+                        else:
+                            prebuffer_active = False
+
                         # Take the next 20ms frame
                         frame_bytes = audio_buffer[:BYTES_PER_FRAME]
                         del audio_buffer[:BYTES_PER_FRAME]
