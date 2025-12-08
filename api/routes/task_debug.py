@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
@@ -20,7 +20,7 @@ router = APIRouter(prefix="/debug", tags=["task-debug"])
 
 # ---------- OpenAI client for brain/NLU ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-_openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+_openai_client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 @router.get("/tasks")
@@ -77,7 +77,7 @@ class BrainResponse(BaseModel):
     raw_event: Dict[str, Any]
     nlu_event: Dict[str, Any]
     speech: str
-    task_id: str | None = None
+    task_id: Optional[str] = None
     meta: Dict[str, Any]
 
 
@@ -104,7 +104,8 @@ def debug_brain(
     system_prompt = (
         "You are the NLU 'brain' for Vozlia, an AI phone assistant.\n"
         "Given what the caller says, you must output a single JSON object ONLY, "
-        "with no extra text. The JSON must match this schema:\n\n"
+        "with no extra text.\n"
+        "The JSON must match this schema:\n"
         "{\n"
         '  \"event\": \"task.intent\",               // literal string\n'
         "  \"intent\": string,                      // one of: set_reminder, start_timer, "
@@ -118,4 +119,77 @@ def debug_brain(
         "      // for start_timer: duration\n"
         "      // for take_note: text\n"
         "      // for check_email: query, max_results\n"
-        "
+        "      // for start_counting: start, end\n"
+        "  }\n"
+        "}\n\n"
+        "Rules:\n"
+        "- Respond with JSON ONLY. No explanations, no comments.\n"
+        "- If the user asks to continue a previous task, use intent=\"continue_task\" and "
+        "set task_id if mentioned; otherwise leave it null.\n"
+        "- For simple yes/no or small-talk that does not map to a task, "
+        "pick the closest intent or 'take_note' with a generic text.\n"
+    )
+
+    user_message = (
+        f"Caller text: {payload.text}\n\n"
+        f"User id: {payload.user_id}\n\n"
+        "Produce ONE JSON object matching the schema."
+    )
+
+    try:
+        resp = _openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0,
+        )
+        raw_content = resp.choices[0].message.content
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error calling OpenAI for NLU: {e}",
+        )
+
+    # 2) Parse the JSON the model returned
+    try:
+        nlu_dict = json.loads(raw_content)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Failed to parse NLU JSON from model.",
+                "raw_content": raw_content,
+                "error": str(e),
+            },
+        )
+
+    # Ensure user_id/text are set from request (even if model forgot)
+    nlu_dict["user_id"] = payload.user_id
+    if "text" not in nlu_dict or nlu_dict["text"] is None:
+        nlu_dict["text"] = payload.text
+
+    # 3) Validate/normalize via NLUEvent model
+    try:
+        nlu_event = NLUEvent(**nlu_dict)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "NLUEvent validation failed.",
+                "nlu_dict": nlu_dict,
+                "error": str(e),
+            },
+        )
+
+    # 4) Run it through your existing task engine
+    directive = handle_nlu_event(db, nlu_event)
+
+    return BrainResponse(
+        raw_event=nlu_dict,
+        nlu_event=jsonable_encoder(nlu_event),
+        speech=directive.speech,
+        task_id=directive.task_id,
+        meta=directive.meta,
+    )
