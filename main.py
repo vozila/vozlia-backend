@@ -32,6 +32,10 @@ from models import User, EmailAccount
 from schemas import EmailAccountCreate, EmailAccountRead
 from deps import get_db
 
+# ⬇️ NEW: bring in task engine API routes
+from api.routes import tasks as tasks_routes
+from api.routes import task_debug as task_debug_routes
+
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +44,10 @@ logger.setLevel(logging.INFO)
 
 # ---------- FastAPI app ----------
 app = FastAPI()
+
+# ⬇️ NEW: include task engine routers
+app.include_router(tasks_routes.router)
+app.include_router(task_debug_routes.router)
 
 
 # ---------- Crypto helpers (for passwords & OAuth tokens) ----------
