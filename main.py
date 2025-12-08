@@ -54,6 +54,7 @@ app.include_router(task_debug_routes.router)
 
 VOICE_USER_ID_CACHE: str | None = None
 
+
 def _get_internal_base_url() -> str:
     """
     Internal base URL to call this same service from inside the container.
@@ -1112,6 +1113,9 @@ async def twilio_stream(websocket: WebSocket):
     # Prebuffer state: we hold back sending until we have PREBUFFER_BYTES
     prebuffer_active = False
 
+    # Per-call transcript history (last few utterances)
+    call_transcripts: list[str] = []
+
     def assistant_actively_speaking() -> bool:
         # If there's buffered audio, or we've sent audio very recently,
         # treat the assistant as actively speaking.
@@ -1167,7 +1171,7 @@ async def twilio_stream(websocket: WebSocket):
 
         async def openai_to_twilio():
             nonlocal stream_sid, barge_in_enabled, cancel_in_progress
-            nonlocal user_speaking_vad, assistant_last_audio_time, audio_buffer, prebuffer_active
+            nonlocal user_speaking_vad, assistant_last_audio_time, audio_buffer, prebuffer_active, call_transcripts
 
             async for msg in openai_ws:
                 try:
@@ -1215,7 +1219,7 @@ async def twilio_stream(websocket: WebSocket):
                     if text:
                         logger.info(f"AI full text response: {text}")
 
-                             # ----- USER TRANSCRIPTS (ASR from caller audio) -----
+                # ----- USER TRANSCRIPTS (ASR from caller audio) -----
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     transcript = event.get("transcript")
                     item_id = event.get("item_id")
@@ -1224,15 +1228,20 @@ async def twilio_stream(websocket: WebSocket):
                             f"[ASR] User said (item_id={item_id}): {transcript!r}"
                         )
 
-                        # 🔁 Route transcript through your text brain (/debug/brain)
-                        speech = await run_brain_on_transcript(transcript)
+                        # Keep a short rolling history for better NLU
+                        call_transcripts.append(transcript)
+                        context_text = " ".join(call_transcripts[-5:])
+                        logger.info(
+                            f"[ASR] Combined context for brain: {context_text!r}"
+                        )
+
+                        # 🔁 Route the combined text through your text brain
+                        speech = await run_brain_on_transcript(context_text)
 
                         if speech:
                             # Feed the brain's response back into the Realtime session
                             # so Coral will speak it to the caller.
                             try:
-                                # We treat this as user text that instructs the model
-                                # WHAT to say, but keep it simple: ask it to say this.
                                 convo_item = {
                                     "type": "conversation.item.create",
                                     "item": {
@@ -1242,9 +1251,10 @@ async def twilio_stream(websocket: WebSocket):
                                             {
                                                 "type": "input_text",
                                                 "text": (
-                                                    "Please say this to the caller, "
-                                                    "in a natural, concise way: "
-                                                    + speech
+                                                    "Say the following sentence to the caller "
+                                                    "exactly as written, without changing the meaning "
+                                                    "and without adding any commentary: "
+                                                    f"\"{speech}\""
                                                 ),
                                             }
                                         ],
@@ -1255,13 +1265,12 @@ async def twilio_stream(websocket: WebSocket):
                                     json.dumps({"type": "response.create"})
                                 )
                                 logger.info(
-                                    f"[BRAIN] Sent brain-generated speech back to Realtime."
+                                    "[BRAIN] Sent brain-generated speech back to Realtime."
                                 )
                             except Exception as e:
                                 logger.error(
                                     f"Error sending brain response into Realtime: {e}"
                                 )
-
 
                 # ----- VAD EVENTS: drive user_speaking_vad & barge-in -----
                 elif etype == "input_audio_buffer.speech_started":
