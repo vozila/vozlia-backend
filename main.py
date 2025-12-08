@@ -886,6 +886,15 @@ async def debug_gpt(text: str = "Hello Vozlia"):
     return JSONResponse({"reply": reply})
 
 
+@app.get("/debug/me")
+def debug_me(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return {
+        "id": str(current_user.id),
+        "email": current_user.email,
+    }
+
+
+
 # ---------- Twilio inbound → TwiML ----------
 @app.post("/twilio/inbound")
 async def twilio_inbound(request: Request):
