@@ -50,6 +50,102 @@ app.include_router(tasks_routes.router)
 app.include_router(task_debug_routes.router)
 
 
+# ---------- Internal brain wiring (call /debug/brain from inside the app) ----------
+
+VOICE_USER_ID_CACHE: str | None = None
+
+def _get_internal_base_url() -> str:
+    """
+    Internal base URL to call this same service from inside the container.
+    On Render, uvicorn listens on PORT (e.g. 10000) on 0.0.0.0.
+    """
+    port = os.getenv("PORT", "8000")
+    return f"http://127.0.0.1:{port}"
+
+
+async def get_voice_user_id() -> str:
+    """
+    Resolve which user_id to use for phone calls.
+
+    Strategy:
+      1) If VOZLIA_VOICE_USER_ID env var is set, use that.
+      2) Otherwise, call /debug/me once and cache the resulting user id.
+    """
+    global VOICE_USER_ID_CACHE
+
+    if VOICE_USER_ID_CACHE:
+        return VOICE_USER_ID_CACHE
+
+    env_user_id = os.getenv("VOZLIA_VOICE_USER_ID")
+    if env_user_id:
+        VOICE_USER_ID_CACHE = env_user_id
+        logger.info(f"Using VOZLIA_VOICE_USER_ID={env_user_id} for voice calls")
+        return env_user_id
+
+    base = _get_internal_base_url()
+    url = f"{base}/debug/me"
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client_http:
+            resp = await client_http.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+        user_id = data.get("id")
+        if not user_id:
+            raise RuntimeError("debug/me did not return an 'id' field")
+
+        VOICE_USER_ID_CACHE = user_id
+        logger.info(f"Resolved voice user_id via /debug/me: {user_id}")
+        return user_id
+
+    except Exception as e:
+        logger.error(f"Failed to resolve voice user id via /debug/me: {e}")
+        # Fallback: dummy id (tasks will still work but not tied cleanly)
+        fallback_id = "voice-demo-user"
+        VOICE_USER_ID_CACHE = fallback_id
+        return fallback_id
+
+
+async def run_brain_on_transcript(transcript: str) -> str | None:
+    """
+    Call the existing /debug/brain endpoint with the transcript text and
+    return the 'speech' string that should be spoken back to the caller.
+
+    This reuses the same intent detection + task engine you already have.
+    """
+    base = _get_internal_base_url()
+    url = f"{base}/debug/brain"
+
+    user_id = await get_voice_user_id()
+
+    payload = {
+        "user_id": user_id,
+        "text": transcript,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client_http:
+            resp = await client_http.post(url, json=payload)
+        if resp.status_code != 200:
+            logger.error(
+                f"/debug/brain HTTP {resp.status_code}: {resp.text}"
+            )
+            return None
+
+        data = resp.json()
+        speech = data.get("speech")
+        if not speech:
+            logger.warning(f"/debug/brain response missing 'speech': {data}")
+            return None
+
+        logger.info(f"[BRAIN] Got speech from /debug/brain: {speech!r}")
+        return speech
+
+    except Exception as e:
+        logger.error(f"Error calling internal /debug/brain: {e}")
+        return None
+
+
 # ---------- Crypto helpers (for passwords & OAuth tokens) ----------
 def get_fernet() -> Fernet:
     key = os.getenv("ENCRYPTION_KEY")
@@ -1119,7 +1215,7 @@ async def twilio_stream(websocket: WebSocket):
                     if text:
                         logger.info(f"AI full text response: {text}")
 
-                # ----- USER TRANSCRIPTS (ASR from caller audio) -----
+                             # ----- USER TRANSCRIPTS (ASR from caller audio) -----
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     transcript = event.get("transcript")
                     item_id = event.get("item_id")
@@ -1127,11 +1223,45 @@ async def twilio_stream(websocket: WebSocket):
                         logger.info(
                             f"[ASR] User said (item_id={item_id}): {transcript!r}"
                         )
-                        # 🚧 NEXT STEP (future):
-                        # Here is where we'll call your task brain:
-                        #   from tasks.brain import run_brain_on_text
-                        #   directive = run_brain_on_text(db, user_id, transcript)
-                        #   -> then send directive.speech back as assistant text/audio.
+
+                        # 🔁 Route transcript through your text brain (/debug/brain)
+                        speech = await run_brain_on_transcript(transcript)
+
+                        if speech:
+                            # Feed the brain's response back into the Realtime session
+                            # so Coral will speak it to the caller.
+                            try:
+                                # We treat this as user text that instructs the model
+                                # WHAT to say, but keep it simple: ask it to say this.
+                                convo_item = {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "message",
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "input_text",
+                                                "text": (
+                                                    "Please say this to the caller, "
+                                                    "in a natural, concise way: "
+                                                    + speech
+                                                ),
+                                            }
+                                        ],
+                                    },
+                                }
+                                await openai_ws.send(json.dumps(convo_item))
+                                await openai_ws.send(
+                                    json.dumps({"type": "response.create"})
+                                )
+                                logger.info(
+                                    f"[BRAIN] Sent brain-generated speech back to Realtime."
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"Error sending brain response into Realtime: {e}"
+                                )
+
 
                 # ----- VAD EVENTS: drive user_speaking_vad & barge-in -----
                 elif etype == "input_audio_buffer.speech_started":
