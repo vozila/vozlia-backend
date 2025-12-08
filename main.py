@@ -964,7 +964,7 @@ async def create_realtime_session():
     # IMPORTANT:
     #  - modalities MUST be ["audio", "text"] if you want audio.
     #  - input/output formats stay g711_ulaw for Twilio.
-    #  - input_audio_transcription enables server-side transcripts.
+    #  - input_audio_transcription only takes a 'model' field (no 'enabled').
     session_update = {
         "type": "session.update",
         "session": {
@@ -977,7 +977,6 @@ async def create_realtime_session():
                 "type": "server_vad",
             },
             "input_audio_transcription": {
-                "enabled": True,
                 "model": "gpt-4o-mini-transcribe",
                 # optional later:
                 # "language": "en",
