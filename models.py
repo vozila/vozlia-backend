@@ -1,6 +1,7 @@
 # models.py
 from datetime import datetime
 from uuid import uuid4
+import enum
 
 from sqlalchemy import (
     Column,
@@ -10,8 +11,9 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     Text,
+    Enum as SAEnum,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from db import Base
@@ -24,7 +26,15 @@ class User(Base):
     email = Column(String, unique=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
+    # Relationships
     email_accounts = relationship("EmailAccount", back_populates="user")
+    # New: user ↔ tasks
+    tasks = relationship(
+        "Task",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class EmailAccount(Base):
@@ -59,3 +69,61 @@ class EmailAccount(Base):
 
     user = relationship("User", back_populates="email_accounts")
 
+
+# =========================
+# Task Engine Models
+# =========================
+
+class TaskStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    COLLECTING_INPUT = "COLLECTING_INPUT"
+    READY = "READY"
+    EXECUTING = "EXECUTING"
+    WAITING = "WAITING"
+    COMPLETED = "COMPLETED"
+    ERROR = "ERROR"
+
+
+class TaskType(str, enum.Enum):
+    REMINDER = "REMINDER"
+    TIMER = "TIMER"
+    EMAIL_CHECK = "EMAIL_CHECK"
+    NOTE = "NOTE"
+    WORKFLOW = "WORKFLOW"
+    COUNTING = "COUNTING"
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    type = Column(SAEnum(TaskType, name="task_type_enum"), nullable=False)
+    status = Column(SAEnum(TaskStatus, name="task_status_enum"), nullable=False, default=TaskStatus.PENDING)
+
+    # Flexible JSON structures used by the task engine
+    # {
+    #   "required": [...],
+    #   "optional": {...},
+    #   "collected": {...}
+    # }
+    inputs = Column(JSONB, nullable=False, default=dict)
+
+    # {
+    #   "cursor": "step_name_or_index",
+    #   "context": {...},
+    #   "history": [...]
+    # }
+    state = Column(JSONB, nullable=False, default=dict)
+
+    # {
+    #   "result": ...,
+    #   "error": "..."
+    # }
+    execution = Column(JSONB, nullable=False, default=dict)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="tasks")
