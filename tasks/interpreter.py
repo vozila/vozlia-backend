@@ -6,12 +6,13 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from models import TaskType, TaskStatus, Task as TaskORM
-from .engine import (
+from tasks.engine import (
     create_task,
     update_task_inputs,
     execute_task,
     get_active_tasks_for_user,
 )
+from tasks.domain import TaskInputs, TaskState  # ⬅️ IMPORTANT
 
 
 class NLUEvent(BaseModel):
@@ -51,6 +52,7 @@ def handle_nlu_event(db: Session, evt: NLUEvent) -> AssistantDirective:
     Main entrypoint: given intent + entities + (optional) task_id,
     decide what to do with the task engine and return a directive.
     """
+    # Special control intents
     if evt.intent == "continue_task":
         return _handle_continue(db, evt)
     if evt.intent == "cancel_task":
@@ -58,6 +60,7 @@ def handle_nlu_event(db: Session, evt: NLUEvent) -> AssistantDirective:
     if evt.intent == "what_number_were_you_on":
         return _handle_query_current(db, evt)
 
+    # Regular "start a task" intents
     task_type = INTENT_TO_TASK_TYPE.get(evt.intent)
     if not task_type:
         return AssistantDirective(
@@ -65,7 +68,7 @@ def handle_nlu_event(db: Session, evt: NLUEvent) -> AssistantDirective:
             meta={"intent": evt.intent},
         )
 
-    # If an existing task is referenced -> update that
+    # If an existing task is referenced → update & maybe execute
     if evt.task_id:
         task = db.query(TaskORM).filter(TaskORM.id == evt.task_id).first()
         if task:
@@ -85,7 +88,7 @@ def handle_nlu_event(db: Session, evt: NLUEvent) -> AssistantDirective:
                 meta={"status": updated_task.status},
             )
 
-    # Otherwise, create new task
+    # Otherwise, create a brand new task
     task = create_task(
         db,
         user_id=evt.user_id,
@@ -134,7 +137,11 @@ def _prompt_for_missing(missing: List[str]) -> str:
     return "I need a bit more information. Can you tell me the details I’m missing?"
 
 
-def _get_current_task_for_user(db: Session, user_id: str, task_id: Optional[str]) -> Optional[TaskORM]:
+def _get_current_task_for_user(
+    db: Session,
+    user_id: str,
+    task_id: Optional[str],
+) -> Optional[TaskORM]:
     if task_id:
         task = db.query(TaskORM).filter(TaskORM.id == task_id).first()
         if task:
@@ -149,6 +156,7 @@ def _handle_continue(db: Session, evt: NLUEvent) -> AssistantDirective:
     if not task:
         return AssistantDirective(speech="There’s nothing in progress to continue right now.")
 
+    # Special behavior for COUNTING tasks
     if task.type == TaskType.COUNTING:
         inputs = TaskInputsWrapper.from_raw(task.inputs)
         state = TaskStateWrapper.from_raw(task.state)
@@ -193,7 +201,7 @@ def _handle_cancel(db: Session, evt: NLUEvent) -> AssistantDirective:
         return AssistantDirective(speech="There’s no active task to cancel.")
 
     task.status = TaskStatus.ERROR
-    exec_obj = (task.execution or {}) if isinstance(task.execution, dict) else {}
+    exec_obj = task.execution if isinstance(task.execution, dict) else {}
     exec_obj["error"] = "Cancelled by user"
     task.execution = exec_obj
 
