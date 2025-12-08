@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple, List
+from uuid import UUID  # ⬅️ NEW
 
 from sqlalchemy.orm import Session
 
@@ -40,6 +41,12 @@ def create_task(
     task_type: TaskType,
     initial_inputs: Optional[Dict[str, Any]] = None,
 ) -> TaskORM:
+    # Normalize user_id to a real UUID object for the DB
+    try:
+        user_uuid = UUID(str(user_id))
+    except ValueError:
+        raise ValueError(f"Invalid user_id '{user_id}', expected UUID string")
+
     # Task-type-specific config: required inputs, optional, steps
     if task_type == TaskType.REMINDER:
         required = ["time", "message"]
@@ -85,7 +92,7 @@ def create_task(
     execution = TaskExecution(result=None, error=None)
 
     task = TaskORM(
-        user_id=user_id,
+        user_id=user_uuid,  # ⬅️ use UUID, not raw string
         type=task_type,
         status=status,
         inputs=_dump_inputs(inputs),
@@ -124,10 +131,12 @@ def update_task_inputs(db: Session, task: TaskORM, new_inputs: Dict[str, Any]) -
 
 
 def get_active_tasks_for_user(db: Session, user_id: str) -> list[TaskORM]:
+    # Normalize to UUID for querying
+    user_uuid = UUID(str(user_id))
     return (
         db.query(TaskORM)
         .filter(
-            TaskORM.user_id == user_id,
+            TaskORM.user_id == user_uuid,
             TaskORM.status.notin_([TaskStatus.COMPLETED, TaskStatus.ERROR]),
         )
         .all()
