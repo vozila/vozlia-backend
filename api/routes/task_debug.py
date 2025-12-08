@@ -13,6 +13,7 @@ from deps import get_db
 from models import Task as TaskORM
 from tasks.interpreter import NLUEvent, handle_nlu_event
 from openai import OpenAI
+from tasks.brain import run_brain_on_text
 
 
 # All routes in this file will be under /debug/...
@@ -89,16 +90,24 @@ def debug_brain(
     """
     End-to-end simulator:
 
-      caller text → GPT builds an NLUEvent JSON → task engine → assistant speech
+      caller text → brain (NLU + tasks) → assistant speech
 
-    This is the exact flow we will later embed inside /twilio/stream,
-    except there we'll feed in transcribed audio instead of plain text.
+    This uses the same core logic that we will later invoke from /twilio/stream.
     """
-    if not OPENAI_API_KEY or _openai_client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY is not configured on the server.",
-        )
+    result = run_brain_on_text(
+        db,
+        user_id=payload.user_id,
+        text=payload.text,
+    )
+
+    return BrainResponse(
+        raw_event=result["raw_event"],
+        nlu_event=jsonable_encoder(result["nlu_event"]),
+        speech=result["speech"],
+        task_id=result["task_id"],
+        meta=result["meta"],
+    )
+
 
     # 1) Ask GPT to turn free-form text into an NLUEvent JSON
     system_prompt = (
