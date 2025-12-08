@@ -961,23 +961,25 @@ async def create_realtime_session():
         extra_headers=OPENAI_REALTIME_HEADERS,
     )
 
-    # 🔑 UPDATED: enable transcription of caller audio
+    # IMPORTANT:
+    #  - modalities MUST be ["audio", "text"] if you want audio.
+    #  - input/output formats stay g711_ulaw for Twilio.
+    #  - input_audio_transcription enables server-side transcripts.
     session_update = {
         "type": "session.update",
         "session": {
             "instructions": SYSTEM_PROMPT,
             "voice": VOICE_NAME,
-            # We drive logic server-side; audio modality is enough here.
-            "modalities": ["audio"],
+            "modalities": ["audio", "text"],
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "turn_detection": {
                 "type": "server_vad",
             },
-            # NEW: ask Realtime to transcribe user speech and send us events
             "input_audio_transcription": {
-                "model": "gpt-4o-transcribe",
-                # You can optionally set language/prompt later:
+                "enabled": True,
+                "model": "gpt-4o-mini-transcribe",
+                # optional later:
                 # "language": "en",
                 # "prompt": "Phone call with a user talking to a virtual assistant.",
             },
