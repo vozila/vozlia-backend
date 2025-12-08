@@ -894,7 +894,6 @@ def debug_me(db: Session = Depends(get_db), current_user: User = Depends(get_cur
     }
 
 
-
 # ---------- Twilio inbound → TwiML ----------
 @app.post("/twilio/inbound")
 async def twilio_inbound(request: Request):
@@ -962,22 +961,31 @@ async def create_realtime_session():
         extra_headers=OPENAI_REALTIME_HEADERS,
     )
 
+    # 🔑 UPDATED: enable transcription of caller audio
     session_update = {
         "type": "session.update",
         "session": {
             "instructions": SYSTEM_PROMPT,
             "voice": VOICE_NAME,
-            "modalities": ["text", "audio"],
+            # We drive logic server-side; audio modality is enough here.
+            "modalities": ["audio"],
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "turn_detection": {
                 "type": "server_vad",
             },
+            # NEW: ask Realtime to transcribe user speech and send us events
+            "input_audio_transcription": {
+                "model": "gpt-4o-transcribe",
+                # You can optionally set language/prompt later:
+                # "language": "en",
+                # "prompt": "Phone call with a user talking to a virtual assistant.",
+            },
         },
     }
 
     await openai_ws.send(json.dumps(session_update))
-    logger.info("Sent session.update to OpenAI Realtime")
+    logger.info("Sent session.update to OpenAI Realtime (with transcription enabled)")
 
     await send_initial_greeting(openai_ws)
 
@@ -1109,6 +1117,20 @@ async def twilio_stream(websocket: WebSocket):
                     text = event.get("text", "")
                     if text:
                         logger.info(f"AI full text response: {text}")
+
+                # ----- USER TRANSCRIPTS (ASR from caller audio) -----
+                elif etype == "conversation.item.input_audio_transcription.completed":
+                    transcript = event.get("transcript")
+                    item_id = event.get("item_id")
+                    if transcript:
+                        logger.info(
+                            f"[ASR] User said (item_id={item_id}): {transcript!r}"
+                        )
+                        # 🚧 NEXT STEP (future):
+                        # Here is where we'll call your task brain:
+                        #   from tasks.brain import run_brain_on_text
+                        #   directive = run_brain_on_text(db, user_id, transcript)
+                        #   -> then send directive.speech back as assistant text/audio.
 
                 # ----- VAD EVENTS: drive user_speaking_vad & barge-in -----
                 elif etype == "input_audio_buffer.speech_started":
