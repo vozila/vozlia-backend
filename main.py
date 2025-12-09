@@ -17,25 +17,19 @@ from fastapi import (
     Depends,
     HTTPException,
 )
-from fastapi.responses import PlainTextResponse, Response, JSONResponse, RedirectResponse
-
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, RedirectResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from twilio.twiml.voice_response import VoiceResponse, Connect
-from openai import OpenAI
 import websockets
 
-from cryptography.fernet import Fernet  # centralized crypto
+from openai import OpenAI
 
-from db import Base, engine
-from models import User, EmailAccount
-from schemas import EmailAccountCreate, EmailAccountRead
+from db import SessionLocal
 from deps import get_db
-
-# ⬇️ NEW: bring in task engine API routes
-from api.routes import tasks as tasks_routes
-from api.routes import task_debug as task_debug_routes
-
+from models import GmailAccount
+from schemas import GmailAccountCreate, GmailAccountRead
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -45,9 +39,14 @@ logger.setLevel(logging.INFO)
 # ---------- FastAPI app ----------
 app = FastAPI()
 
-# ⬇️ NEW: include task engine routers
-app.include_router(tasks_routes.router)
-app.include_router(task_debug_routes.router)
+# CORS (if you’re calling from a browser-based landing page or admin UI)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten for prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------- Internal brain wiring (call /debug/brain from inside the app) ----------
@@ -80,28 +79,22 @@ async def get_voice_user_id() -> str:
     env_user_id = os.getenv("VOZLIA_VOICE_USER_ID")
     if env_user_id:
         VOICE_USER_ID_CACHE = env_user_id
-        logger.info(f"Using VOZLIA_VOICE_USER_ID={env_user_id} for voice calls")
         return env_user_id
 
-    base = _get_internal_base_url()
-    url = f"{base}/debug/me"
+    internal_base = _get_internal_base_url()
+    url = f"{internal_base}/debug/me"
 
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client_http:
-            resp = await client_http.get(url)
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
         resp.raise_for_status()
         data = resp.json()
-        user_id = data.get("id")
-        if not user_id:
-            raise RuntimeError("debug/me did not return an 'id' field")
-
+        user_id = str(data.get("id") or data.get("user_id") or "voice-demo-user")
         VOICE_USER_ID_CACHE = user_id
-        logger.info(f"Resolved voice user_id via /debug/me: {user_id}")
+        logger.info(f"Resolved voice user_id={user_id!r} via /debug/me")
         return user_id
-
     except Exception as e:
-        logger.error(f"Failed to resolve voice user id via /debug/me: {e}")
-        # Fallback: dummy id (tasks will still work but not tied cleanly)
+        logger.error(f"Error resolving voice user id via /debug/me: {e}")
         fallback_id = "voice-demo-user"
         VOICE_USER_ID_CACHE = fallback_id
         return fallback_id
@@ -110,146 +103,158 @@ async def get_voice_user_id() -> str:
 async def run_brain_on_transcript(transcript: str) -> str | None:
     """
     Call the existing /debug/brain endpoint with the transcript text and
-    return the 'speech' string that should be spoken back to the caller.
+    return the 'speech' string if any.
 
-    This reuses the same intent detection + task engine you already have.
+    NOTE: In the current PROD version, we’re no longer using this inside the
+    Twilio <-> OpenAI loop. It’s kept here only for future LAB experiments.
     """
-    base = _get_internal_base_url()
-    url = f"{base}/debug/brain"
+    internal_base = _get_internal_base_url()
+    url = f"{internal_base}/debug/brain"
 
-    user_id = await get_voice_user_id()
+    try:
+        user_id = await get_voice_user_id()
+    except Exception as e:
+        logger.error(f"Error obtaining voice user id: {e}")
+        return None
 
     payload = {
         "user_id": user_id,
-        "text": transcript,
+        "transcript": transcript,
     }
 
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client_http:
-            resp = await client_http.post(url, json=payload)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload)
         if resp.status_code != 200:
-            logger.error(
-                f"/debug/brain HTTP {resp.status_code}: {resp.text}"
-            )
+            logger.error(f"/debug/brain HTTP {resp.status_code}: {resp.text}")
             return None
 
         data = resp.json()
         speech = data.get("speech")
-        if not speech:
+        if not isinstance(speech, str) or not speech.strip():
             logger.warning(f"/debug/brain response missing 'speech': {data}")
             return None
 
-        logger.info(f"[BRAIN] Got speech from /debug/brain: {speech!r}")
-        return speech
-
+        logger.info(f"Brain returned speech: {speech!r}")
+        return speech.strip()
     except Exception as e:
-        logger.error(f"Error calling internal /debug/brain: {e}")
+        logger.error(f"Error calling /debug/brain: {e}")
         return None
 
 
-# ---------- Crypto helpers (for passwords & OAuth tokens) ----------
-def get_fernet() -> Fernet:
-    key = os.getenv("ENCRYPTION_KEY")
-    if not key:
-        raise RuntimeError("ENCRYPTION_KEY is not configured")
-    # ENCRYPTION_KEY should be something like Fernet.generate_key().decode()
-    return Fernet(key.encode() if not key.startswith("gAAAA") else key)
+# ---------- Health check ----------
+@app.get("/health", response_class=PlainTextResponse)
+async def health():
+    return "OK"
 
 
-def encrypt_str(value: str | None) -> str | None:
-    if value is None:
-        return None
-    f = get_fernet()
-    return f.encrypt(value.encode()).decode()
+# ---------- Database dependency ----------
+def get_db_sync():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-def decrypt_str(value: str | None) -> str | None:
-    if not value:
-        return None
-    f = get_fernet()
-    return f.decrypt(value.encode()).decode()
+# ---------- Gmail account models / schemas ----------
+
+class GmailAuthInitResponse(BaseModel):
+    auth_url: str
 
 
-# ---------- Google / Gmail OAuth config ----------
+class GmailAuthCallbackRequest(BaseModel):
+    code: str
+    state: str
+
+
+# ---------- Google OAuth config ----------
+
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
-# For now: read-only Gmail scope (you can expand later)
-GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GOOGLE_AUTH_BASE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
+GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
-
-# Create tables on startup (simple MVP, later use Alembic)
-@app.on_event("startup")
-def on_startup() -> None:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables ensured (create_all).")
-
-
-# ---------- Auth stub / current user ----------
-def get_current_user(db: Session = Depends(get_db)) -> User:
-    """
-    TEMP: For now, just returns the first user or creates a demo user.
-    Later this will be replaced with real auth / tenant logic.
-    """
-    user = db.query(User).first()
-    if not user:
-        user = User(email="demo@vozlia.com")
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        logger.info(f"Created demo user with id={user.id} email={user.email}")
-    return user
-
-
-# ---------- Email account endpoints ----------
-@app.get("/email/accounts", response_model=List[EmailAccountRead])
-def list_email_accounts(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> List[EmailAccountRead]:
-    accounts = (
-        db.query(EmailAccount)
-        .filter(EmailAccount.user_id == current_user.id)
-        .all()
+if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not GOOGLE_REDIRECT_URI:
+    logger.warning(
+        "Google OAuth env vars are not fully set. "
+        "Gmail account linking will not work."
     )
-    return accounts
 
 
-@app.post("/email/accounts", response_model=EmailAccountRead)
-def create_email_account(
-    payload: EmailAccountCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> EmailAccountRead:
+def build_google_auth_url(state: str) -> str:
+    from urllib.parse import urlencode
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": GOOGLE_GMAIL_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    return f"{GOOGLE_AUTH_BASE_URL}?{urlencode(params)}"
+
+
+async def exchange_code_for_tokens(code: str) -> dict:
+    data = {
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(GOOGLE_TOKEN_URL, data=data)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def refresh_google_tokens(refresh_token: str) -> dict:
+    data = {
+        "refresh_token": refresh_token,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(GOOGLE_TOKEN_URL, data=data)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ---------- Gmail account CRUD ----------
+
+@app.post("/email/accounts", response_model=GmailAccountRead)
+async def create_gmail_account(
+    payload: GmailAccountCreate,
+    db: Session = Depends(get_db_sync),
+):
     """
-    Creates an email account record for the current user.
-    For provider_type == 'imap_custom', password (if provided) is encrypted
-    before storing in password_enc.
+    Create a Gmail account record with encrypted refresh token and SMTP settings.
     """
-    password_enc = None
-    if payload.provider_type == "imap_custom" and payload.password:
-        key = os.getenv("ENCRYPTION_KEY")
-        if not key:
-            raise HTTPException(
-                status_code=500,
-                detail="ENCRYPTION_KEY not configured on server",
-            )
-        # Use shared helper for consistency
-        password_enc = encrypt_str(payload.password)
+    if not payload.refresh_token:
+        raise HTTPException(status_code=400, detail="Missing refresh_token")
 
-    account = EmailAccount(
-        user_id=current_user.id,
-        provider_type=payload.provider_type,
-        email_address=str(payload.email_address),
-        display_name=payload.display_name,
-        is_primary=payload.is_primary,
-        is_active=payload.is_active,
-        imap_host=payload.imap_host,
-        imap_port=payload.imap_port,
-        imap_ssl=payload.imap_ssl,
+    from cryptography.fernet import Fernet
+
+    key = os.getenv("ENCRYPTION_KEY")
+    if not key:
+        raise HTTPException(
+            status_code=500,
+            detail="ENCRYPTION_KEY not set in environment.",
+        )
+
+    f = Fernet(key.encode("utf-8"))
+    password_enc = f.encrypt(payload.password.encode("utf-8"))
+
+    account = GmailAccount(
+        email_address=payload.email_address,
+        refresh_token=payload.refresh_token,
         smtp_host=payload.smtp_host,
         smtp_port=payload.smtp_port,
         smtp_ssl=payload.smtp_ssl,
@@ -265,609 +270,108 @@ def create_email_account(
 
 
 # ---------- Google OAuth: start flow ----------
-@app.get("/auth/google/start")
-def google_auth_start(
-    current_user: User = Depends(get_current_user),
-):
+@app.get("/auth/google/start", response_model=GmailAuthInitResponse)
+async def google_auth_start():
     """
-    Starts Gmail OAuth flow for the current user.
-    Returns a redirect to Google's consent screen.
-    """
-    if not GOOGLE_CLIENT_ID or not GOOGLE_REDIRECT_URI:
-        raise HTTPException(
-            status_code=500,
-            detail="Google OAuth not configured on server",
-        )
-
-    # For MVP, embed user id in state (no DB-backed state yet)
-    state = f"user-{current_user.id}"
-
-    params = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": GOOGLE_REDIRECT_URI,
-        "response_type": "code",
-        "scope": GOOGLE_GMAIL_SCOPE,
-        "access_type": "offline",  # ask for refresh_token
-        "include_granted_scopes": "true",
-        "prompt": "consent",       # force showing consent to reliably get refresh_token
-        "state": state,
-    }
-
-    url = httpx.URL("https://accounts.google.com/o/oauth2/v2/auth", params=params)
-    return RedirectResponse(str(url))
-
-
-# ---------- Google OAuth: callback handler ----------
-@app.get("/auth/google/callback")
-async def google_auth_callback(
-    request: Request,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Handles Google's OAuth callback.
-    Exchanges 'code' for tokens, gets Gmail profile, and stores/updates EmailAccount.
+    Return URL that the user should visit to authorize Gmail access.
     """
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not GOOGLE_REDIRECT_URI:
         raise HTTPException(
             status_code=500,
-            detail="Google OAuth not configured on server",
+            detail="Google OAuth is not configured.",
         )
 
-    params = dict(request.query_params)
-    error = params.get("error")
-    if error:
-        raise HTTPException(status_code=400, detail=f"Google OAuth error: {error}")
+    state = "dummy-state"  # TODO: generate and persist a CSRF-safe state
+    url = build_google_auth_url(state)
+    return GmailAuthInitResponse(auth_url=url)
 
-    code = params.get("code")
+
+# ---------- Google OAuth: callback ----------
+@app.get("/auth/google/callback")
+async def google_auth_callback(request: Request):
+    """
+    Handle the Google OAuth callback. In a real app, you'd:
+      - Verify the 'state'
+      - Exchange 'code' for tokens
+      - Store tokens mapped to the correct user
+    """
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+
     if not code:
-        raise HTTPException(status_code=400, detail="Missing 'code' in callback")
+        raise HTTPException(status_code=400, detail="Missing 'code' in query params")
 
-    # 1. Exchange code for tokens
-    data = {
-        "code": code,
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "redirect_uri": GOOGLE_REDIRECT_URI,
-        "grant_type": "authorization_code",
-    }
+    try:
+        token_data = await exchange_code_for_tokens(code)
+    except httpx.HTTPError as e:
+        logger.error(f"Error exchanging code for tokens: {e}")
+        raise HTTPException(status_code=500, detail="Token exchange failed")
 
-    async with httpx.AsyncClient() as client_http:
-        token_resp = await client_http.post(GOOGLE_TOKEN_URL, data=data)
-        if token_resp.status_code != 200:
-            logger.error(
-                "Google token exchange failed: %s %s",
-                token_resp.status_code,
-                token_resp.text,
-            )
-            try:
-                google_error = token_resp.json()
-            except Exception:
-                google_error = {"raw": token_resp.text}
+    logger.info(f"Google token data: {token_data}")
 
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "message": "Failed to exchange code for tokens with Google",
-                    "google_status": token_resp.status_code,
-                    "google_error": google_error,
-                },
-            )
+    return RedirectResponse(url="/auth/success")  # or wherever your UI lives
 
-        token_data = token_resp.json()
 
-        access_token = token_data.get("access_token")
-        refresh_token = token_data.get("refresh_token")  # may be None on re-consent
-        expires_in = token_data.get("expires_in")
+# ---------- Gmail simple queries ----------
 
-        if not access_token:
-            raise HTTPException(
-                status_code=500,
-                detail="No access_token returned from Google",
-            )
+async def get_gmail_headers(access_token: str, max_results: int = 10) -> List[dict]:
+    url = "https://www.googleapis.com/gmail/v1/users/me/messages"
+    params = {"maxResults": max_results}
+    headers = {"Authorization": f"Bearer {access_token}"}
 
-        # 2. Use access token to get Gmail profile (email address)
-        profile_url = f"{GMAIL_API_BASE}/users/me/profile"
-        profile_resp = await client_http.get(
-            profile_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-
-        if profile_resp.status_code != 200:
-            logger.error(
-                "Gmail profile request failed: %s %s",
-                profile_resp.status_code,
-                profile_resp.text,
-            )
-            try:
-                google_error = profile_resp.json()
-            except Exception:
-                google_error = {"raw": profile_resp.text}
-
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "message": "Failed to fetch Gmail profile",
-                    "google_status": profile_resp.status_code,
-                    "google_error": google_error,
-                },
-            )
-
-        profile = profile_resp.json()
-        email_address = profile.get("emailAddress")
-        if not email_address:
-            raise HTTPException(
-                status_code=500,
-                detail="Gmail profile did not include emailAddress",
-            )
-
-    oauth_expires_at = (
-        datetime.utcnow() + timedelta(seconds=expires_in)
-        if expires_in
-        else None
-    )
-
-    # 3. Store or update EmailAccount row for this Gmail address
-    account = (
-        db.query(EmailAccount)
-        .filter(
-            EmailAccount.user_id == current_user.id,
-            EmailAccount.email_address == email_address,
-            EmailAccount.provider_type == "gmail",
-        )
-        .first()
-    )
-
-    if not account:
-        account = EmailAccount(
-            user_id=current_user.id,
-            provider_type="gmail",
-            oauth_provider="google",
-            email_address=email_address,
-            display_name=email_address,
-            is_primary=False,  # you can adjust via UI later
-            is_active=True,
-        )
-        db.add(account)
-
-    # Encrypt tokens and store
-    account.oauth_access_token = encrypt_str(access_token)
-    if refresh_token:
-        account.oauth_refresh_token = encrypt_str(refresh_token)
-    account.oauth_expires_at = oauth_expires_at
-
-    db.commit()
-    db.refresh(account)
-
-    logger.info(
-        f"Linked Gmail account for user_id={current_user.id}, email={email_address}"
-    )
-
-    # For now, just return JSON; later redirect back to your landing page/front-end
-    return {
-        "status": "ok",
-        "message": "Gmail account connected",
-        "email_address": email_address,
-        "account_id": str(account.id),
-    }
-
-
-# ---------- Gmail helpers (token refresh + account fetch) ----------
-def _get_gmail_account_or_404(
-    account_id: str,
-    current_user: User,
-    db: Session,
-) -> EmailAccount:
-    account = (
-        db.query(EmailAccount)
-        .filter(
-            EmailAccount.id == account_id,
-            EmailAccount.user_id == current_user.id,
-        )
-        .first()
-    )
-    if not account:
-        raise HTTPException(status_code=404, detail="Email account not found")
-
-    if account.provider_type != "gmail" or account.oauth_provider != "google":
-        raise HTTPException(
-            status_code=400,
-            detail="Email account is not a Gmail account linked via Google OAuth",
-        )
-
-    if not account.oauth_access_token:
-        raise HTTPException(
-            status_code=400,
-            detail="No OAuth access token stored for this account",
-        )
-
-    return account
-
-
-def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
-    """
-    Returns a valid Gmail access token, refreshing with the stored refresh token
-    if needed. Updates DB if a refresh occurs.
-    """
-    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="Google OAuth not configured on server",
-        )
-
-    access_token = decrypt_str(account.oauth_access_token)
-    refresh_token = decrypt_str(account.oauth_refresh_token)
-    now = datetime.utcnow()
-
-    # If token is still valid for at least 60s, reuse it
-    if account.oauth_expires_at and access_token:
-        if account.oauth_expires_at > now + timedelta(seconds=60):
-            return access_token
-
-    # Need to refresh
-    if not refresh_token:
-        raise HTTPException(
-            status_code=401,
-            detail=(
-                "Gmail access token expired and no refresh token available. "
-                "Please reconnect your Gmail account."
-            ),
-        )
-
-    data = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token",
-    }
-
-    with httpx.Client(timeout=10.0) as client_http:
-        resp = client_http.post(GOOGLE_TOKEN_URL, data=data)
-        if resp.status_code != 200:
-            logger.error(
-                f"Failed to refresh Gmail token: {resp.status_code} {resp.text}"
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="Failed to refresh Gmail access token with Google",
-            )
-
-        token_data = resp.json()
-        new_access_token = token_data.get("access_token")
-        expires_in = token_data.get("expires_in")
-
-        if not new_access_token:
-            raise HTTPException(
-                status_code=500,
-                detail="Google did not return a new access token during refresh",
-            )
-
-        account.oauth_access_token = encrypt_str(new_access_token)
-        if expires_in:
-            account.oauth_expires_at = now + timedelta(seconds=expires_in)
-        db.commit()
-        db.refresh(account)
-
-        return new_access_token
-
-
-def _extract_headers(message_json: dict) -> dict:
-    headers_list = (
-        message_json.get("payload", {})
-        .get("headers", [])
-    )
-    h = {hdr.get("name", "").lower(): hdr.get("value", "") for hdr in headers_list}
-    return {
-        "subject": h.get("subject"),
-        "from": h.get("from"),
-        "to": h.get("to"),
-        "date": h.get("date"),
-    }
-
-
-# ---------- Core Gmail listing logic (reusable by endpoints and helper) ----------
-def _gmail_list_messages_core(
-    account_id: str,
-    max_results: int,
-    query: str | None,
-    db: Session,
-    current_user: User,
-):
-    """
-    Core logic to list Gmail messages for an account.
-    Returns the same JSON structure used by the /messages endpoint.
-    """
-    # Safety clamp: avoid accidentally slamming Gmail with huge requests
-    if max_results <= 0:
-        max_results = 1
-    if max_results > 50:
-        max_results = 50
-
-    account = _get_gmail_account_or_404(account_id, current_user, db)
-    access_token = ensure_gmail_access_token(account, db)
-
-    params = {
-        "maxResults": max_results,
-    }
-    if query:
-        params["q"] = query
-
-    with httpx.Client(timeout=10.0) as client_http:
-        # 1) List message IDs
-        list_url = f"{GMAIL_API_BASE}/users/me/messages"
-        list_resp = client_http.get(
-            list_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            params=params,
-        )
-        if list_resp.status_code != 200:
-            logger.error(
-                f"Gmail list messages failed: {list_resp.status_code} {list_resp.text}"
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="Failed to list Gmail messages",
-            )
-
-        list_data = list_resp.json()
-        messages = list_data.get("messages", [])
-        size_estimate = list_data.get("resultSizeEstimate", len(messages))
-
-        # 2) Fetch details for each message (up to max_results)
-        detailed = []
-        for msg in messages:
-            msg_id = msg.get("id")
-            if not msg_id:
-                continue
-
-            msg_url = f"{GMAIL_API_BASE}/users/me/messages/{msg_id}"
-            msg_resp = client_http.get(
-                msg_url,
-                headers={"Authorization": f"Bearer {access_token}"},
-                params={"format": "metadata"},
-            )
-            if msg_resp.status_code != 200:
-                logger.warning(
-                    f"Failed to fetch Gmail message {msg_id}: "
-                    f"{msg_resp.status_code} {msg_resp.text}"
-                )
-                continue
-
-            msg_json = msg_resp.json()
-            headers = _extract_headers(msg_json)
-            detailed.append(
-                {
-                    "id": msg_json.get("id"),
-                    "threadId": msg_json.get("threadId"),
-                    "snippet": msg_json.get("snippet"),
-                    "subject": headers.get("subject"),
-                    "from": headers.get("from"),
-                    "to": headers.get("to"),
-                    "date": headers.get("date"),
-                }
-            )
-
-    return {
-        "account_id": account_id,
-        "email_address": account.email_address,
-        "query": query,
-        "resultSizeEstimate": size_estimate,
-        "messages": detailed,
-    }
-
-
-# ---------- Gmail API usage endpoints ----------
-
-@app.get("/email/accounts/{account_id}/messages")
-def list_gmail_messages(
-    account_id: str,
-    max_results: int = 20,
-    query: str | None = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    List recent Gmail messages for this account with basic metadata + snippet.
-
-    Example queries:
-      - /email/accounts/{account_id}/messages
-      - /email/accounts/{account_id}/messages?max_results=10
-      - /email/accounts/{account_id}/messages?query=from:amazon OR subject:invoice
-    """
-    return _gmail_list_messages_core(
-        account_id=account_id,
-        max_results=max_results,
-        query=query,
-        db=db,
-        current_user=current_user,
-    )
-
-
-@app.get("/email/accounts/{account_id}/stats")
-def gmail_stats(
-    account_id: str,
-    window_days: int = 1,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Approximate count of messages received in the last N days.
-    Uses Gmail search 'newer_than:{N}d'.
-
-    Examples:
-      - /email/accounts/{account_id}/stats?window_days=1   -> "today-ish"
-      - /email/accounts/{account_id}/stats?window_days=7   -> last week
-      - /email/accounts/{account_id}/stats?window_days=30  -> last month-ish
-    """
-    if window_days <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="window_days must be >= 1",
-        )
-
-    account = _get_gmail_account_or_404(account_id, current_user, db)
-    access_token = ensure_gmail_access_token(account, db)
-
-    query = f"newer_than:{window_days}d"
-
-    with httpx.Client(timeout=10.0) as client_http:
-        list_url = f"{GMAIL_API_BASE}/users/me/messages"
-        list_resp = client_http.get(
-            list_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            params={"q": query, "maxResults": 1},
-        )
-        if list_resp.status_code != 200:
-            logger.error(
-                f"Gmail stats list failed: {list_resp.status_code} {list_resp.text}"
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="Failed to compute Gmail stats",
-            )
-
-        data = list_resp.json()
-        size_estimate = data.get("resultSizeEstimate", 0)
-
-    return {
-        "account_id": account_id,
-        "email_address": account.email_address,
-        "window_days": window_days,
-        "query": query,
-        "approx_message_count": size_estimate,
-    }
-
-
-# ---------- Gmail summary helper for Vozlia (core logic) ----------
-def summarize_gmail_messages_for_assistant(
-    account_id: str,
-    db: Session,
-    current_user: User,
-    max_results: int = 20,
-    query: str | None = None,
-) -> dict:
-    """
-    Helper for Vozlia's voice logic.
-
-    Returns a dict:
-      {
-        "summary": "<short spoken-style summary>",
-        "messages": [... up to max_results messages ...],
-        "account_id": ...,
-        "email_address": ...,
-        "query": ...
-      }
-    """
-    # Clamp here too, in case it's called directly
-    if max_results <= 0:
-        max_results = 1
-    if max_results > 50:
-        max_results = 50
-
-    if not OPENAI_API_KEY or client is None:
-        # Fallback: just return a plain-text description using subjects
-        data = _gmail_list_messages_core(
-            account_id=account_id,
-            max_results=max_results,
-            query=query,
-            db=db,
-            current_user=current_user,
-        )
-        messages = data.get("messages", [])
-        if not messages:
-            summary = "You have no recent emails matching that filter."
-        else:
-            subjects = [m.get("subject") or "(no subject)" for m in messages]
-            joined = "; ".join(subjects[:5])
-            summary = (
-                f"You have {len(messages)} recent emails. "
-                f"Some subjects include: {joined}."
-            )
-        data["summary"] = summary
-        return data
-
-    # Use OpenAI to create a tight, spoken-style summary.
-    data = _gmail_list_messages_core(
-        account_id=account_id,
-        max_results=max_results,
-        query=query,
-        db=db,
-        current_user=current_user,
-    )
-    messages = data.get("messages", [])
-
-    if not messages:
-        summary_text = "You have no recent emails matching that filter."
-    else:
-        # Truncate for prompt safety
-        messages_for_prompt = messages[: max_results]
-
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are Vozlia, an AI phone secretary. "
-                            "Given a list of email metadata (subject, sender, snippet, date), "
-                            "produce a VERY short spoken-style summary for the caller. "
-                            "1–3 short sentences. Mention approximate counts and the most important themes, "
-                            "like bills, important notices, or personal messages. "
-                            "Do NOT read email addresses or long codes out loud."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "Here is the list of recent emails:\n"
-                            + json.dumps(messages_for_prompt, indent=2)
-                            + "\n\nRespond with a short spoken summary only."
-                        ),
-                    },
-                ],
-            )
-            summary_text = resp.choices[0].message.content
-        except Exception as e:
-            logger.error(f"Error generating Gmail summary via OpenAI: {e}")
-            # Fallback to simple subject-based summary
-            subjects = [m.get("subject") or "(no subject)" for m in messages]
-            joined = "; ".join(subjects[:5])
-            summary_text = (
-                f"You have {len(messages)} recent emails. "
-                f"Some subjects include: {joined}."
-            )
-
-    data["summary"] = summary_text
-    return data
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(url, params=params, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("messages", [])
 
 
 @app.get("/email/accounts/{account_id}/summary")
-def gmail_summary(
-    account_id: str,
-    max_results: int = 20,
+async def gmail_summary(
+    account_id: int,
+    max_results: int = 10,
     query: str | None = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_sync),
 ):
     """
-    High-level Gmail summary for this account, suitable for Vozlia to speak.
-
-    Example:
-      - /email/accounts/{account_id}/summary
-      - /email/accounts/{account_id}/summary?query=is:unread&max_results=10
+    Very simple Gmail summary endpoint:
+      - Looks up GmailAccount by ID.
+      - Refreshes tokens if needed.
+      - Calls Gmail API to fetch recent messages.
     """
-    data = summarize_gmail_messages_for_assistant(
-        account_id=account_id,
-        db=db,
-        current_user=current_user,
-        max_results=max_results,
-        query=query,
-    )
+    account: GmailAccount | None = db.query(GmailAccount).filter(
+        GmailAccount.id == account_id
+    ).first()
 
-    # Optionally trim the messages list to keep response lighter
-    data["messages"] = data.get("messages", [])[: max_results]
-    return data
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    from cryptography.fernet import Fernet
+
+    key = os.getenv("ENCRYPTION_KEY")
+    if not key:
+        raise HTTPException(
+            status_code=500,
+            detail="ENCRYPTION_KEY not set in environment.",
+        )
+
+    f = Fernet(key.encode("utf-8"))
+    # Here we only need the refresh_token; password is used for SMTP elsewhere
+    refresh_token = account.refresh_token
+
+    try:
+        token_data = await refresh_google_tokens(refresh_token)
+    except httpx.HTTPError as e:
+        logger.error(f"Error refreshing Google tokens: {e}")
+        raise HTTPException(status_code=500, detail="Failed to refresh token")
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=500, detail="No access_token in token_data")
+
+    headers_list = await get_gmail_headers(access_token, max_results=max_results)
+
+    return {"account_id": account_id, "email_address": account.email_address, "messages": headers_list}
 
 
 # ---------- OpenAI config ----------
@@ -889,168 +393,31 @@ OPENAI_REALTIME_HEADERS = {
 }
 
 SUPPORTED_VOICES = {
-    "alloy",
-    "ash",
-    "ballad",
-    "coral",
-    "echo",
-    "sage",
-    "shimmer",
-    "verse",
-    "marin",
-    "cedar",
+    "coral": "coral",
+    "alloy": "alloy",
 }
 
-voice_env = os.getenv("OPENAI_REALTIME_VOICE", "coral")
-if voice_env not in SUPPORTED_VOICES:
-    logger.warning(
-        f"Unsupported voice '{voice_env}' for Realtime. "
-        "Falling back to 'coral'. Supported voices: "
-        + ", ".join(sorted(SUPPORTED_VOICES))
-    )
-    voice_env = "coral"
+VOICE_NAME = os.getenv("VOZLIA_VOICE", "coral")
+if VOICE_NAME not in SUPPORTED_VOICES:
+    VOICE_NAME = "coral"
 
-VOICE_NAME = voice_env
-
-SYSTEM_PROMPT = (
-    "You are Vozlia, a warm, friendly, highly capable AI phone assistant using the "
-    "Coral voice persona. Speak naturally, confidently, and in a professional tone, "
-    "similar to a helpful customer support agent. "
-    "You greet callers immediately at the start of the call, introduce yourself as "
-    "Vozlia, and invite them to describe what they need help with. "
-    "Keep your responses very concise: usually no more than 2–3 short sentences "
-    "(around 5–7 seconds of speech) before pausing. "
-    "If the caller asks for a long explanation or story, summarize the key points "
-    "briefly and offer to go deeper only if they ask. "
-    "Be attentive to interruptions: if the caller starts speaking while you are "
-    "talking, immediately stop and listen. "
-    "Your goal is to make callers feel welcome, understood, and supported."
+SYSTEM_PROMPT = os.getenv(
+    "VOZLIA_SYSTEM_PROMPT",
+    (
+        "You are Vozlia, a calm, competent, AI-powered assistant on a phone call. "
+        "You speak clearly, concisely, and naturally. "
+        "You are allowed to ask clarifying questions when needed, but avoid rambling. "
+        "Do not guess about facts you are uncertain about; say what you *can* do. "
+        "You are talking to a real human on a call, so be polite and easy to interrupt."
+    ),
 )
 
-# ---------- Audio framing for G.711 μ-law ----------
-SAMPLE_RATE = 8000        # Hz
-FRAME_MS = 20             # 20 ms per frame
-BYTES_PER_FRAME = int(SAMPLE_RATE * FRAME_MS / 1000)  # 160 bytes
 
-# Real-time pacing: one 20ms frame every 20ms
-FRAME_INTERVAL = FRAME_MS / 1000.0  # 0.020 seconds
-
-# Prebuffer at start of each utterance to smooth jitter
-# 4 frames = 80 ms
-PREBUFFER_FRAMES = 4
-PREBUFFER_BYTES = PREBUFFER_FRAMES * BYTES_PER_FRAME
-
-# Limit how far ahead we've sent audio to Twilio (in seconds)
-# This directly bounds the maximum "tail" after barge-in.
-MAX_TWILIO_BACKLOG_SECONDS = 1.0
-
-
-# ---------- Basic health endpoints ----------
-@app.get("/")
-async def root():
-    return PlainTextResponse("OK")
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-# ---------- Debug GPT (text only) ----------
-async def generate_gpt_reply(text: str) -> str:
-    logger.info(f"/debug/gpt called with text: {text!r}")
-
-    if not OPENAI_API_KEY or client is None:
-        return "OpenAI API key is not configured on the server."
-
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are Vozlia, a helpful AI assistant."},
-                {"role": "user", "content": text},
-            ],
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        logger.error(f"Error calling OpenAI chat.completions: {e}")
-        return f"Error talking to GPT: {e}"
-
-
-@app.get("/debug/gpt")
-async def debug_gpt(text: str = "Hello Vozlia"):
-    reply = await generate_gpt_reply(text)
-    return JSONResponse({"reply": reply})
-
-
-@app.get("/debug/me")
-def debug_me(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return {
-        "id": str(current_user.id),
-        "email": current_user.email,
-    }
-
-
-# ---------- Twilio inbound → TwiML ----------
-@app.post("/twilio/inbound")
-async def twilio_inbound(request: Request):
-    form = await request.form()
-    from_number = form.get("From")
-    to_number = form.get("To")
-    call_sid = form.get("CallSid")
-
-    logger.info(
-        f"Incoming call: From={from_number}, To={to_number}, CallSid={call_sid}"
-    )
-
-    resp = VoiceResponse()
-    connect = Connect()
-
-    stream_url = os.getenv(
-        "TWILIO_STREAM_URL",
-        "wss://vozlia-backend.onrender.com/twilio/stream",
-    )
-    connect.stream(url=stream_url)
-    resp.append(connect)
-
-    xml = str(resp)
-    logger.debug(f"Generated TwiML:\n{xml}")
-
-    return Response(content=xml, media_type="application/xml")
-
-
-# ---------- Helper: initial greeting via Realtime ----------
-async def send_initial_greeting(openai_ws):
-    try:
-        convo_item = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Greet the caller as Vozlia, a friendly AI phone assistant using "
-                            "the Coral voice. Briefly introduce yourself and invite them to "
-                            "say what they need help with."
-                        ),
-                    }
-                ],
-            },
-        }
-        await openai_ws.send(json.dumps(convo_item))
-        await openai_ws.send(json.dumps({"type": "response.create"}))
-        logger.info("Sent initial greeting request to OpenAI Realtime")
-    except Exception as e:
-        logger.error(f"Error sending initial greeting: {e}")
-
-
-# ---------- Helper: OpenAI Realtime session via websockets ----------
 async def create_realtime_session():
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set; cannot use Realtime API.")
-
+    """
+    Create an OpenAI Realtime WebSocket session and send a session.update
+    configuring audio + transcription.
+    """
     logger.info("Connecting to OpenAI Realtime WebSocket via websockets...")
 
     openai_ws = await websockets.connect(
@@ -1075,9 +442,6 @@ async def create_realtime_session():
             },
             "input_audio_transcription": {
                 "model": "gpt-4o-mini-transcribe",
-                # optional later:
-                # "language": "en",
-                # "prompt": "Phone call with a user talking to a virtual assistant.",
             },
         },
     }
@@ -1085,12 +449,49 @@ async def create_realtime_session():
     await openai_ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime (with transcription enabled)")
 
-    await send_initial_greeting(openai_ws)
-
     return openai_ws
 
 
-# ---------- Twilio media stream ↔ OpenAI Realtime ----------
+# ---------- Twilio inbound → TwiML ----------
+@app.post("/twilio/inbound")
+async def twilio_inbound(request: Request):
+    """
+    Twilio hits this first. We respond with TwiML instructing it to open a
+    Media Stream WebSocket to /twilio/stream.
+    """
+    form = await request.form()
+    from_number = form.get("From")
+    to_number = form.get("To")
+
+    logger.info(f"Incoming call from {from_number} to {to_number}")
+
+    twiml = f"""
+<Response>
+    <Start>
+        <Stream url="wss://{request.url.hostname}/twilio/stream" />
+    </Start>
+    <Say>Connecting you to Vozlia, your AI assistant.</Say>
+    <Pause length="60" />
+</Response>
+    """.strip()
+
+    return PlainTextResponse(twiml, media_type="text/xml")
+
+
+# ---------- Twilio Media Stream WebSocket ----------
+FRAME_MS = 20
+SAMPLE_RATE = 8000
+BYTES_PER_FRAME = int(SAMPLE_RATE * (FRAME_MS / 1000.0))
+
+# Prebuffer ~100ms (5 frames) of audio before sending to Twilio
+PREBUFFER_FRAMES = 5
+PREBUFFER_BYTES = PREBUFFER_FRAMES * BYTES_PER_FRAME
+
+# Limit how far ahead we've sent audio to Twilio (in seconds)
+# This directly bounds the maximum "tail" after barge-in.
+MAX_TWILIO_BACKLOG_SECONDS = 1.0
+
+
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
     await websocket.accept()
@@ -1117,8 +518,7 @@ async def twilio_stream(websocket: WebSocket):
     call_transcripts: list[str] = []
 
     def assistant_actively_speaking() -> bool:
-        # If there's buffered audio, or we've sent audio very recently,
-        # treat the assistant as actively speaking.
+        # If there's buffered audio, or
         if audio_buffer:
             return True
         return (time.monotonic() - assistant_last_audio_time) < 0.6
@@ -1134,40 +534,37 @@ async def twilio_stream(websocket: WebSocket):
                 except WebSocketDisconnect:
                     logger.info("Twilio WebSocket disconnected")
                     break
+                except Exception as e:
+                    logger.error(f"Error receiving from Twilio WS: {e}")
+                    break
 
                 try:
                     data = json.loads(msg_text)
                 except json.JSONDecodeError:
-                    logger.warning(f"Non-JSON message from Twilio: {msg_text!r}")
+                    logger.warning(f"Non-JSON payload from Twilio: {msg_text!r}")
                     continue
 
-                event_type = data.get("event")
+                event = data.get("event")
 
-                if event_type != "media":
-                    logger.info(f"Twilio stream event: {event_type}")
-
-                if event_type == "start":
-                    stream_sid = data.get("start", {}).get("streamSid")
-                    logger.info(f"Stream started: {stream_sid}")
-
-                elif event_type == "media":
-                    payload_b64 = data.get("media", {}).get("payload")
-                    if not payload_b64:
+                if event == "start":
+                    stream_sid = data.get("streamSid")
+                    logger.info(f"Twilio stream started (streamSid={stream_sid})")
+                elif event == "media":
+                    if not openai_ws:
                         continue
 
-                    # Always forward μ-law audio to OpenAI
-                    audio_event = {
+                    chunk = data["media"]["payload"]
+                    audio_bytes = base64.b64decode(chunk)
+
+                    base64_ulaw = base64.b64encode(audio_bytes).decode("ascii")
+                    realtime_event = {
                         "type": "input_audio_buffer.append",
-                        "audio": payload_b64,
+                        "audio": base64_ulaw,
                     }
-                    await openai_ws.send(json.dumps(audio_event))
-
-                elif event_type == "stop":
-                    logger.info("Twilio sent stop; closing call.")
+                    await openai_ws.send(json.dumps(realtime_event))
+                elif event == "stop":
+                    logger.info("Twilio stream stopped by Twilio")
                     break
-
-                elif event_type == "connected":
-                    logger.info("Twilio reports call connected")
 
         async def openai_to_twilio():
             nonlocal stream_sid, barge_in_enabled, cancel_in_progress
@@ -1201,18 +598,15 @@ async def twilio_stream(websocket: WebSocket):
                     audio_buffer.extend(raw_bytes)
 
                 elif etype == "response.audio.done":
-                    logger.info("OpenAI finished an audio response")
-                    cancel_in_progress = False
-                    # After the first full response, allow barge-in.
-                    if not barge_in_enabled:
-                        barge_in_enabled = True
-                        logger.info("Barge-in is now ENABLED for subsequent responses.")
+                    logger.info("OpenAI finished an audio response.")
+                    assistant_last_audio_time = time.monotonic()
+                    barge_in_enabled = True
+                    prebuffer_active = False
 
-                # ----- TEXT LOGGING (optional) -----
                 elif etype == "response.text.delta":
-                    delta = event.get("delta", "")
-                    if delta:
-                        logger.info(f"AI (text delta): {delta}")
+                    text_delta = event.get("delta", "")
+                    if text_delta:
+                        logger.info(f"AI text delta: {text_delta}")
 
                 elif etype == "response.text.done":
                     text = event.get("text", "")
@@ -1227,50 +621,8 @@ async def twilio_stream(websocket: WebSocket):
                         logger.info(
                             f"[ASR] User said (item_id={item_id}): {transcript!r}"
                         )
-
-                        # Keep a short rolling history for better NLU
+                        # Keep a short rolling history; useful for logging or future NLU
                         call_transcripts.append(transcript)
-                        context_text = " ".join(call_transcripts[-5:])
-                        logger.info(
-                            f"[ASR] Combined context for brain: {context_text!r}"
-                        )
-
-                        # 🔁 Route the combined text through your text brain
-                        speech = await run_brain_on_transcript(context_text)
-
-                        if speech:
-                            # Feed the brain's response back into the Realtime session
-                            # so Coral will speak it to the caller.
-                            try:
-                                convo_item = {
-                                    "type": "conversation.item.create",
-                                    "item": {
-                                        "type": "message",
-                                        "role": "user",
-                                        "content": [
-                                            {
-                                                "type": "input_text",
-                                                "text": (
-                                                    "Say the following sentence to the caller "
-                                                    "exactly as written, without changing the meaning "
-                                                    "and without adding any commentary: "
-                                                    f"\"{speech}\""
-                                                ),
-                                            }
-                                        ],
-                                    },
-                                }
-                                await openai_ws.send(json.dumps(convo_item))
-                                await openai_ws.send(
-                                    json.dumps({"type": "response.create"})
-                                )
-                                logger.info(
-                                    "[BRAIN] Sent brain-generated speech back to Realtime."
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    f"Error sending brain response into Realtime: {e}"
-                                )
 
                 # ----- VAD EVENTS: drive user_speaking_vad & barge-in -----
                 elif etype == "input_audio_buffer.speech_started":
@@ -1290,18 +642,25 @@ async def twilio_stream(websocket: WebSocket):
 
                             # Drop any queued assistant audio so Twilio tail is minimal
                             audio_buffer.clear()
-                            prebuffer_active = False
-
                             logger.info(
                                 "BARGE-IN: user speech started while AI speaking; "
                                 "sent response.cancel and cleared audio buffer."
                             )
                         except Exception as e:
-                            logger.error(f"Error sending response.cancel: {e}")
+                            logger.error(
+                                f"Error sending response.cancel: {e}"
+                            )
 
                 elif etype == "input_audio_buffer.speech_stopped":
                     user_speaking_vad = False
                     logger.info("OpenAI VAD: user speech STOP")
+
+                    # Trigger a model response when the user finishes speaking
+                    try:
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                        logger.info("Sent response.create after VAD speech stop")
+                    except Exception as e:
+                        logger.error(f"Error sending response.create: {e}")
 
                 # ----- ERROR EVENTS -----
                 elif etype == "error":
@@ -1315,88 +674,85 @@ async def twilio_stream(websocket: WebSocket):
 
         async def twilio_audio_sender():
             """
-            Convert the continuous μ-law audio buffer into fixed 20 ms frames
-            and send them to Twilio at a steady cadence, with:
-              - a small prebuffer per utterance to avoid choppiness
-              - an explicit cap on how far ahead we've sent audio (backlog)
+            Convert the continuous μ-law audio_buffer into 20ms frames and
+            send them to Twilio, respecting a small prebuffer.
             """
-            nonlocal assistant_last_audio_time, stream_sid, audio_buffer, prebuffer_active
+            nonlocal audio_buffer, assistant_last_audio_time, prebuffer_active
 
-            # Real-time pacing variables
+            frame_interval = FRAME_MS / 1000.0
             next_send_time = time.monotonic()
-            call_start_time = time.monotonic()
+
             frames_sent = 0
 
-            try:
-                while True:
-                    now = time.monotonic()
+            while True:
+                now = time.monotonic()
 
-                    # Compute how far ahead Twilio is scheduled to play vs. wall clock.
-                    audio_sent_duration = frames_sent * (FRAME_MS / 1000.0)
-                    call_elapsed = max(0.0, now - call_start_time)
-                    backlog_seconds = audio_sent_duration - call_elapsed
-
+                if not prebuffer_active and audio_buffer:
+                    # If Twilio is too far ahead, drop frames.
+                    backlog_seconds = frames_sent * frame_interval - (
+                        now - assistant_last_audio_time
+                    )
                     if backlog_seconds > MAX_TWILIO_BACKLOG_SECONDS:
-                        # We've sent too far ahead. Pause sending and let real time catch up.
-                        await asyncio.sleep(0.01)
-                        # Reset next_send_time to "now" so we don't try to rush later.
-                        next_send_time = time.monotonic()
-                        continue
+                        drop_frames = int(
+                            (backlog_seconds - MAX_TWILIO_BACKLOG_SECONDS)
+                            / frame_interval
+                        )
+                        drop_bytes = drop_frames * BYTES_PER_FRAME
+                        audio_buffer = audio_buffer[drop_bytes:]
+                        logger.info(
+                            f"Dropping {drop_frames} frames from audio buffer to "
+                            f"keep backlog around {MAX_TWILIO_BACKLOG_SECONDS}s"
+                        )
 
-                    if stream_sid and len(audio_buffer) >= BYTES_PER_FRAME:
-                        # If we're still prebuffering this utterance, wait until we have enough
-                        if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
-                            await asyncio.sleep(0.005)
-                            continue
-                        else:
-                            prebuffer_active = False
+                if not audio_buffer:
+                    await asyncio.sleep(0.005)
+                    continue
 
-                        # Take the next 20ms frame
-                        frame_bytes = audio_buffer[:BYTES_PER_FRAME]
-                        del audio_buffer[:BYTES_PER_FRAME]
+                if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
+                    await asyncio.sleep(0.005)
+                    continue
 
-                        frame_b64 = base64.b64encode(frame_bytes).decode("utf-8")
+                if now < next_send_time:
+                    await asyncio.sleep(next_send_time - now)
+                    continue
 
-                        twilio_msg = {
+                # Take the next 20ms frame
+                frame_bytes = audio_buffer[:BYTES_PER_FRAME]
+                audio_buffer = audio_buffer[BYTES_PER_FRAME:]
+
+                try:
+                    frame_b64 = base64.b64encode(frame_bytes).decode("ascii")
+                    twilio_msg = json.dumps(
+                        {
                             "event": "media",
                             "streamSid": stream_sid,
                             "media": {"payload": frame_b64},
                         }
+                    )
+                    await websocket.send_text(twilio_msg)
+                    frames_sent += 1
+                except WebSocketDisconnect:
+                    logger.info("WebSocket disconnected while sending audio")
+                    return
+                except Exception as e:
+                    logger.error(f"Error sending audio frame to Twilio: {e}")
 
-                        try:
-                            await websocket.send_text(json.dumps(twilio_msg))
-                            assistant_last_audio_time = time.monotonic()
-                            frames_sent += 1
-                        except WebSocketDisconnect:
-                            logger.info("WebSocket disconnected while sending audio")
-                            return
-                        except Exception as e:
-                            logger.error(f"Error sending audio frame to Twilio: {e}")
+                # Schedule next frame at real-time
+                next_send_time += frame_interval
 
-                        # Schedule next frame at real-time
-                        next_send_time += FRAME_INTERVAL
-                        sleep_for = max(0.0, next_send_time - time.monotonic())
-                        await asyncio.sleep(sleep_for)
-                    else:
-                        # Nothing (or not enough) to send, avoid busy loop and
-                        # keep next_send_time aligned with "now"
-                        next_send_time = time.monotonic()
-                        await asyncio.sleep(0.005)
-            except asyncio.CancelledError:
-                logger.info("twilio_audio_sender cancelled")
-            except Exception as e:
-                logger.exception(f"Error in twilio_audio_sender: {e}")
-
+        # Run them concurrently
         await asyncio.gather(
             twilio_to_openai(),
             openai_to_twilio(),
             twilio_audio_sender(),
         )
 
+    except WebSocketDisconnect:
+        logger.info("Twilio WebSocket disconnected (outer)")
     except Exception as e:
-        logger.exception(f"Error in /twilio/stream: {e}")
+        logger.error(f"Unhandled error in twilio_stream: {e}")
     finally:
-        if openai_ws is not None:
+        if openai_ws:
             try:
                 await openai_ws.close()
             except Exception:
