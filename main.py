@@ -4,7 +4,7 @@ import asyncio
 import logging
 import base64
 import time
-from typing import List
+from typing import List, Optional
 from datetime import datetime, timedelta
 
 from pydantic import BaseModel
