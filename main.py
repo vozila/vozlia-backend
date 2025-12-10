@@ -1179,11 +1179,11 @@ async def create_realtime_session():
     await openai_ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime")
 
-    await send_initial_greeting(openai_ws)
-
+    # NOTE: initial greeting is now sent from /twilio/stream once state is set up
     return openai_ws
 
 
+# ---------- Twilio media stream ↔ OpenAI Realtime ----------
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
@@ -1207,8 +1207,9 @@ async def twilio_stream(websocket: WebSocket):
     # Prebuffer state: we hold back sending until we have PREBUFFER_BYTES
     prebuffer_active = False
 
-    # Only play audio for responses we explicitly requested
+    # Only play audio for responses we explicitly requested via response.create
     allowed_response_ids: set[str] = set()
+    manual_response_pending = False  # True right after WE send response.create
 
     def assistant_actively_speaking() -> bool:
         if audio_buffer:
@@ -1216,7 +1217,34 @@ async def twilio_stream(websocket: WebSocket):
         return (time.monotonic() - assistant_last_audio_time) < 0.6
 
     try:
+        # Create Realtime session
         openai_ws = await create_realtime_session()
+
+        # --------- INITIAL GREETING (MANUAL RESPONSE) ---------
+        try:
+            convo_item = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Greet the caller as Vozlia, a friendly AI phone assistant using "
+                                "the Coral voice. Briefly introduce yourself and invite them to "
+                                "say what they need help with."
+                            ),
+                        }
+                    ],
+                },
+            }
+            await openai_ws.send(json.dumps(convo_item))
+            await openai_ws.send(json.dumps({"type": "response.create"}))
+            manual_response_pending = True
+            logger.info("Sent initial greeting request to OpenAI Realtime")
+        except Exception as e:
+            logger.error(f"Error sending initial greeting: {e}")
 
         async def twilio_to_openai():
             nonlocal stream_sid, openai_ws
@@ -1263,7 +1291,8 @@ async def twilio_stream(websocket: WebSocket):
         async def openai_to_twilio():
             nonlocal stream_sid, barge_in_enabled, cancel_in_progress
             nonlocal user_speaking_vad, assistant_last_audio_time
-            nonlocal audio_buffer, prebuffer_active, allowed_response_ids
+            nonlocal audio_buffer, prebuffer_active
+            nonlocal allowed_response_ids, manual_response_pending
 
             async for msg in openai_ws:
                 try:
@@ -1275,14 +1304,20 @@ async def twilio_stream(websocket: WebSocket):
                 etype = event.get("type")
 
                 # --------------------------------------------------
-                # 0) Track allowed responses (so we mute unwanted ones)
+                # 0) Track responses: ALLOW ONLY MANUAL ONES
                 # --------------------------------------------------
                 if etype == "response.created":
                     resp = event.get("response") or {}
                     rid = resp.get("id") or event.get("response_id")
-                    if rid:
+
+                    if rid and manual_response_pending:
+                        # This is the response we explicitly triggered via response.create
                         allowed_response_ids.add(rid)
-                        logger.info(f"Tracking allowed response_id: {rid}")
+                        manual_response_pending = False
+                        logger.info(f"Tracking allowed MANUAL response_id: {rid}")
+                    else:
+                        # Auto response (e.g., Realtime reacting on its own) → ignore audio
+                        logger.info(f"Ignoring auto response_id: {rid}")
                     continue
 
                 # --------------------------------------------------
@@ -1291,7 +1326,7 @@ async def twilio_stream(websocket: WebSocket):
                 if etype == "response.audio.delta":
                     resp_id = event.get("response_id")
 
-                    # If this response_id is not authorized, we DROP the audio
+                    # If this response_id is not authorized, DROP the audio
                     if resp_id and resp_id not in allowed_response_ids:
                         logger.info(
                             f"Dropping unsolicited audio for response_id={resp_id}"
@@ -1352,11 +1387,37 @@ async def twilio_stream(websocket: WebSocket):
 
                     logger.info(f"USER Transcript completed: {transcript_text!r}")
 
+                    # ---------- Intent gating: email/skills vs chit-chat ----------
                     if not should_route_transcript_to_fsm(transcript_text):
                         logger.info(
                             "Debounce: transcript does NOT look like an email/skill "
-                            "intent; letting core Realtime model handle it."
+                            "intent; using generic GPT response via manual response.create."
                         )
+                        # Generic chit-chat: we manually create a text turn + response.create
+                        try:
+                            convo_item = {
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": transcript_text,
+                                        }
+                                    ],
+                                },
+                            }
+                            await openai_ws.send(json.dumps(convo_item))
+                            await openai_ws.send(json.dumps({"type": "response.create"}))
+                            manual_response_pending = True
+                            logger.info(
+                                "Sent generic response.create for chit-chat turn"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Error sending generic response.create: {e}"
+                            )
                         continue
 
                     logger.info(
@@ -1364,6 +1425,7 @@ async def twilio_stream(websocket: WebSocket):
                         "routing to FSM + backend."
                     )
 
+                    # Call the same FSM + Gmail router your custom GPT uses
                     try:
                         fsm_response = await call_fsm_router(
                             text=transcript_text,
@@ -1373,6 +1435,8 @@ async def twilio_stream(websocket: WebSocket):
                         logger.exception(
                             f"Error calling /assistant/route from transcript: {e}"
                         )
+                        # Let Realtime handle any follow-up itself (but audio is muted
+                        # unless we send our own response.create).
                         continue
 
                     spoken_reply = (fsm_response or {}).get("spoken_reply") or ""
@@ -1382,6 +1446,7 @@ async def twilio_stream(websocket: WebSocket):
 
                     logger.info(f"FSM spoken_reply to send: {spoken_reply!r}")
 
+                    # Inject that reply into the Realtime conversation so it speaks it
                     try:
                         convo_item = {
                             "type": "conversation.item.create",
@@ -1402,6 +1467,7 @@ async def twilio_stream(websocket: WebSocket):
                         }
                         await openai_ws.send(json.dumps(convo_item))
                         await openai_ws.send(json.dumps({"type": "response.create"}))
+                        manual_response_pending = True
                         logger.info(
                             "Sent FSM-driven spoken reply into Realtime session"
                         )
@@ -1554,4 +1620,3 @@ async def twilio_stream(websocket: WebSocket):
             pass
 
         logger.info("Twilio stream closed")
-
