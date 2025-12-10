@@ -1,210 +1,236 @@
 # vozlia_fsm.py
-from __future__ import annotations
+"""
+Vozlia Finite State Machine (FSM)
+--------------------------------
+This FSM does lightweight intent classification and produces
+structured results telling the backend what to do.
 
-from dataclasses import dataclass, field
+It does NOT call any external APIs — it only decides WHAT should happen.
+"""
+
 from enum import Enum, auto
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any
 
-from transitions import Machine
+
+# ----------------------------
+# ENUMS FOR STATES & INTENTS
+# ----------------------------
+
+class State(Enum):
+    IDLE = auto()
+    EMAIL_SUMMARY = auto()
+    GENERAL_QUERY = auto()
+    GREETING = auto()
+    SMALL_TALK = auto()
+    UNKNOWN = auto()
 
 
-class TaskType(Enum):
-    NONE = auto()
-    EMAIL_UNREAD_SUMMARY = auto()
-    # Later: CALENDAR_SUMMARY, CREATE_MEETING, WEATHER_LOOKUP, etc.
+class Intent(Enum):
+    GREETING = auto()
+    CHECK_EMAIL_UNREAD = auto()
+    CHECK_EMAIL_ALL = auto()
+    GENERIC_EMAIL_QUERY = auto()
+    GENERAL_KNOWLEDGE_QUESTION = auto()
+    WEATHER = auto()
+    LOCATION_LOOKUP = auto()
+    SMALL_TALK = auto()
+    UNKNOWN = auto()
 
+
+# ----------------------------
+# RESULT OBJECT
+# ----------------------------
 
 @dataclass
-class CallContext:
-    """
-    Per-call server-side context.
-    This is your 'memory' for that phone call.
-    """
-    call_id: str
-    active_task: TaskType = TaskType.NONE
-    slots: Dict[str, Any] = field(default_factory=dict)
-    last_user_utterance: str = ""
-    last_assistant_utterance: str = ""
+class FSMResult:
+    intent: Intent
+    next_state: State
+    spoken_reply: str
+    backend_call: Optional[Dict[str, Any]] = field(default_factory=dict)
+    raw_debug: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class FSMAction:
-    """
-    What the FSM wants the backend to do right now.
-    """
-    speak: Optional[str] = None          # text for Vozlia to say
-    api_call: Optional[Dict[str, Any]] = None  # e.g. {"type": "gmail_unread_summary", "params": {...}}
+# ----------------------------
+# MAIN FSM LOGIC
+# ----------------------------
 
+class VozliaFSM:
+    def __init__(self):
+        self.state = State.IDLE
 
-class CallFSM:
-    """
-    A finite state machine for a single call, powered by the 'transitions' library.
-    """
+    # ------------------------
+    # Intent Classifier
+    # ------------------------
+    def classify_intent(self, text: str) -> Intent:
+        t = text.lower()
 
-    # Define state names (simple strings for transitions)
-    states = [
-        "idle",                 # no active task
-        "email_unread_fetching",
-        "email_unread_done",
-    ]
+        # ---- Greetings ----
+        if any(x in t for x in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]):
+            return Intent.GREETING
 
-    def __init__(self, call_id: str):
-        self.ctx = CallContext(call_id=call_id)
-        self._pending_action: Optional[FSMAction] = None
+        # ---- Email intents ----
+        if "email" in t or "gmail" in t:
+            if "unread" in t:
+                return Intent.CHECK_EMAIL_UNREAD
+            if any(x in t for x in ["check", "show", "list", "read"]):
+                return Intent.CHECK_EMAIL_ALL
+            return Intent.GENERIC_EMAIL_QUERY
 
-        # Machine from 'transitions'
-        self.machine = Machine(
-            model=self,
-            states=CallFSM.states,
-            initial="idle",
-            ignore_invalid_triggers=True,  # don't crash on bad trigger
-        )
+        # ---- Weather intent ----
+        if any(x in t for x in ["weather", "temperature", "forecast"]):
+            return Intent.WEATHER
 
-        # Transitions for email-unread flow
-        self.machine.add_transition(
-            trigger="start_email_unread_flow",
-            source="idle",
-            dest="email_unread_fetching",
-            after="_after_start_email_unread_flow",
-        )
+        # ---- Location lookup ----
+        if any(x in t for x in ["nearest", "closest", "nearby"]):
+            return Intent.LOCATION_LOOKUP
 
-        self.machine.add_transition(
-            trigger="finish_email_unread_flow",
-            source="email_unread_fetching",
-            dest="email_unread_done",
-            after="_after_finish_email_unread_flow",
-        )
+        # ---- General knowledge ----
+        if any(x in t for x in ["who", "what", "when", "where", "why", "how"]):
+            return Intent.GENERAL_KNOWLEDGE_QUESTION
 
-        self.machine.add_transition(
-            trigger="reset",
-            source="*",
-            dest="idle",
-            after="_after_reset",
-        )
+        # ---- Small talk ----
+        if any(x in t for x in ["how are you", "what’s up", "whats up"]):
+            return Intent.SMALL_TALK
 
-    # -------------------------------------------------------------------------
-    # Helpers to get / clear the last action (FSMAction)
-    # -------------------------------------------------------------------------
+        return Intent.UNKNOWN
 
-    def pop_action(self) -> Optional[FSMAction]:
-        action = self._pending_action
-        self._pending_action = None
-        return action
+    # ------------------------
+    # Main Handler
+    # ------------------------
+    def handle_utterance(self, text: str) -> Dict[str, Any]:
+        intent = self.classify_intent(text)
 
-    def _set_action(self, speak: Optional[str] = None, api_call: Optional[Dict[str, Any]] = None):
-        self._pending_action = FSMAction(speak=speak, api_call=api_call)
-
-    # -------------------------------------------------------------------------
-    # Callbacks wired into transitions
-    # -------------------------------------------------------------------------
-
-    def _after_start_email_unread_flow(self):
-        """
-        We just transitioned: idle -> email_unread_fetching
-        Decide what to say and which API call to request.
-        """
-        self.ctx.active_task = TaskType.EMAIL_UNREAD_SUMMARY
-
-        speak = (
-            "Okay, I’ll take a quick look at your unread email and summarize "
-            "what looks important."
-        )
-
-        # Let the backend know exactly what to do.
-        api_call = {
-            "type": "gmail_unread_summary",
-            "params": {
-                "query": "is:unread",
-                "max_results": 20,
-            },
+        # Attach debug info
+        debug = {
+            "input": text,
+            "intent_detected": intent.name,
+            "previous_state": self.state.name,
         }
 
-        self._set_action(speak=speak, api_call=api_call)
+        # Intent routing
+        if intent == Intent.GREETING:
+            self.state = State.GREETING
+            return FSMResult(
+                intent=intent,
+                next_state=self.state,
+                spoken_reply="Hi! How can I help you today?",
+                backend_call=None,
+                raw_debug=debug
+            ).__dict__
 
-    def _after_finish_email_unread_flow(self):
-        """
-        This is called after we move email_unread_fetching -> email_unread_done.
-        The actual summary text will be provided via handle_api_result().
-        """
-        # Nothing to do here; handle_api_result will set the 'speak' message.
-        pass
+        # ---- Email: unread summary ----
+        if intent == Intent.CHECK_EMAIL_UNREAD:
+            self.state = State.EMAIL_SUMMARY
+            return FSMResult(
+                intent=intent,
+                next_state=self.state,
+                spoken_reply="Let me check your unread emails.",
+                backend_call={
+                    "type": "gmail_summary",
+                    "params": {
+                        "query": "is:unread",
+                        "max_results": 20
+                    }
+                },
+                raw_debug=debug
+            ).__dict__
 
-    def _after_reset(self):
-        """
-        Reset context after finishing a task.
-        """
-        self.ctx.active_task = TaskType.NONE
-        self.ctx.slots.clear()
-        self._set_action(
-            speak="All set. What else would you like help with?",
-            api_call=None,
-        )
+        # ---- Email: general inbox ----
+        if intent == Intent.CHECK_EMAIL_ALL:
+            self.state = State.EMAIL_SUMMARY
+            return FSMResult(
+                intent=intent,
+                next_state=self.state,
+                spoken_reply="Checking your inbox now.",
+                backend_call={
+                    "type": "gmail_summary",
+                    "params": {
+                        "query": None,
+                        "max_results": 20
+                    }
+                },
+                raw_debug=debug
+            ).__dict__
 
-    # -------------------------------------------------------------------------
-    # Public interface: called by your backend
-    # -------------------------------------------------------------------------
+        # ---- Generic email inquiries ----
+        if intent == Intent.GENERIC_EMAIL_QUERY:
+            self.state = State.EMAIL_SUMMARY
+            return FSMResult(
+                intent=intent,
+                next_state=self.state,
+                spoken_reply="Let me review your recent email activity.",
+                backend_call={
+                    "type": "gmail_summary",
+                    "params": {
+                        "query": None,
+                        "max_results": 20
+                    }
+                },
+                raw_debug=debug
+            ).__dict__
 
-    def handle_user_utterance(self, text: str) -> Optional[FSMAction]:
-        """
-        Backend calls this when you have a clean user utterance (transcript).
-        This method may:
-          - Trigger a state transition
-          - Set a 'speak' message
-          - Request an API call
-          - Or do nothing (return None) and let the LLM handle free-form chat.
-        """
-        self.ctx.last_user_utterance = text
-        lower = text.lower().strip()
+        # ---- Weather ----
+        if intent == Intent.WEATHER:
+            self.state = State.GENERAL_QUERY
+            return FSMResult(
+                intent=intent,
+                next_state=self.state,
+                spoken_reply="Sure, let me look up the weather for you.",
+                backend_call={
+                    "type": "weather_lookup",
+                    "params": {}
+                },
+                raw_debug=debug
+            ).__dict__
 
-        # When idle, try to detect structured intents.
-        if self.state == "idle":
-            if "email" in lower and ("unread" in lower or "new" in lower):
-                # Kick off unread-email flow.
-                self.start_email_unread_flow()
-                return self.pop_action()
+        # ---- Location lookup ----
+        if intent == Intent.LOCATION_LOOKUP:
+            self.state = State.GENERAL_QUERY
+            return FSMResult(
+                intent=intent,
+                next_state=self.state,
+                spoken_reply="Let me find some options near you.",
+                backend_call={
+                    "type": "location_search",
+                    "params": {}
+                },
+                raw_debug=debug
+            ).__dict__
 
-            # No structured task recognized → let the LLM handle it.
-            return None
+        # ---- General knowledge ----
+        if intent == Intent.GENERAL_KNOWLEDGE_QUESTION:
+            self.state = State.GENERAL_QUERY
+            return FSMResult(
+                intent=intent,
+                next_state=self.state,
+                spoken_reply="Let me think about that.",
+                backend_call={
+                    "type": "general_knowledge",
+                    "params": {
+                        "query": text
+                    }
+                },
+                raw_debug=debug
+            ).__dict__
 
-        # If we've already done the unread email summary,
-        # handle simple follow-ups in a structured way.
-        if self.state == "email_unread_done":
-            if "anything important" in lower:
-                self._set_action(
-                    speak=(
-                        "From what I saw, the key items were billing and account notices, "
-                        "donation requests, and sales promotions. I can read one in more "
-                        "detail if you’d like."
-                    )
-                )
-                return self.pop_action()
+        # ---- Small talk ----
+        if intent == Intent.SMALL_TALK:
+            self.state = State.SMALL_TALK
+            return FSMResult(
+                intent=intent,
+                next_state=self.state,
+                spoken_reply="I'm doing great, thanks for asking!",
+                backend_call=None,
+                raw_debug=debug
+            ).__dict__
 
-            if lower in {"thanks", "that’s all", "that's all", "no thanks"}:
-                self.reset()
-                return self.pop_action()
-
-            # Otherwise let LLM handle, but keep state.
-            return None
-
-        # Default: no special behavior
-        return None
-
-    def handle_api_result(self, api_type: str, result: Dict[str, Any]) -> Optional[FSMAction]:
-        """
-        Backend calls this after it completes an API call that the FSM requested.
-        For example: Gmail unread summary.
-        """
-        if api_type == "gmail_unread_summary":
-            summary = result.get("summary") or (
-                "I wasn’t able to get a detailed summary of your unread email."
-            )
-
-            # Move to 'done' state
-            self.finish_email_unread_flow()
-
-            # Speak the summary
-            self._set_action(speak=summary)
-            return self.pop_action()
-
-        # Unknown API type for now.
-        return None
+        # ---- Unknown intent ----
+        self.state = State.UNKNOWN
+        return FSMResult(
+            intent=Intent.UNKNOWN,
+            next_state=self.state,
+            spoken_reply="I'm not completely sure, but I'm here to help.",
+            backend_call=None,
+            raw_debug=debug
+        ).__dict__
