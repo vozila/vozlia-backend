@@ -1222,6 +1222,9 @@ async def create_realtime_session():
         extra_headers=OPENAI_REALTIME_HEADERS,
     )
 
+    # NOTE:
+    # - Do NOT send 'session.input_audio_buffer' here (it is not a valid param).
+    # - Enable transcription via 'input_audio_transcription' instead.
     session_update = {
         "type": "session.update",
         "session": {
@@ -1233,14 +1236,9 @@ async def create_realtime_session():
             "turn_detection": {
                 "type": "server_vad",
             },
-            # 🚨 NEW: ask Realtime to transcribe the caller's audio
-            "input_audio_buffer": {
-                "transcription": {
-                    "enabled": True,
-                    # You can adjust the model name if needed
-                    "model": "gpt-4o-mini-transcribe",
-                    "language": "en",
-                }
+            # Enable streaming transcription of caller audio
+            "input_audio_transcription": {
+                "model": "gpt-4o-mini-transcribe"
             },
         },
     }
@@ -1251,7 +1249,7 @@ async def create_realtime_session():
     await send_initial_greeting(openai_ws)
 
     return openai_ws
-
+ async def openai_to_twilio():
 
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
 @app.websocket("/twilio/stream")
@@ -1329,7 +1327,7 @@ async def twilio_stream(websocket: WebSocket):
                 elif event_type == "connected":
                     logger.info("Twilio reports call connected")
 
-        async def openai_to_twilio():
+              async def openai_to_twilio():
             nonlocal stream_sid, barge_in_enabled, cancel_in_progress
             nonlocal user_speaking_vad, assistant_last_audio_time, audio_buffer, prebuffer_active
 
@@ -1367,6 +1365,126 @@ async def twilio_stream(websocket: WebSocket):
                     if not barge_in_enabled:
                         barge_in_enabled = True
                         logger.info("Barge-in is now ENABLED for subsequent responses.")
+
+                # ----- USER TRANSCRIPT COMPLETED → route through FSM -----
+                elif etype == "input_audio_transcription.completed":
+                    # The exact schema may evolve; we log to inspect it.
+                    logger.info(f"Transcript event from OpenAI: {event}")
+
+                    # Try a few common shapes defensively
+                    transcript_text = ""
+                    if isinstance(event.get("text"), str):
+                        transcript_text = event["text"]
+                    elif isinstance(event.get("transcript"), str):
+                        transcript_text = event["transcript"]
+                    else:
+                        # Some versions embed output objects; try to dig text out if present
+                        output = event.get("output")
+                        if isinstance(output, dict) and isinstance(output.get("text"), str):
+                            transcript_text = output["text"]
+
+                    transcript_text = (transcript_text or "").strip()
+                    if not transcript_text:
+                        logger.info("Transcript completed event but no text found.")
+                        continue
+
+                    logger.info(f"USER Transcript completed: {transcript_text!r}")
+
+                    try:
+                        # Call the same FSM + Gmail router your custom GPT uses
+                        fsm_response = await call_fsm_router(
+                            text=transcript_text,
+                            context={"channel": "phone"},
+                        )
+                    except Exception as e:
+                        logger.exception(f"Error calling /assistant/route from transcript: {e}")
+                        continue
+
+                    spoken_reply = (fsm_response or {}).get("spoken_reply") or ""
+                    if not spoken_reply.strip():
+                        logger.info("FSM returned no spoken_reply; skipping.")
+                        continue
+
+                    logger.info(f"FSM spoken_reply to send: {spoken_reply!r}")
+
+                    # Inject that reply into the Realtime conversation so it speaks it
+                    try:
+                        convo_item = {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            "Say the following to the caller, in your own voice, "
+                                            "without adding extra commentary:\n"
+                                            f"{spoken_reply}"
+                                        ),
+                                    }
+                                ],
+                            },
+                        }
+                        await openai_ws.send(json.dumps(convo_item))
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                        logger.info("Sent FSM-driven spoken reply into Realtime session")
+                    except Exception as e:
+                        logger.error(f"Error sending FSM reply into Realtime: {e}")
+
+                # ----- TEXT LOGGING (optional) -----
+                elif etype == "response.text.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        logger.info(f"AI (text delta): {delta}")
+
+                elif etype == "response.text.done":
+                    text = event.get("text", "")
+                    if text:
+                        logger.info(f"AI full text response: {text}")
+
+                # ----- VAD EVENTS: drive user_speaking_vad & barge-in -----
+                elif etype == "input_audio_buffer.speech_started":
+                    user_speaking_vad = True
+                    logger.info("OpenAI VAD: user speech START")
+
+                    if (
+                        barge_in_enabled
+                        and assistant_actively_speaking()
+                        and not cancel_in_progress
+                    ):
+                        try:
+                            await openai_ws.send(
+                                json.dumps({"type": "response.cancel"})
+                            )
+                            cancel_in_progress = True
+
+                            # Drop any queued assistant audio so Twilio tail is minimal
+                            audio_buffer.clear()
+                            prebuffer_active = False
+
+                            logger.info(
+                                "BARGE-IN: user speech started while AI speaking; "
+                                "sent response.cancel and cleared audio buffer."
+                            )
+                        except Exception as e:
+                            logger.error(f"Error sending response.cancel: {e}")
+
+                elif etype == "input_audio_buffer.speech_stopped":
+                    user_speaking_vad = False
+                    logger.info("OpenAI VAD: user speech STOP")
+
+                # ----- ERROR EVENTS -----
+                elif etype == "error":
+                    logger.error(f"OpenAI error event: {event}")
+                    err = event.get("error") or {}
+                    code = err.get("code")
+
+                    if code == "response_cancel_not_active":
+                        # harmless: we tried to cancel after it already finished
+                        cancel_in_progress = False
+
+
 
                 # ----- ✅ USER TRANSCRIPT COMPLETED → route through FSM -----
                 elif isinstance(etype, str) and etype.startswith("input_audio_buffer.transcript"):
