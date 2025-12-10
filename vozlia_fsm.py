@@ -1,236 +1,329 @@
-# vozlia_fsm.py
 """
-Vozlia Finite State Machine (FSM)
---------------------------------
-This FSM does lightweight intent classification and produces
-structured results telling the backend what to do.
+vozlia_fsm.py
 
-It does NOT call any external APIs — it only decides WHAT should happen.
+Finite State Machine for Vozlia using the `transitions` library.
+
+This module is intentionally narrow in scope:
+
+- It classifies each caller utterance into a simple intent
+  (check email, greeting, small talk, generic help, etc.)
+- It manages a small set of states (idle, email_intent, small_talk, generic_help).
+- For "skill" intents (like checking email), it emits a `backend_call`
+  payload that the backend can execute (e.g., Gmail summary).
+- It returns a `spoken_reply` that can be read to the caller.
+
+The heavy lifting (Gmail API, weather, tasks, etc.) is done in your
+FastAPI backend, not here.
 """
 
-from enum import Enum, auto
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
+from transitions import Machine
 
 
-# ----------------------------
-# ENUMS FOR STATES & INTENTS
-# ----------------------------
-
-class State(Enum):
-    IDLE = auto()
-    EMAIL_SUMMARY = auto()
-    GENERAL_QUERY = auto()
-    GREETING = auto()
-    SMALL_TALK = auto()
-    UNKNOWN = auto()
+# -------------------- Intent labels --------------------
 
 
-class Intent(Enum):
-    GREETING = auto()
-    CHECK_EMAIL_UNREAD = auto()
-    CHECK_EMAIL_ALL = auto()
-    GENERIC_EMAIL_QUERY = auto()
-    GENERAL_KNOWLEDGE_QUESTION = auto()
-    WEATHER = auto()
-    LOCATION_LOOKUP = auto()
-    SMALL_TALK = auto()
-    UNKNOWN = auto()
+INTENT_GREETING = "greeting"
+INTENT_CHECK_EMAIL = "check_email"
+INTENT_SMALL_TALK = "small_talk"
+INTENT_GENERIC_HELP = "generic_help"
+INTENT_UNKNOWN = "unknown"
 
 
-# ----------------------------
-# RESULT OBJECT
-# ----------------------------
+# -------------------- FSM states --------------------
+
+
+FSM_STATES = [
+    "idle",
+    "email_intent",
+    "small_talk",
+    "generic_help",
+]
+
 
 @dataclass
-class FSMResult:
-    intent: Intent
-    next_state: State
-    spoken_reply: str
-    backend_call: Optional[Dict[str, Any]] = field(default_factory=dict)
-    raw_debug: Dict[str, Any] = field(default_factory=dict)
-
-
-# ----------------------------
-# MAIN FSM LOGIC
-# ----------------------------
-
 class VozliaFSM:
-    def __init__(self):
-        self.state = State.IDLE
+    """
+    A very lightweight FSM wrapper around `transitions.Machine`.
 
-    # ------------------------
-    # Intent Classifier
-    # ------------------------
-    def classify_intent(self, text: str) -> Intent:
-        t = text.lower()
+    Public API:
+        fsm = VozliaFSM()
+        result = fsm.handle_utterance("Check my unread emails", context={...})
 
-        # ---- Greetings ----
-        if any(x in t for x in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]):
-            return Intent.GREETING
+    `result` is a dict:
+      {
+        "intent": "check_email",
+        "previous_state": "idle",
+        "next_state": "email_intent",
+        "spoken_reply": "Sure, I'll take a quick look at your recent unread emails.",
+        "backend_call": {
+            "type": "gmail_summary",
+            "params": {
+                "query": "is:unread",
+                "max_results": 20
+            }
+        },
+        "context": {...}
+      }
+    """
 
-        # ---- Email intents ----
-        if "email" in t or "gmail" in t:
-            if "unread" in t:
-                return Intent.CHECK_EMAIL_UNREAD
-            if any(x in t for x in ["check", "show", "list", "read"]):
-                return Intent.CHECK_EMAIL_ALL
-            return Intent.GENERIC_EMAIL_QUERY
+    # transitions Machine will attach itself and manage `state` attr
+    machine: Machine = field(init=False, repr=False)
+    state: str = field(init=False, default="idle")
 
-        # ---- Weather intent ----
-        if any(x in t for x in ["weather", "temperature", "forecast"]):
-            return Intent.WEATHER
+    def __post_init__(self) -> None:
+        # Initialize the underlying transitions.Machine
+        self.machine = Machine(
+            model=self,
+            states=FSM_STATES,
+            initial="idle",
+            ignore_invalid_triggers=True,  # don't explode on unknown triggers
+        )
 
-        # ---- Location lookup ----
-        if any(x in t for x in ["nearest", "closest", "nearby"]):
-            return Intent.LOCATION_LOOKUP
+        # Generic transitions to move into specific "intent" states
+        self.machine.add_transition("to_email_intent", "*", "email_intent")
+        self.machine.add_transition("to_small_talk", "*", "small_talk")
+        self.machine.add_transition("to_generic_help", "*", "generic_help")
+        self.machine.add_transition("reset_to_idle", "*", "idle")
 
-        # ---- General knowledge ----
-        if any(x in t for x in ["who", "what", "when", "where", "why", "how"]):
-            return Intent.GENERAL_KNOWLEDGE_QUESTION
+    # -------------------- Public API --------------------
 
-        # ---- Small talk ----
-        if any(x in t for x in ["how are you", "what’s up", "whats up"]):
-            return Intent.SMALL_TALK
+    def handle_utterance(
+        self,
+        text: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Main entrypoint.
 
-        return Intent.UNKNOWN
+        - Classifies intent from `text`
+        - Transitions FSM state accordingly
+        - Produces:
+            - spoken_reply (string)
+            - intent (string)
+            - previous_state / next_state
+            - backend_call (dict or None)
+            - context (echoed)
 
-    # ------------------------
-    # Main Handler
-    # ------------------------
-    def handle_utterance(self, text: str) -> Dict[str, Any]:
-        intent = self.classify_intent(text)
+        This function does NOT talk to any external APIs – it just
+        decides *what should happen* and lets the backend do the work.
+        """
+        context = context or {}
+        original_state = self.state
 
-        # Attach debug info
-        debug = {
-            "input": text,
-            "intent_detected": intent.name,
-            "previous_state": self.state.name,
+        cleaned = (text or "").strip()
+        lowered = cleaned.lower()
+
+        if not lowered:
+            # Blank / noise – keep it simple
+            intent = INTENT_UNKNOWN
+            spoken_reply = "I didn’t quite catch that. Could you please repeat?"
+            backend_call = None
+            # No need to change state
+            return {
+                "intent": intent,
+                "previous_state": original_state,
+                "next_state": self.state,
+                "spoken_reply": spoken_reply,
+                "backend_call": backend_call,
+                "context": context,
+            }
+
+        # 1) Classify the intent
+        intent = self._classify_intent(lowered)
+
+        # 2) Drive state transitions + decide backend_call + spoken_reply
+        backend_call: Optional[Dict[str, Any]] = None
+        spoken_reply: str
+
+        if intent == INTENT_CHECK_EMAIL:
+            self.to_email_intent()
+            backend_call, spoken_reply = self._handle_email_intent(lowered)
+
+        elif intent == INTENT_GREETING:
+            self.reset_to_idle()
+            spoken_reply = self._handle_greeting(cleaned)
+
+        elif intent == INTENT_SMALL_TALK:
+            self.to_small_talk()
+            spoken_reply = self._handle_small_talk(cleaned)
+
+        elif intent == INTENT_GENERIC_HELP:
+            self.to_generic_help()
+            spoken_reply = (
+                "Sure, tell me what you’d like help with and I’ll take care of it."
+            )
+
+        else:  # INTENT_UNKNOWN
+            # For unknowns, keep state simple: go back to idle
+            self.reset_to_idle()
+            spoken_reply = (
+                "I’m not entirely sure what you meant. "
+                "Could you rephrase that or give me a bit more detail?"
+            )
+
+        # 3) Build result payload
+        result = {
+            "intent": intent,
+            "previous_state": original_state,
+            "next_state": self.state,
+            "spoken_reply": spoken_reply,
+            "backend_call": backend_call,
+            "context": context,
+        }
+        return result
+
+    # -------------------- Intent classification --------------------
+
+    def _classify_intent(self, lowered: str) -> str:
+        """
+        Extremely simple rule-based classifier.
+
+        This is intentionally conservative: the model (GPT/Realtime)
+        will already be very smart. The FSM just nudges clear patterns
+        into explicit backend actions.
+        """
+
+        # Check email / inbox / unread
+        email_keywords = [
+            "email",
+            "emails",
+            "inbox",
+            "gmail",
+            "unread",
+            "new mail",
+            "new emails",
+            "check my mail",
+            "check my inbox",
+            "latest emails",
+        ]
+        if any(k in lowered for k in email_keywords):
+            return INTENT_CHECK_EMAIL
+
+        # Greetings
+        greeting_keywords = [
+            "hello",
+            "hi ",
+            "hi,",
+            "hey",
+            "good morning",
+            "good afternoon",
+            "good evening",
+        ]
+        if any(lowered.startswith(k) for k in greeting_keywords):
+            return INTENT_GREETING
+
+        # Small talk topics
+        small_talk_keywords = [
+            "how are you",
+            "how's it going",
+            "how are you doing",
+            "who are you",
+            "what are you",
+            "tell me about yourself",
+        ]
+        if any(k in lowered for k in small_talk_keywords):
+            return INTENT_SMALL_TALK
+
+        # Generic help phrases
+        generic_help_keywords = [
+            "i need help",
+            "can you help",
+            "i have a question",
+            "i need some assistance",
+            "help me with",
+        ]
+        if any(k in lowered for k in generic_help_keywords):
+            return INTENT_GENERIC_HELP
+
+        return INTENT_UNKNOWN
+
+    # -------------------- Handlers for each intent --------------------
+
+    def _handle_email_intent(
+        self,
+        lowered: str,
+    ) -> tuple[Dict[str, Any], str]:
+        """
+        Decide *how* to query Gmail based on the utterance.
+
+        Returns:
+            backend_call, spoken_reply
+        """
+        # Default Gmail query and max_results
+        gmail_query = None
+        max_results = 20
+
+        # Common patterns: unread, today, this week, etc.
+        if "unread" in lowered or "new" in lowered or "newest" in lowered:
+            gmail_query = "is:unread"
+
+        # Time windows
+        if "today" in lowered:
+            # e.g. "emails from today" -> use newer_than:1d
+            if gmail_query:
+                gmail_query = f"{gmail_query} newer_than:1d"
+            else:
+                gmail_query = "newer_than:1d"
+
+        if "yesterday" in lowered:
+            # GMail doesn't have a native "yesterday" filter,
+            # but we can approximate with 2 days if needed.
+            if gmail_query:
+                gmail_query = f"{gmail_query} newer_than:2d"
+            else:
+                gmail_query = "newer_than:2d"
+
+        if "this week" in lowered or "past week" in lowered:
+            if gmail_query:
+                gmail_query = f"{gmail_query} newer_than:7d"
+            else:
+                gmail_query = "newer_than:7d"
+
+        # If caller mentions "only a few" or "top couple", reduce max_results
+        if "few" in lowered or "couple" in lowered or "top 3" in lowered:
+            max_results = 5
+        elif "top 10" in lowered:
+            max_results = 10
+
+        backend_call = {
+            "type": "gmail_summary",
+            "params": {
+                "query": gmail_query,
+                "max_results": max_results,
+                # NOTE: account_id is resolved in the backend
+                # based on payload.account_id or default Gmail account.
+            },
         }
 
-        # Intent routing
-        if intent == Intent.GREETING:
-            self.state = State.GREETING
-            return FSMResult(
-                intent=intent,
-                next_state=self.state,
-                spoken_reply="Hi! How can I help you today?",
-                backend_call=None,
-                raw_debug=debug
-            ).__dict__
+        if gmail_query == "is:unread":
+            spoken_reply = (
+                "Sure, I’ll take a quick look at your unread emails and summarize them."
+            )
+        elif gmail_query:
+            spoken_reply = (
+                "Okay, I’ll check your recent emails that match what you asked for."
+            )
+        else:
+            spoken_reply = (
+                "Got it, I’ll take a quick look at your recent emails and summarize them."
+            )
 
-        # ---- Email: unread summary ----
-        if intent == Intent.CHECK_EMAIL_UNREAD:
-            self.state = State.EMAIL_SUMMARY
-            return FSMResult(
-                intent=intent,
-                next_state=self.state,
-                spoken_reply="Let me check your unread emails.",
-                backend_call={
-                    "type": "gmail_summary",
-                    "params": {
-                        "query": "is:unread",
-                        "max_results": 20
-                    }
-                },
-                raw_debug=debug
-            ).__dict__
+        return backend_call, spoken_reply
 
-        # ---- Email: general inbox ----
-        if intent == Intent.CHECK_EMAIL_ALL:
-            self.state = State.EMAIL_SUMMARY
-            return FSMResult(
-                intent=intent,
-                next_state=self.state,
-                spoken_reply="Checking your inbox now.",
-                backend_call={
-                    "type": "gmail_summary",
-                    "params": {
-                        "query": None,
-                        "max_results": 20
-                    }
-                },
-                raw_debug=debug
-            ).__dict__
+    def _handle_greeting(self, cleaned: str) -> str:
+        return (
+            "Hi, this is Vozlia. I’m your AI assistant. "
+            "What would you like help with today?"
+        )
 
-        # ---- Generic email inquiries ----
-        if intent == Intent.GENERIC_EMAIL_QUERY:
-            self.state = State.EMAIL_SUMMARY
-            return FSMResult(
-                intent=intent,
-                next_state=self.state,
-                spoken_reply="Let me review your recent email activity.",
-                backend_call={
-                    "type": "gmail_summary",
-                    "params": {
-                        "query": None,
-                        "max_results": 20
-                    }
-                },
-                raw_debug=debug
-            ).__dict__
-
-        # ---- Weather ----
-        if intent == Intent.WEATHER:
-            self.state = State.GENERAL_QUERY
-            return FSMResult(
-                intent=intent,
-                next_state=self.state,
-                spoken_reply="Sure, let me look up the weather for you.",
-                backend_call={
-                    "type": "weather_lookup",
-                    "params": {}
-                },
-                raw_debug=debug
-            ).__dict__
-
-        # ---- Location lookup ----
-        if intent == Intent.LOCATION_LOOKUP:
-            self.state = State.GENERAL_QUERY
-            return FSMResult(
-                intent=intent,
-                next_state=self.state,
-                spoken_reply="Let me find some options near you.",
-                backend_call={
-                    "type": "location_search",
-                    "params": {}
-                },
-                raw_debug=debug
-            ).__dict__
-
-        # ---- General knowledge ----
-        if intent == Intent.GENERAL_KNOWLEDGE_QUESTION:
-            self.state = State.GENERAL_QUERY
-            return FSMResult(
-                intent=intent,
-                next_state=self.state,
-                spoken_reply="Let me think about that.",
-                backend_call={
-                    "type": "general_knowledge",
-                    "params": {
-                        "query": text
-                    }
-                },
-                raw_debug=debug
-            ).__dict__
-
-        # ---- Small talk ----
-        if intent == Intent.SMALL_TALK:
-            self.state = State.SMALL_TALK
-            return FSMResult(
-                intent=intent,
-                next_state=self.state,
-                spoken_reply="I'm doing great, thanks for asking!",
-                backend_call=None,
-                raw_debug=debug
-            ).__dict__
-
-        # ---- Unknown intent ----
-        self.state = State.UNKNOWN
-        return FSMResult(
-            intent=Intent.UNKNOWN,
-            next_state=self.state,
-            spoken_reply="I'm not completely sure, but I'm here to help.",
-            backend_call=None,
-            raw_debug=debug
-        ).__dict__
+    def _handle_small_talk(self, cleaned: str) -> str:
+        # You can make this more playful later if you’d like
+        return (
+            "I’m doing well and ready to help. "
+            "Tell me what you’d like me to do for you."
+        )
