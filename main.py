@@ -4,7 +4,7 @@ import asyncio
 import logging
 import base64
 import time
-from typing import List
+from typing import List, Optional
 from datetime import datetime, timedelta
 from vozlia_fsm import VozliaFSM  # and Intent if you exposed it
 from pydantic import BaseModel
@@ -36,6 +36,22 @@ from db import Base, engine
 from models import User, EmailAccount
 from schemas import EmailAccountCreate, EmailAccountRead
 from deps import get_db
+
+async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
+    """
+    Calls your existing /assistant/route FSM endpoint and returns spoken_reply.
+    """
+    try:
+        data = await call_fsm_router(
+            text=transcript,
+            context={"channel": "phone"},
+        )
+        spoken = data.get("spoken_reply")
+        logger.info("FSM spoken_reply to send: %r", spoken)
+        return spoken
+    except Exception:
+        logger.exception("Error calling /assistant/route")
+        return None
 
 
 # ---------- Logging ----------
