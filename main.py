@@ -6,11 +6,9 @@ import base64
 import time
 from typing import List, Optional
 from datetime import datetime, timedelta
+
 from vozlia_fsm import VozliaFSM  # and Intent if you exposed it
 from pydantic import BaseModel
-from vozlia_fsm import VozliaFSM  # your FSM module
-
-
 
 import httpx  # <-- for Google OAuth + Gmail API
 
@@ -36,22 +34,6 @@ from db import Base, engine
 from models import User, EmailAccount
 from schemas import EmailAccountCreate, EmailAccountRead
 from deps import get_db
-
-async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
-    """
-    Calls your existing /assistant/route FSM endpoint and returns spoken_reply.
-    """
-    try:
-        data = await call_fsm_router(
-            text=transcript,
-            context={"channel": "phone"},
-        )
-        spoken = data.get("spoken_reply")
-        logger.info("FSM spoken_reply to send: %r", spoken)
-        return spoken
-    except Exception:
-        logger.exception("Error calling /assistant/route")
-        return None
 
 
 # ---------- Logging ----------
@@ -85,8 +67,8 @@ def decrypt_str(value: str | None) -> str | None:
     f = get_fernet()
     return f.decrypt(value.encode()).decode()
 
-# ---------- FSM debug endpoint (text-only) ----------
 
+# ---------- FSM debug endpoint (text-only) ----------
 @app.post("/fsm/debug")
 async def fsm_debug(request: Request):
     """
@@ -442,6 +424,7 @@ def _get_gmail_account_or_404(
 
     return account
 
+
 def _get_default_gmail_account_id(current_user: User, db: Session) -> str | None:
     """
     Returns the id of the user's primary Gmail account if present,
@@ -466,8 +449,6 @@ def _get_default_gmail_account_id(current_user: User, db: Session) -> str | None
         return str(first.id)
 
     return None
-
-
 
 
 def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
@@ -643,7 +624,6 @@ def _gmail_list_messages_core(
 
 
 # ---------- Gmail API usage endpoints ----------
-
 @app.get("/email/accounts/{account_id}/messages")
 def list_gmail_messages(
     account_id: str,
@@ -723,8 +703,8 @@ def gmail_stats(
         "approx_message_count": size_estimate,
     }
 
-# ---------- Assistant routing models (FSM entrypoint) ----------
 
+# ---------- Assistant routing models (FSM entrypoint) ----------
 class AssistantRouteIn(BaseModel):
     """
     Input body when the assistant (phone or ChatGPT) asks the backend
@@ -745,8 +725,6 @@ class AssistantRouteOut(BaseModel):
     spoken_reply: str
     fsm: dict
     gmail: dict | None = None
-
-
 
 
 # ---------- Gmail summary helper for Vozlia (core logic) ----------
@@ -854,7 +832,6 @@ def summarize_gmail_messages_for_assistant(
 
 
 # ---------- Core assistant routing logic (FSM + skills) ----------
-
 def _run_fsm_and_backend(
     text: str,
     db: Session,
@@ -897,8 +874,8 @@ def _run_fsm_and_backend(
             # No Gmail account available – append a brief explanation.
             if spoken_reply:
                 spoken_reply = (
-                    spoken_reply.rstrip(". ") +
-                    " However, I don't see a Gmail account connected for you yet."
+                    spoken_reply.rstrip(". ")
+                    + " However, I don't see a Gmail account connected for you yet."
                 )
             else:
                 spoken_reply = (
@@ -967,8 +944,8 @@ def gmail_summary(
     data["messages"] = data.get("messages", [])[: max_results]
     return data
 
-# ---------- Assistant router endpoint (for phone + ChatGPT) ----------
 
+# ---------- Assistant router endpoint (for phone + ChatGPT) ----------
 @app.post("/assistant/route", response_model=AssistantRouteOut)
 def assistant_route(
     payload: AssistantRouteIn,
@@ -999,6 +976,52 @@ def assistant_route(
         context=payload.context,
     )
     return result
+
+
+# ---------- FSM router helper for external callers (Twilio, ChatGPT tools, etc.) ----------
+VOZLIA_BACKEND_BASE_URL = os.getenv(
+    "VOZLIA_BACKEND_BASE_URL",
+    "https://vozlia-backend.onrender.com",
+)
+
+
+async def call_fsm_router(
+    text: str,
+    context: Optional[dict] = None,
+    account_id: Optional[str] = None,
+) -> dict:
+    """
+    Helper to call the unified /assistant/route endpoint from other parts of
+    the system (e.g., Twilio calls, future ChatGPT tools).
+
+    This keeps Twilio <-> Realtime code decoupled from the internal FSM wiring.
+    """
+    if not text:
+        return {"spoken_reply": "", "fsm": {}, "gmail": None}
+
+    url = VOZLIA_BACKEND_BASE_URL.rstrip("/") + "/assistant/route"
+    payload: dict = {"text": text}
+    if context is not None:
+        payload["context"] = context
+    if account_id is not None:
+        payload["account_id"] = account_id
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client_http:
+            resp = await client_http.post(url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.exception("Error calling /assistant/route at %s: %s", url, e)
+        # Fallback: simple spoken error
+        return {
+            "spoken_reply": (
+                "I tried to check that information in the backend, "
+                "but something went wrong. Please try again in a moment."
+            ),
+            "fsm": {"error": str(e)},
+            "gmail": None,
+        }
 
 
 # ---------- OpenAI config ----------
@@ -1162,45 +1185,16 @@ async def twilio_inbound(request: Request):
     return Response(content=xml, media_type="application/xml")
 
 
-# ---------- Helper: initial greeting via Realtime ----------
-async def send_initial_greeting(openai_ws):
-    try:
-        convo_item = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Greet the caller as Vozlia, a friendly AI phone assistant using "
-                            "the Coral voice. Briefly introduce yourself and invite them to "
-                            "say what they need help with."
-                        ),
-                    }
-                ],
-            },
-        }
-        await openai_ws.send(json.dumps(convo_item))
-        await openai_ws.send(json.dumps({"type": "response.create"}))
-        logger.info("Sent initial greeting request to OpenAI Realtime")
-    except Exception as e:
-        logger.error(f"Error sending initial greeting: {e}")
-
-
 # ---------- Helper: OpenAI Realtime session via websockets ----------
 async def create_realtime_session():
     """
     Connect to OpenAI Realtime WebSocket using env vars and configure the session.
 
-    IMPORTANT:
-    - We use server-side VAD (turn_detection.type = server_vad).
-    - We DO NOT use input_audio_buffer.commit at all; VAD segments the stream.
-    - We also set create_response=False so that:
-        * VAD still emits speech_started / speech_stopped / transcript events.
-        * But the server does NOT auto-generate responses.
-      We then explicitly call response.create() from our code when we want a reply.
+    We:
+    - Use server-side VAD (turn_detection.type = server_vad).
+    - Do NOT manually call input_audio_buffer.commit; Realtime handles segmentation.
+    - Set create_response=False so VAD still emits transcripts, but we control when
+      to call response.create().
     """
     logger.info("Connecting to OpenAI Realtime WebSocket via websockets...")
 
@@ -1224,8 +1218,6 @@ async def create_realtime_session():
                 "type": "server_vad",
                 "threshold": 0.5,
                 "silence_duration_ms": 500,
-                # CRITICAL: We want VAD events + transcripts,
-                # but we'll manually call response.create().
                 "create_response": False,
                 "interrupt_response": True,
             },
@@ -1238,13 +1230,11 @@ async def create_realtime_session():
     await openai_ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime")
 
-    # Trigger an initial greeting using only the system prompt.
-    # The system prompt instructs Vozlia to greet the caller.
+    # Initial greeting: rely on the system prompt to greet the caller.
     await openai_ws.send(json.dumps({"type": "response.create"}))
     logger.info("Sent initial greeting request to OpenAI Realtime")
 
     return openai_ws
-
 
 
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
@@ -1258,11 +1248,7 @@ async def twilio_stream(websocket: WebSocket):
     - Only streams audio for the active response_id.
     - Barge-in cancels the correct active response when user starts talking.
     - Routes certain transcripts to the FSM/email backend via /assistant/route.
-
-    CRITICAL CHANGE:
-    - We NO LONGER call input_audio_buffer.commit at all.
-    - With server_vad enabled, the Realtime API consumes the continuous
-      input_audio_buffer.append stream and performs its own segmentation.
+    - Uses a paced sender loop so Twilio receives frames at ~real-time speed.
     """
 
     await websocket.accept()
@@ -1289,41 +1275,74 @@ async def twilio_stream(websocket: WebSocket):
     active_response_id: Optional[str] = None  # The single "currently active" response
     allowed_response_ids: set[str] = set()    # Responses we accept audio from
 
+    # Background task that sends audio frames to Twilio at real-time pace
+    send_task: Optional[asyncio.Task] = None
+    send_task_started: bool = False
+
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
-        # If there's buffered audio or very recent send, treat as "speaking"
-        if audio_buffer:
-            return True
-        return False
+        # If there's buffered audio, treat as "speaking"
+        return bool(audio_buffer)
 
-    # --- Helper: send μ-law audio TO Twilio ---------------------------------
-    async def send_audio_to_twilio():
+    # --- Helper: paced sender loop to Twilio --------------------------------
+    async def send_audio_loop():
         nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time
 
-        if stream_sid is None or not audio_buffer:
-            return
+        try:
+            while True:
+                # If WebSocket is closed, exit
+                if websocket.client_state.name != "CONNECTED":
+                    break
 
-        # Prebuffer: wait until we have at least PREBUFFER_BYTES, then start streaming
-        if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
-            return
-        elif prebuffer_active and len(audio_buffer) >= PREBUFFER_BYTES:
-            prebuffer_active = False
-            logger.info("Prebuffer complete; starting to send audio to Twilio")
+                if stream_sid is None:
+                    await asyncio.sleep(FRAME_INTERVAL)
+                    continue
 
-        chunk = bytes(audio_buffer[:BYTES_PER_FRAME])  # 20ms at 8kHz μ-law
-        audio_buffer = audio_buffer[BYTES_PER_FRAME:]
+                if not audio_buffer:
+                    await asyncio.sleep(FRAME_INTERVAL)
+                    continue
 
-        if not chunk:
-            return
+                # Prebuffer: wait until we have at least PREBUFFER_BYTES, then start streaming
+                if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
+                    await asyncio.sleep(FRAME_INTERVAL)
+                    continue
+                elif prebuffer_active and len(audio_buffer) >= PREBUFFER_BYTES:
+                    prebuffer_active = False
+                    logger.info("Prebuffer complete; starting to send audio to Twilio")
 
-        payload = base64.b64encode(chunk).decode("ascii")
-        msg = {
-            "event": "media",
-            "streamSid": stream_sid,
-            "media": {"payload": payload},
-        }
-        await websocket.send_text(json.dumps(msg))
-        assistant_last_audio_time = time.monotonic()
+                # Bound backlog: if buffer is too large, drop oldest frames
+                backlog_frames = len(audio_buffer) // BYTES_PER_FRAME
+                max_backlog_frames = int(MAX_TWILIO_BACKLOG_SECONDS / FRAME_INTERVAL)
+                if backlog_frames > max_backlog_frames:
+                    drop_bytes = (backlog_frames - max_backlog_frames) * BYTES_PER_FRAME
+                    audio_buffer = audio_buffer[drop_bytes:]
+                    logger.warning(
+                        "Dropping %d bytes of buffered audio to respect backlog limit",
+                        drop_bytes,
+                    )
+
+                if len(audio_buffer) < BYTES_PER_FRAME:
+                    await asyncio.sleep(FRAME_INTERVAL)
+                    continue
+
+                chunk = bytes(audio_buffer[:BYTES_PER_FRAME])
+                audio_buffer = audio_buffer[BYTES_PER_FRAME:]
+
+                payload = base64.b64encode(chunk).decode("ascii")
+                msg = {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": payload},
+                }
+                await websocket.send_text(json.dumps(msg))
+                assistant_last_audio_time = time.monotonic()
+
+                # Pace roughly 1 frame per 20ms
+                await asyncio.sleep(FRAME_INTERVAL)
+        except WebSocketDisconnect:
+            logger.info("send_audio_loop: Twilio WebSocket disconnected")
+        except Exception:
+            logger.exception("Error in send_audio_loop")
 
     # --- Helper: barge-in ----------------------------------------------------
     async def handle_barge_in():
@@ -1507,7 +1526,7 @@ async def twilio_stream(websocket: WebSocket):
                             logger.info("Barge-in is now ENABLED for subsequent responses.")
 
                 elif etype == "response.audio.delta":
-                    # Stream assistant audio back to Twilio
+                    # Stream assistant audio back to Twilio (buffered; send loop handles pacing)
                     resp_id = event.get("response_id")
                     delta_b64 = event.get("delta")
 
@@ -1528,7 +1547,6 @@ async def twilio_stream(websocket: WebSocket):
                         continue
 
                     audio_buffer.extend(delta_bytes)
-                    await send_audio_to_twilio()
 
                 elif etype == "input_audio_buffer.speech_started":
                     user_speaking_vad = True
@@ -1555,7 +1573,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Twilio event loop ---------------------------------------------------
     async def twilio_loop():
-        nonlocal stream_sid, prebuffer_active
+        nonlocal stream_sid, prebuffer_active, send_task, send_task_started
 
         try:
             async for msg in websocket.iter_text():
@@ -1577,6 +1595,12 @@ async def twilio_stream(websocket: WebSocket):
                     prebuffer_active = True
                     logger.info("Twilio stream event: start")
                     logger.info("Stream started: %s", stream_sid)
+
+                    # Start the paced sender loop on first start event
+                    if not send_task_started:
+                        send_task = asyncio.create_task(send_audio_loop())
+                        send_task_started = True
+                        logger.info("Started send_audio_loop task")
 
                 elif event_type == "media":
                     if not openai_ws:
@@ -1606,7 +1630,6 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif event_type == "stop":
                     logger.info("Twilio stream event: stop")
-                    # Do NOT send any commit here either; just end the loop.
                     logger.info("Twilio sent stop; closing call.")
                     break
 
@@ -1636,5 +1659,13 @@ async def twilio_stream(websocket: WebSocket):
             await websocket.close()
         except Exception:
             logger.exception("Error closing Twilio WebSocket")
+
+        # Cancel the send loop if it's still running
+        if send_task is not None and not send_task.done():
+            send_task.cancel()
+            try:
+                await send_task
+            except Exception:
+                pass
 
         logger.info("WebSocket disconnected while sending audio")
