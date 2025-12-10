@@ -1186,6 +1186,8 @@ async def create_realtime_session():
 
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
 @app.websocket("/twilio/stream")
+
+
 async def twilio_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Twilio media stream connected")
@@ -1206,6 +1208,9 @@ async def twilio_stream(websocket: WebSocket):
 
     # Prebuffer state: we hold back sending until we have PREBUFFER_BYTES
     prebuffer_active = False
+
+    # NEW: only play audio for responses we explicitly requested
+    allowed_response_ids: set[str] = set()
 
     def assistant_actively_speaking() -> bool:
         if audio_buffer:
@@ -1262,33 +1267,55 @@ async def twilio_stream(websocket: WebSocket):
             nonlocal user_speaking_vad, assistant_last_audio_time, audio_buffer, prebuffer_active
 
             async for msg in openai_ws:
-                try:
-                    event = json.loads(msg)
-                except json.JSONDecodeError:
-                    logger.warning(f"Non-JSON message from OpenAI: {msg!r}")
-                    continue
+              try:
+                  event = json.loads(msg)
+              except json.JSONDecodeError:
+                  logger.warning(f"Non-JSON message from OpenAI: {msg!r}")
+                  continue
 
-                etype = event.get("type")
+              etype = event.get("type")
 
-                # --------------------------------------------------
-                # 1) AUDIO FROM OPENAI → BUFFER FOR TWILIO
-                # --------------------------------------------------
-                if etype == "response.audio.delta":
-                    audio_chunk_b64 = event.get("delta")
-                    if not audio_chunk_b64:
-                        continue
+              # --------------------------------------------------
+              # 0) Track allowed responses (so we mute unwanted ones)
+              # --------------------------------------------------
+              if etype == "response.created":
+                  # Realtime uses this when a new response begins
+                  resp = event.get("response") or {}
+                  rid = resp.get("id") or event.get("response_id")
+                  if rid:
+                      allowed_response_ids.add(rid)
+                      logger.info(f"Tracking allowed response_id: {rid}")
+                  continue
 
-                    try:
-                        raw_bytes = base64.b64decode(audio_chunk_b64)
-                    except Exception as e:
-                        logger.error(f"Error decoding audio delta: {e}")
-                        continue
+              # --------------------------------------------------
+              # 1) AUDIO FROM OPENAI → BUFFER FOR TWILIO (filtered)
+              # --------------------------------------------------
+              if etype == "response.audio.delta":
+                  resp_id = event.get("response_id")
 
-                    # New utterance → enable prebuffer
-                    if len(audio_buffer) == 0:
-                        prebuffer_active = True
+                  # If this response_id is not authorized, we DROP the audio
+                  if resp_id and resp_id not in allowed_response_ids:
+                      logger.info(
+                          f"Dropping unsolicited audio for response_id={resp_id}"
+                      )
+                      continue
 
-                    audio_buffer.extend(raw_bytes)
+                  audio_chunk_b64 = event.get("delta")
+                  if not audio_chunk_b64:
+                      continue
+
+                  try:
+                      raw_bytes = base64.b64decode(audio_chunk_b64)
+                  except Exception as e:
+                      logger.error(f"Error decoding audio delta: {e}")
+                      continue
+
+                  # New utterance → turn prebuffer on
+                  if len(audio_buffer) == 0:
+                      prebuffer_active = True
+
+                  audio_buffer.extend(raw_bytes)
+                  continue
 
                 elif etype == "response.audio.done":
                     logger.info("OpenAI finished an audio response")
