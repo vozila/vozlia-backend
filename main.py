@@ -1186,8 +1186,6 @@ async def create_realtime_session():
 
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
 @app.websocket("/twilio/stream")
-
-
 async def twilio_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Twilio media stream connected")
@@ -1209,7 +1207,7 @@ async def twilio_stream(websocket: WebSocket):
     # Prebuffer state: we hold back sending until we have PREBUFFER_BYTES
     prebuffer_active = False
 
-    # NEW: only play audio for responses we explicitly requested
+    # Only play audio for responses we explicitly requested
     allowed_response_ids: set[str] = set()
 
     def assistant_actively_speaking() -> bool:
@@ -1264,58 +1262,58 @@ async def twilio_stream(websocket: WebSocket):
 
         async def openai_to_twilio():
             nonlocal stream_sid, barge_in_enabled, cancel_in_progress
-            nonlocal user_speaking_vad, assistant_last_audio_time, audio_buffer, prebuffer_active
+            nonlocal user_speaking_vad, assistant_last_audio_time
+            nonlocal audio_buffer, prebuffer_active, allowed_response_ids
 
             async for msg in openai_ws:
-              try:
-                  event = json.loads(msg)
-              except json.JSONDecodeError:
-                  logger.warning(f"Non-JSON message from OpenAI: {msg!r}")
-                  continue
+                try:
+                    event = json.loads(msg)
+                except json.JSONDecodeError:
+                    logger.warning(f"Non-JSON message from OpenAI: {msg!r}")
+                    continue
 
-              etype = event.get("type")
+                etype = event.get("type")
 
-              # --------------------------------------------------
-              # 0) Track allowed responses (so we mute unwanted ones)
-              # --------------------------------------------------
-              if etype == "response.created":
-                  # Realtime uses this when a new response begins
-                  resp = event.get("response") or {}
-                  rid = resp.get("id") or event.get("response_id")
-                  if rid:
-                      allowed_response_ids.add(rid)
-                      logger.info(f"Tracking allowed response_id: {rid}")
-                  continue
+                # --------------------------------------------------
+                # 0) Track allowed responses (so we mute unwanted ones)
+                # --------------------------------------------------
+                if etype == "response.created":
+                    resp = event.get("response") or {}
+                    rid = resp.get("id") or event.get("response_id")
+                    if rid:
+                        allowed_response_ids.add(rid)
+                        logger.info(f"Tracking allowed response_id: {rid}")
+                    continue
 
-              # --------------------------------------------------
-              # 1) AUDIO FROM OPENAI → BUFFER FOR TWILIO (filtered)
-              # --------------------------------------------------
-              if etype == "response.audio.delta":
-                  resp_id = event.get("response_id")
+                # --------------------------------------------------
+                # 1) AUDIO FROM OPENAI → BUFFER FOR TWILIO (filtered)
+                # --------------------------------------------------
+                if etype == "response.audio.delta":
+                    resp_id = event.get("response_id")
 
-                  # If this response_id is not authorized, we DROP the audio
-                  if resp_id and resp_id not in allowed_response_ids:
-                      logger.info(
-                          f"Dropping unsolicited audio for response_id={resp_id}"
-                      )
-                      continue
+                    # If this response_id is not authorized, we DROP the audio
+                    if resp_id and resp_id not in allowed_response_ids:
+                        logger.info(
+                            f"Dropping unsolicited audio for response_id={resp_id}"
+                        )
+                        continue
 
-                  audio_chunk_b64 = event.get("delta")
-                  if not audio_chunk_b64:
-                      continue
+                    audio_chunk_b64 = event.get("delta")
+                    if not audio_chunk_b64:
+                        continue
 
-                  try:
-                      raw_bytes = base64.b64decode(audio_chunk_b64)
-                  except Exception as e:
-                      logger.error(f"Error decoding audio delta: {e}")
-                      continue
+                    try:
+                        raw_bytes = base64.b64decode(audio_chunk_b64)
+                    except Exception as e:
+                        logger.error(f"Error decoding audio delta: {e}")
+                        continue
 
-                  # New utterance → turn prebuffer on
-                  if len(audio_buffer) == 0:
-                      prebuffer_active = True
+                    # New utterance → turn prebuffer on
+                    if len(audio_buffer) == 0:
+                        prebuffer_active = True
 
-                  audio_buffer.extend(raw_bytes)
-                  continue
+                    audio_buffer.extend(raw_bytes)
+                    continue
 
                 elif etype == "response.audio.done":
                     logger.info("OpenAI finished an audio response")
@@ -1328,20 +1326,15 @@ async def twilio_stream(websocket: WebSocket):
                 # 2) USER TRANSCRIPT COMPLETED → (maybe) route through FSM
                 # --------------------------------------------------
                 elif etype == "conversation.item.input_audio_transcription.completed":
-                    # End-of-utterance transcript from Realtime (already VAD-chunked)
                     logger.info(f"Transcript event from OpenAI: {event}")
 
-                    # Try several shapes defensively
                     transcript_text = ""
 
-                    # Some versions use "text"
                     if isinstance(event.get("text"), str):
                         transcript_text = event["text"]
-                    # Official Realtime shape uses "transcript"
                     elif isinstance(event.get("transcript"), str):
                         transcript_text = event["transcript"]
                     else:
-                        # Extra safety: try nested item/content if present
                         item = event.get("item") or {}
                         content = item.get("content") or []
                         if isinstance(content, list) and content:
@@ -1359,23 +1352,18 @@ async def twilio_stream(websocket: WebSocket):
 
                     logger.info(f"USER Transcript completed: {transcript_text!r}")
 
-                    # ---------- NEW: Debounce / intent gating ----------
                     if not should_route_transcript_to_fsm(transcript_text):
                         logger.info(
                             "Debounce: transcript does NOT look like an email/skill "
                             "intent; letting core Realtime model handle it."
                         )
-                        # We do *not* call the FSM here; the base audio model
-                        # will still respond naturally using SYSTEM_PROMPT.
                         continue
 
                     logger.info(
                         "Debounce: transcript looks like an email/skill request; "
                         "routing to FSM + backend."
                     )
-                    # ---------------------------------------------------
 
-                    # Call the same FSM + Gmail router your custom GPT uses
                     try:
                         fsm_response = await call_fsm_router(
                             text=transcript_text,
@@ -1385,7 +1373,6 @@ async def twilio_stream(websocket: WebSocket):
                         logger.exception(
                             f"Error calling /assistant/route from transcript: {e}"
                         )
-                        # Let Realtime handle any follow-up itself
                         continue
 
                     spoken_reply = (fsm_response or {}).get("spoken_reply") or ""
@@ -1395,7 +1382,6 @@ async def twilio_stream(websocket: WebSocket):
 
                     logger.info(f"FSM spoken_reply to send: {spoken_reply!r}")
 
-                    # Inject that reply into the Realtime conversation so it speaks it
                     try:
                         convo_item = {
                             "type": "conversation.item.create",
@@ -1423,7 +1409,6 @@ async def twilio_stream(websocket: WebSocket):
                         logger.error(
                             f"Error sending FSM reply into Realtime: {e}"
                         )
-
 
                 # --------------------------------------------------
                 # 3) OPTIONAL: text logs from model (for debugging)
@@ -1454,7 +1439,6 @@ async def twilio_stream(websocket: WebSocket):
                             await openai_ws.send(json.dumps({"type": "response.cancel"}))
                             cancel_in_progress = True
 
-                            # Drop any queued assistant audio so Twilio tail is minimal
                             audio_buffer.clear()
                             prebuffer_active = False
 
@@ -1478,14 +1462,11 @@ async def twilio_stream(websocket: WebSocket):
                     code = err.get("code")
 
                     if code == "response_cancel_not_active":
-                        # harmless: we tried to cancel when nothing was active
                         cancel_in_progress = False
 
-                # You can log other event types for debugging if you like:
                 else:
                     # logger.debug(f"Unhandled Realtime event type: {etype}")
                     pass
-
 
         async def twilio_audio_sender():
             """
@@ -1573,3 +1554,4 @@ async def twilio_stream(websocket: WebSocket):
             pass
 
         logger.info("Twilio stream closed")
+
