@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import json
 import asyncio
@@ -20,7 +22,7 @@ from fastapi.responses import PlainTextResponse, Response, JSONResponse, Redirec
 
 from sqlalchemy.orm import Session
 
-from twilio.twiml.voice_response import VoiceResponse, Connect
+from twilio.twiml.voice_response import VoiceResponse, Connect, Gather
 from openai import OpenAI
 import websockets
 
@@ -33,7 +35,7 @@ from models import User, EmailAccount
 from schemas import EmailAccountCreate, EmailAccountRead
 from deps import get_db
 
-import httpx  # <-- for Google OAuth + Gmail API
+import httpx  # for Google OAuth + Gmail API
 
 
 # ---------- OpenAI Realtime config (env-based) ----------
@@ -55,6 +57,9 @@ OPENAI_REALTIME_HEADERS = {
     "OpenAI-Beta": "realtime=v1",
 }
 
+# ---------- OpenAI text client ----------
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -63,58 +68,69 @@ logger.setLevel(logging.INFO)
 
 
 # ---------- Simple debounce / intent gating for FSM ----------
-
-# Short acknowledgements / filler that we *don't* want to send to the FSM.
 SMALL_TALK_PHRASES = {
-    "ok", "okay", "thanks", "thank you", "awesome", "cool", "great",
-    "that’s fine", "that's fine", "fine", "got it", "sounds good",
-    "no problem", "all good", "sure", "yeah", "yep", "no thanks",
-    "bye", "goodbye", "see you", "talk to you later",
+    "ok",
+    "okay",
+    "thanks",
+    "thank you",
+    "awesome",
+    "cool",
+    "great",
+    "that’s fine",
+    "that's fine",
+    "fine",
+    "got it",
+    "sounds good",
+    "no problem",
+    "all good",
+    "sure",
+    "yeah",
+    "yep",
+    "no thanks",
+    "bye",
+    "goodbye",
+    "see you",
+    "talk to you later",
 }
 
-# Keywords that strongly indicate an *email* intent.
 EMAIL_KEYWORDS = {
-    "email", "emails", "inbox", "gmail",
-    "message", "messages", "unread", "read my",
-    "check my mail", "check my email", "check my emails",
+    "email",
+    "emails",
+    "inbox",
+    "gmail",
+    "message",
+    "messages",
+    "unread",
+    "read my",
+    "check my mail",
+    "check my email",
+    "check my emails",
 }
 
 
 def looks_like_small_talk(text: str) -> bool:
-    """Return True if this is a short acknowledgment / chit-chat."""
     t = text.strip().lower()
-    # Very short (1–2 words) + in known small talk phrases.
     if len(t.split()) <= 3 and t in SMALL_TALK_PHRASES:
         return True
     return False
 
 
 def should_route_transcript_to_fsm(text: str) -> bool:
-    """
-    Debounce / intent gate:
-    Decide if this transcript should go to the FSM + backend
-    or just be handled by the base Realtime model conversation.
-    """
     t = (text or "").strip().lower()
     if not t:
         return False
 
     words = t.split()
 
-    # Ignore super-short fragments like "how many", "cats", "awesome"
     if len(words) < 3:
         return False
 
-    # Ignore pure small talk; let the base model handle that.
     if looks_like_small_talk(t):
         return False
 
-    # For now, only trigger FSM on email-related utterances.
-    # (We can expand this to calendar, tasks, etc. later.)
     if any(kw in t for kw in EMAIL_KEYWORDS):
         return True
 
-    # Fallback: don't send to FSM; treat as general chit-chat.
     return False
 
 
@@ -123,7 +139,6 @@ app = FastAPI()
 
 
 # ---------- Internal call to FSM router (/assistant/route) ----------
-
 VOZLIA_BACKEND_BASE_URL = os.getenv(
     "VOZLIA_BACKEND_BASE_URL",
     "https://vozlia-backend.onrender.com",
@@ -131,18 +146,6 @@ VOZLIA_BACKEND_BASE_URL = os.getenv(
 
 
 async def call_fsm_router(text: str, context: dict | None = None) -> dict:
-    """
-    Call the existing /assistant/route endpoint so phone calls
-    use the same FSM + Gmail logic as the custom GPT.
-
-    Returns the parsed JSON:
-      {
-        "spoken_reply": "...",
-        "fsm": {...},
-        "gmail": {...} or null,
-        ...
-      }
-    """
     if context is None:
         context = {"channel": "phone"}
 
@@ -164,7 +167,7 @@ def get_fernet() -> Fernet:
     if not key:
         raise RuntimeError("ENCRYPTION_KEY is not configured")
     # ENCRYPTION_KEY should be something like Fernet.generate_key().decode()
-    return Fernet(key.encode() if not key.startswith("gAAAA") else key)
+    return Fernet(key.encode())
 
 
 def encrypt_str(value: str | None) -> str | None:
@@ -184,21 +187,6 @@ def decrypt_str(value: str | None) -> str | None:
 # ---------- FSM debug endpoint (text-only) ----------
 @app.post("/fsm/debug")
 async def fsm_debug(request: Request):
-    """
-    Simple text-only endpoint to exercise the VozliaFSM.
-
-    Body example:
-      { "text": "Do I have any unread emails?" }
-
-    Returns whatever the FSM decides:
-      {
-        "intent": "...",
-        "state": "...",
-        "backend_call": { ... },
-        "spoken_reply": "...",
-        "raw": { ... }   # optional extra info
-      }
-    """
     body = await request.json()
     text = (body.get("text") or "").strip()
 
@@ -227,7 +215,6 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
-# For now: read-only Gmail scope (you can expand later)
 GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
@@ -242,10 +229,6 @@ def on_startup() -> None:
 
 # ---------- Auth stub / current user ----------
 def get_current_user(db: Session = Depends(get_db)) -> User:
-    """
-    TEMP: For now, just returns the first user or creates a demo user.
-    Later this will be replaced with real auth / tenant logic.
-    """
     user = db.query(User).first()
     if not user:
         user = User(email="demo@vozlia.com")
@@ -276,15 +259,9 @@ def create_email_account(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> EmailAccountRead:
-    """
-    Creates an email account record for the current user.
-    For provider_type == 'imap_custom', password (if provided) is encrypted
-    before storing in password_enc.
-    """
     password_enc = None
     if payload.provider_type == "imap_custom" and payload.password:
-        key = os.getenv("ENCRYPTION_KEY")
-        if not key:
+        if not os.getenv("ENCRYPTION_KEY"):
             raise HTTPException(
                 status_code=500,
                 detail="ENCRYPTION_KEY not configured on server",
@@ -320,10 +297,6 @@ def create_email_account(
 def google_auth_start(
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Starts Gmail OAuth flow for the current user.
-    Returns a redirect to Google's consent screen.
-    """
     if not GOOGLE_CLIENT_ID or not GOOGLE_REDIRECT_URI:
         raise HTTPException(
             status_code=500,
@@ -337,7 +310,7 @@ def google_auth_start(
         "redirect_uri": GOOGLE_REDIRECT_URI,
         "response_type": "code",
         "scope": GOOGLE_GMAIL_SCOPE,
-        "access_type": "offline",  # ask for refresh_token
+        "access_type": "offline",
         "include_granted_scopes": "true",
         "prompt": "consent",
         "state": state,
@@ -354,10 +327,6 @@ async def google_auth_callback(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Handles Google's OAuth callback.
-    Exchanges 'code' for tokens, gets Gmail profile, and stores/updates EmailAccount.
-    """
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not GOOGLE_REDIRECT_URI:
         raise HTTPException(
             status_code=500,
@@ -497,7 +466,7 @@ async def google_auth_callback(
     }
 
 
-# ---------- Gmail helpers (token refresh + account fetch) ----------
+# ---------- Gmail helpers ----------
 def _get_gmail_account_or_404(
     account_id: str,
     current_user: User,
@@ -530,10 +499,6 @@ def _get_gmail_account_or_404(
 
 
 def _get_default_gmail_account_id(current_user: User, db: Session) -> str | None:
-    """
-    Returns the id of the user's primary Gmail account if present,
-    otherwise the first active Gmail account. Returns None if none exist.
-    """
     q = (
         db.query(EmailAccount)
         .filter(
@@ -556,10 +521,6 @@ def _get_default_gmail_account_id(current_user: User, db: Session) -> str | None
 
 
 def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
-    """
-    Returns a valid Gmail access token, refreshing with the stored refresh token
-    if needed. Updates DB if a refresh occurs.
-    """
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
         raise HTTPException(
             status_code=500,
@@ -621,10 +582,7 @@ def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
 
 
 def _extract_headers(message_json: dict) -> dict:
-    headers_list = (
-        message_json.get("payload", {})
-        .get("headers", [])
-    )
+    headers_list = message_json.get("payload", {}).get("headers", [])
     h = {hdr.get("name", "").lower(): hdr.get("value", "") for hdr in headers_list}
     return {
         "subject": h.get("subject"),
@@ -634,7 +592,6 @@ def _extract_headers(message_json: dict) -> dict:
     }
 
 
-# ---------- Core Gmail listing logic (reusable) ----------
 def _gmail_list_messages_core(
     account_id: str,
     max_results: int,
@@ -642,10 +599,6 @@ def _gmail_list_messages_core(
     db: Session,
     current_user: User,
 ):
-    """
-    Core logic to list Gmail messages for an account.
-    Returns the same JSON structure used by the /messages endpoint.
-    """
     if max_results <= 0:
         max_results = 1
     if max_results > 50:
@@ -654,9 +607,7 @@ def _gmail_list_messages_core(
     account = _get_gmail_account_or_404(account_id, current_user, db)
     access_token = ensure_gmail_access_token(account, db)
 
-    params = {
-        "maxResults": max_results,
-    }
+    params = {"maxResults": max_results}
     if query:
         params["q"] = query
 
@@ -722,7 +673,6 @@ def _gmail_list_messages_core(
     }
 
 
-# ---------- Gmail API usage endpoints ----------
 @app.get("/email/accounts/{account_id}/messages")
 def list_gmail_messages(
     account_id: str,
@@ -799,7 +749,7 @@ class AssistantRouteOut(BaseModel):
     gmail: dict | None = None
 
 
-# ---------- Gmail summary helper for Vozlia (core logic) ----------
+# ---------- Gmail summary helper for Vozlia ----------
 def summarize_gmail_messages_for_assistant(
     account_id: str,
     db: Session,
@@ -845,7 +795,7 @@ def summarize_gmail_messages_for_assistant(
     if not messages:
         summary_text = "You have no recent emails matching that filter."
     else:
-        messages_for_prompt = messages[: max_results]
+        messages_for_prompt = messages[:max_results]
 
         try:
             resp = client.chat.completions.create(
@@ -970,11 +920,10 @@ def gmail_summary(
         max_results=max_results,
         query=query,
     )
-    data["messages"] = data.get("messages", [])[: max_results]
+    data["messages"] = data.get("messages", [])[:max_results]
     return data
 
 
-# ---------- Assistant router endpoint (for phone + ChatGPT) ----------
 @app.post("/assistant/route", response_model=AssistantRouteOut)
 def assistant_route(
     payload: AssistantRouteIn,
@@ -991,9 +940,7 @@ def assistant_route(
     return result
 
 
-# ---------- OpenAI client (for text + Gmail summaries) ----------
-client = OpenAI(api_key=OPENAI_API_KEY)
-
+# ---------- Voice / system prompt ----------
 SUPPORTED_VOICES = {
     "alloy",
     "ash",
@@ -1003,7 +950,7 @@ SUPPORTED_VOICES = {
     "sage",
     "shimmer",
     "verse",
-    "marin",
+    "martin",
     "cedar",
 }
 
@@ -1094,7 +1041,7 @@ async def debug_gpt(text: str = "Hello Vozlia"):
     return JSONResponse({"reply": reply})
 
 
-# ---------- Twilio inbound → TwiML ----------
+# ---------- Twilio inbound → TwiML (media stream) ----------
 @app.post("/twilio/inbound")
 async def twilio_inbound(request: Request):
     form = await request.form()
@@ -1122,31 +1069,47 @@ async def twilio_inbound(request: Request):
     return Response(content=xml, media_type="application/xml")
 
 
-# ---------- Helper: initial greeting via Realtime ----------
-async def send_initial_greeting(openai_ws):
-    try:
-        convo_item = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Greet the caller as Vozlia, a friendly AI phone assistant using "
-                            "the Coral voice. Briefly introduce yourself and invite them to "
-                            "say what they need help with."
-                        ),
-                    }
-                ],
-            },
-        }
-        await openai_ws.send(json.dumps(convo_item))
-        await openai_ws.send(json.dumps({"type": "response.create"}))
-        logger.info("Sent initial greeting request to OpenAI Realtime")
-    except Exception as e:
-        logger.error(f"Error sending initial greeting: {e}")
+# ---------- Optional: Twilio /twilio/gather endpoint ----------
+@app.post("/twilio/gather")
+async def twilio_gather(request: Request):
+    """
+    Optional Gather-based endpoint (not used for media streams).
+    Only active if you point Twilio Voice webhook here.
+    """
+    form = await request.form()
+    from_number = form.get("From")
+    to_number = form.get("To")
+    call_sid = form.get("CallSid")
+
+    logger.info(
+        f"Twilio /twilio/gather called: From={from_number}, To={to_number}, CallSid={call_sid}"
+    )
+
+    resp = VoiceResponse()
+    gather = Gather(
+        input="speech dtmf",
+        timeout=5,
+        num_digits=1,
+        action="/twilio/inbound",
+        method="POST",
+    )
+    gather.say(
+        "Hello, this is Vozlia. "
+        "Please say what you need help with, or press 1 to continue."
+    )
+    resp.append(gather)
+
+    # Fallback if no input
+    resp.say("I didn't receive anything. Connecting you now.")
+    connect = Connect()
+    stream_url = os.getenv(
+        "TWILIO_STREAM_URL",
+        "wss://vozlia-backend.onrender.com/twilio/stream",
+    )
+    connect.stream(url=stream_url)
+    resp.append(connect)
+
+    return Response(content=str(resp), media_type="application/xml")
 
 
 # ---------- Helper: OpenAI Realtime session via websockets ----------
@@ -1174,7 +1137,6 @@ async def create_realtime_session():
             "output_audio_format": "g711_ulaw",
             "turn_detection": {
                 "type": "server_vad",
-                # You can tune these later:
                 "threshold": 0.5,
                 "silence_duration_ms": 500,
             },
@@ -1187,11 +1149,14 @@ async def create_realtime_session():
     await openai_ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime")
 
-    # Initial greeting is triggered once state is up
+    # Ask Realtime to generate the first greeting
     await openai_ws.send(json.dumps({"type": "response.create"}))
     logger.info("Sent initial greeting request to OpenAI Realtime")
 
     return openai_ws
+
+
+# ---------- Twilio media stream ↔ OpenAI Realtime ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
     """
@@ -1229,15 +1194,11 @@ async def twilio_stream(websocket: WebSocket):
     allowed_response_ids: set[str] = set()         # Responses we accept audio from
 
     # --- Twilio → OpenAI commit gating (frame-based) ------------------------
-    # Twilio sends ~20ms of μ-law per "media" frame.
-    # We commit to OpenAI ONLY after we see at least ~1 second of frames
-    # to guarantee we are WELL above the ">= 100ms" minimum from OpenAI's POV.
     FRAMES_PER_COMMIT = 50          # 50 * 20ms ≈ 1 second of audio
     frames_since_commit: int = 0    # count of media frames since last commit
 
     # Simple helper to judge if assistant is currently speaking
     def assistant_actively_speaking() -> bool:
-        # If there's buffered audio or very recent send, treat as "speaking"
         if audio_buffer:
             return True
         return False
@@ -1249,7 +1210,6 @@ async def twilio_stream(websocket: WebSocket):
         if stream_sid is None or not audio_buffer:
             return
 
-        # Prebuffer: wait until we have at least PREBUFFER_BYTES, then start streaming
         if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
             return
         elif prebuffer_active and len(audio_buffer) >= PREBUFFER_BYTES:
@@ -1273,10 +1233,6 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Helper: barge-in ----------------------------------------------------
     async def handle_barge_in():
-        """
-        Called when OpenAI VAD says user started speaking while assistant is talking.
-        Cancels the current active response if there is one.
-        """
         nonlocal active_response_id, audio_buffer
 
         if not barge_in_enabled:
@@ -1303,13 +1259,18 @@ async def twilio_stream(websocket: WebSocket):
         else:
             logger.info("BARGE-IN: no active_response_id; skipping response.cancel")
 
-        # Clear buffered audio so we stop sending the interrupted response
         audio_buffer.clear()
 
     # --- Intent helpers ------------------------------------------------------
     EMAIL_KEYWORDS_LOCAL = [
-        "email", "emails", "inbox", "gmail", "messages",
-        "how many emails", "read my email", "read my emails",
+        "email",
+        "emails",
+        "inbox",
+        "gmail",
+        "messages",
+        "how many emails",
+        "read my email",
+        "read my emails",
     ]
 
     def looks_like_email_intent(text: str) -> bool:
@@ -1330,9 +1291,6 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Helper: call FSM/email backend -------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
-        """
-        Calls your existing /assistant/route FSM endpoint and returns spoken_reply.
-        """
         try:
             data = await call_fsm_router(
                 text=transcript,
@@ -1347,9 +1305,6 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Helper: create responses with active_response_id guard -------------
     async def create_generic_response():
-        """
-        Generic GPT turn: just respond to latest user message in the Realtime conversation.
-        """
         nonlocal active_response_id
         if active_response_id is not None:
             logger.warning(
@@ -1362,9 +1317,6 @@ async def twilio_stream(websocket: WebSocket):
         logger.info("Sent generic response.create for chit-chat turn")
 
     async def create_fsm_spoken_reply(spoken_reply: str):
-        """
-        Ask Realtime to speak a specific backend-computed reply.
-        """
         nonlocal active_response_id
         if active_response_id is not None:
             logger.warning(
@@ -1389,10 +1341,6 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Helper: handle transcripts from Realtime ---------------------------
     async def handle_transcript_event(event: dict):
-        """
-        Handles 'conversation.item.input_audio_transcription.completed' events.
-        Uses email/FSM routing vs generic chit-chat.
-        """
         transcript: str = event.get("transcript", "").strip()
         if not transcript:
             return
@@ -1447,20 +1395,19 @@ async def twilio_stream(websocket: WebSocket):
                             rid, etype,
                         )
                         active_response_id = None
-                        # After first full response, enable barge-in
                         if not barge_in_enabled:
                             barge_in_enabled = True
                             logger.info("Barge-in is now ENABLED for subsequent responses.")
 
                 elif etype == "response.audio.delta":
-                    # Stream assistant audio back to Twilio
                     resp_id = event.get("response_id")
                     delta_b64 = event.get("delta")
 
                     if resp_id != active_response_id:
                         logger.info(
                             "Dropping unsolicited audio for response_id=%s (active=%s)",
-                            resp_id, active_response_id,
+                            resp_id,
+                            active_response_id,
                         )
                         continue
 
@@ -1479,7 +1426,6 @@ async def twilio_stream(websocket: WebSocket):
                 elif etype == "input_audio_buffer.speech_started":
                     user_speaking_vad = True
                     logger.info("OpenAI VAD: user speech START")
-                    # If assistant is speaking and barge-in is enabled, cancel
                     if assistant_actively_speaking():
                         await handle_barge_in()
 
@@ -1488,7 +1434,6 @@ async def twilio_stream(websocket: WebSocket):
                     logger.info("OpenAI VAD: user speech STOP")
 
                 elif etype == "conversation.item.input_audio_transcription.completed":
-                    # Handle transcript → FSM or generic
                     await handle_transcript_event(event)
 
                 elif etype == "error":
@@ -1533,7 +1478,6 @@ async def twilio_stream(websocket: WebSocket):
                     if not payload:
                         continue
 
-                    # Just to measure, decode Twilio μ-law payload
                     try:
                         ulaw_bytes = base64.b64decode(payload)
                     except Exception:
@@ -1541,21 +1485,16 @@ async def twilio_stream(websocket: WebSocket):
                         continue
 
                     if len(ulaw_bytes) == 0:
-                        # Nothing to send; don't touch commit counter
                         continue
 
-                    # 1) Append Twilio μ-law audio into Realtime's input buffer
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
-                        "audio": payload,  # base64 g711_ulaw
+                        "audio": payload,
                     }))
 
-                    # 2) Count this as one frame for commit gating
                     frames_since_commit += 1
 
-                    # 3) Only commit when we've seen enough frames
                     if frames_since_commit >= FRAMES_PER_COMMIT:
-                        # Extra safety: never commit if, for some reason, we have no frames
                         if frames_since_commit <= 0:
                             logger.warning(
                                 "Commit skipped because frames_since_commit=%d",
@@ -1574,10 +1513,6 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif event_type == "stop":
                     logger.info("Twilio stream event: stop")
-
-                    # IMPORTANT: Do NOT send another commit here. This avoids
-                    # a possible commit with 0 new frames (which would cause
-                    # the exact 'buffer too small / 0.00ms' errors we see).
                     logger.info(
                         "Twilio sent stop; closing call. frames_since_commit=%d (dropping leftover).",
                         frames_since_commit,
@@ -1594,7 +1529,6 @@ async def twilio_stream(websocket: WebSocket):
         openai_ws = await create_realtime_session()
         logger.info("connection open")
 
-        # Run both loops concurrently until one exits
         await asyncio.gather(
             openai_loop(),
             twilio_loop(),
