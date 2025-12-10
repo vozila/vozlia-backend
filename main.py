@@ -40,6 +40,63 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vozlia")
 logger.setLevel(logging.INFO)
 
+
+# ---------- Simple debounce / intent gating for FSM ----------
+
+# Short acknowledgements / filler that we *don't* want to send to the FSM.
+SMALL_TALK_PHRASES = {
+    "ok", "okay", "thanks", "thank you", "awesome", "cool", "great",
+    "that’s fine", "that's fine", "fine", "got it", "sounds good",
+    "no problem", "all good", "sure", "yeah", "yep", "no thanks",
+    "bye", "goodbye", "see you", "talk to you later",
+}
+
+# Keywords that strongly indicate an *email* intent.
+EMAIL_KEYWORDS = {
+    "email", "emails", "inbox", "gmail",
+    "message", "messages", "unread", "read my",
+    "check my mail", "check my email", "check my emails",
+}
+
+
+def looks_like_small_talk(text: str) -> bool:
+    """Return True if this is a short acknowledgment / chit-chat."""
+    t = text.strip().lower()
+    # Very short (1–2 words) + in known small talk phrases.
+    if len(t.split()) <= 3 and t in SMALL_TALK_PHRASES:
+        return True
+    return False
+
+
+def should_route_transcript_to_fsm(text: str) -> bool:
+    """
+    Debounce / intent gate:
+    Decide if this transcript should go to the FSM + backend
+    or just be handled by the base Realtime model conversation.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    words = t.split()
+
+    # Ignore super-short fragments like "how many", "cats", "awesome"
+    if len(words) < 3:
+        return False
+
+    # Ignore pure small talk; let the base model handle that.
+    if looks_like_small_talk(t):
+        return False
+
+    # For now, only trigger FSM on email-related utterances.
+    # (We can expand this to calendar, tasks, etc. later.)
+    if any(kw in t for kw in EMAIL_KEYWORDS):
+        return True
+
+    # Fallback: don't send to FSM; treat as general chit-chat.
+    return False
+
+
 # ---------- FastAPI app ----------
 app = FastAPI()
 
@@ -1241,27 +1298,55 @@ async def twilio_stream(websocket: WebSocket):
                         logger.info("Barge-in is now ENABLED for subsequent responses.")
 
                 # --------------------------------------------------
-                # 2) USER TRANSCRIPT COMPLETED → route through FSM
+                # 2) USER TRANSCRIPT COMPLETED → (maybe) route through FSM
                 # --------------------------------------------------
                 elif etype == "conversation.item.input_audio_transcription.completed":
+                    # End-of-utterance transcript from Realtime (already VAD-chunked)
                     logger.info(f"Transcript event from OpenAI: {event}")
 
-                    # Official shape: { type, transcript, item_id, content_index, ... }
-                    transcript_text = (event.get("transcript") or "").strip()
+                    # Try several shapes defensively
+                    transcript_text = ""
 
-                    # Extra safety: some variants nest content, so we try to dig it out:
-                    if not transcript_text:
+                    # Some versions use "text"
+                    if isinstance(event.get("text"), str):
+                        transcript_text = event["text"]
+                    # Official Realtime shape uses "transcript"
+                    elif isinstance(event.get("transcript"), str):
+                        transcript_text = event["transcript"]
+                    else:
+                        # Extra safety: try nested item/content if present
                         item = event.get("item") or {}
                         content = item.get("content") or []
-                        if content and isinstance(content, list):
+                        if isinstance(content, list) and content:
                             first = content[0] or {}
-                            transcript_text = (first.get("transcript") or first.get("text") or "").strip()
+                            transcript_text = (
+                                first.get("transcript")
+                                or first.get("text")
+                                or ""
+                            )
 
+                    transcript_text = (transcript_text or "").strip()
                     if not transcript_text:
                         logger.info("Transcript completed event but no text found.")
                         continue
 
                     logger.info(f"USER Transcript completed: {transcript_text!r}")
+
+                    # ---------- NEW: Debounce / intent gating ----------
+                    if not should_route_transcript_to_fsm(transcript_text):
+                        logger.info(
+                            "Debounce: transcript does NOT look like an email/skill "
+                            "intent; letting core Realtime model handle it."
+                        )
+                        # We do *not* call the FSM here; the base audio model
+                        # will still respond naturally using SYSTEM_PROMPT.
+                        continue
+
+                    logger.info(
+                        "Debounce: transcript looks like an email/skill request; "
+                        "routing to FSM + backend."
+                    )
+                    # ---------------------------------------------------
 
                     # Call the same FSM + Gmail router your custom GPT uses
                     try:
@@ -1270,7 +1355,9 @@ async def twilio_stream(websocket: WebSocket):
                             context={"channel": "phone"},
                         )
                     except Exception as e:
-                        logger.exception(f"Error calling /assistant/route from transcript: {e}")
+                        logger.exception(
+                            f"Error calling /assistant/route from transcript: {e}"
+                        )
                         # Let Realtime handle any follow-up itself
                         continue
 
@@ -1302,9 +1389,14 @@ async def twilio_stream(websocket: WebSocket):
                         }
                         await openai_ws.send(json.dumps(convo_item))
                         await openai_ws.send(json.dumps({"type": "response.create"}))
-                        logger.info("Sent FSM-driven spoken reply into Realtime session")
+                        logger.info(
+                            "Sent FSM-driven spoken reply into Realtime session"
+                        )
                     except Exception as e:
-                        logger.error(f"Error sending FSM reply into Realtime: {e}")
+                        logger.error(
+                            f"Error sending FSM reply into Realtime: {e}"
+                        )
+
 
                 # --------------------------------------------------
                 # 3) OPTIONAL: text logs from model (for debugging)
