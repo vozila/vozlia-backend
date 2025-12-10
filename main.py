@@ -7,6 +7,9 @@ import time
 from typing import List
 from datetime import datetime, timedelta
 from vozlia_fsm import VozliaFSM  # and Intent if you exposed it
+from pydantic import BaseModel
+from vozlia_fsm import VozliaFSM  # your FSM module
+
 
 
 import httpx  # <-- for Google OAuth + Gmail API
@@ -423,6 +426,33 @@ def _get_gmail_account_or_404(
 
     return account
 
+def _get_default_gmail_account_id(current_user: User, db: Session) -> str | None:
+    """
+    Returns the id of the user's primary Gmail account if present,
+    otherwise the first active Gmail account. Returns None if none exist.
+    """
+    q = (
+        db.query(EmailAccount)
+        .filter(
+            EmailAccount.user_id == current_user.id,
+            EmailAccount.provider_type == "gmail",
+            EmailAccount.oauth_provider == "google",
+            EmailAccount.is_active == True,  # noqa: E712
+        )
+    )
+
+    primary = q.filter(EmailAccount.is_primary == True).first()  # noqa: E712
+    if primary:
+        return str(primary.id)
+
+    first = q.first()
+    if first:
+        return str(first.id)
+
+    return None
+
+
+
 
 def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
     """
@@ -677,6 +707,31 @@ def gmail_stats(
         "approx_message_count": size_estimate,
     }
 
+# ---------- Assistant routing models (FSM entrypoint) ----------
+
+class AssistantRouteIn(BaseModel):
+    """
+    Input body when the assistant (phone or ChatGPT) asks the backend
+    what to do with a specific user utterance.
+    """
+    text: str
+    account_id: str | None = None  # optional: explicit Gmail account
+    context: dict | None = None    # optional: extra metadata (channel, etc.)
+
+
+class AssistantRouteOut(BaseModel):
+    """
+    What the backend returns to the assistant:
+      - spoken_reply: what Vozlia should actually say
+      - fsm: raw FSM decision payload (intent, next_state, etc.)
+      - gmail: optional Gmail summary data (if used)
+    """
+    spoken_reply: str
+    fsm: dict
+    gmail: dict | None = None
+
+
+
 
 # ---------- Gmail summary helper for Vozlia (core logic) ----------
 def summarize_gmail_messages_for_assistant(
@@ -782,6 +837,93 @@ def summarize_gmail_messages_for_assistant(
     return data
 
 
+# ---------- Core assistant routing logic (FSM + skills) ----------
+
+def _run_fsm_and_backend(
+    text: str,
+    db: Session,
+    current_user: User,
+    account_id: str | None = None,
+    context: dict | None = None,
+) -> AssistantRouteOut:
+    """
+    Single entrypoint for:
+      - Running VozliaFSM on the caller's utterance.
+      - Optionally calling backend skills (currently: Gmail summary).
+      - Producing a spoken reply plus structured data.
+    """
+    fsm = VozliaFSM()
+
+    # You can pass extra context if your FSM needs it (channel, user id, etc.)
+    fsm_context = context or {}
+    fsm_context.setdefault("user_id", current_user.id)
+    fsm_context.setdefault("channel", "phone")  # or "chat" for GPT-side usage
+
+    fsm_result: dict = fsm.handle_utterance(text, context=fsm_context)
+
+    spoken_reply: str = fsm_result.get("spoken_reply") or ""
+    backend_call: dict | None = fsm_result.get("backend_call") or None
+
+    gmail_data: dict | None = None
+
+    # --- Handle Gmail summary skill, if requested by FSM ---
+    if backend_call and backend_call.get("type") == "gmail_summary":
+        params = backend_call.get("params") or {}
+
+        # Priority: explicit account_id in params > request body > default Gmail account
+        account_id_effective = (
+            params.get("account_id")
+            or account_id
+            or _get_default_gmail_account_id(current_user, db)
+        )
+
+        if not account_id_effective:
+            # No Gmail account available – append a brief explanation.
+            if spoken_reply:
+                spoken_reply = (
+                    spoken_reply.rstrip(". ") +
+                    " However, I don't see a Gmail account connected for you yet."
+                )
+            else:
+                spoken_reply = (
+                    "I tried to check your email, but I don't see a Gmail "
+                    "account connected for you yet."
+                )
+        else:
+            gmail_query = params.get("query")
+            gmail_max_results = params.get("max_results", 20)
+
+            gmail_data = summarize_gmail_messages_for_assistant(
+                account_id=account_id_effective,
+                db=db,
+                current_user=current_user,
+                max_results=gmail_max_results,
+                query=gmail_query,
+            )
+
+            gmail_summary = gmail_data.get("summary")
+            if gmail_summary:
+                # Combine FSM reply + Gmail summary in a natural way
+                if spoken_reply:
+                    spoken_reply = f"{spoken_reply.strip()} {gmail_summary.strip()}"
+                else:
+                    spoken_reply = gmail_summary.strip()
+
+            # Make sure we expose which account_id was used
+            gmail_data["used_account_id"] = account_id_effective
+
+    # TODO: In the future, add other backend_call types here:
+    #   - weather lookup
+    #   - nearby_location search
+    #   - task engine, calendar, etc.
+
+    return AssistantRouteOut(
+        spoken_reply=spoken_reply,
+        fsm=fsm_result,
+        gmail=gmail_data,
+    )
+
+
 @app.get("/email/accounts/{account_id}/summary")
 def gmail_summary(
     account_id: str,
@@ -808,6 +950,39 @@ def gmail_summary(
     # Optionally trim the messages list to keep response lighter
     data["messages"] = data.get("messages", [])[: max_results]
     return data
+
+# ---------- Assistant router endpoint (for phone + ChatGPT) ----------
+
+@app.post("/assistant/route", response_model=AssistantRouteOut)
+def assistant_route(
+    payload: AssistantRouteIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Unified router for Vozlia.
+
+    This is what:
+      - The phone agent (OpenAI Realtime) can call via tools, and
+      - Your future custom GPT can call as a tool,
+
+    whenever the assistant needs to:
+      - Interpret the caller's request (via FSM), and
+      - Optionally use backend skills (Gmail, etc.)
+
+    It returns:
+      - spoken_reply: what Vozlia should actually say
+      - fsm: raw FSM decision info
+      - gmail: optional Gmail summary block (if used)
+    """
+    result = _run_fsm_and_backend(
+        text=payload.text,
+        db=db,
+        current_user=current_user,
+        account_id=payload.account_id,
+        context=payload.context,
+    )
+    return result
 
 
 # ---------- OpenAI config ----------
