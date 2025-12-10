@@ -1192,7 +1192,6 @@ async def create_realtime_session():
     logger.info("Sent initial greeting request to OpenAI Realtime")
 
     return openai_ws
-
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
     """
@@ -1229,11 +1228,15 @@ async def twilio_stream(websocket: WebSocket):
     active_response_id: Optional[str] = None       # The single "currently active" response
     allowed_response_ids: set[str] = set()         # Responses we accept audio from
 
-    # --- NEW: input buffering for Realtime commit threshold -----------------
-    # Twilio sends ~20ms per media frame.
-    # Realtime wants at least ~100ms before we call input_audio_buffer.commit.
-    FRAMES_PER_COMMIT = 5       # 5 * 20ms = 100ms
-    frames_since_commit: int = 0
+    # --- NEW: byte-accurate input buffering for Realtime commit threshold ---
+    # For g711_ulaw at 8kHz: 1 byte/sample => 8000 bytes/sec.
+    #   100 ms ≈ 800 bytes, we give a little margin and aim for ~150 ms.
+    BYTES_PER_MS = SAMPLE_RATE // 1000  # 8000 / 1000 = 8
+    MIN_COMMIT_MS = 150
+    MIN_COMMIT_BYTES = BYTES_PER_MS * MIN_COMMIT_MS  # ~1200 bytes
+
+    # Number of μ-law bytes appended to Realtime input since last commit
+    pending_input_bytes: int = 0
 
     # Simple helper to judge if assistant is currently speaking
     def assistant_actively_speaking() -> bool:
@@ -1504,7 +1507,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Twilio event loop ---------------------------------------------------
     async def twilio_loop():
-        nonlocal stream_sid, prebuffer_active, frames_since_commit
+        nonlocal stream_sid, prebuffer_active, pending_input_bytes
 
         try:
             async for msg in websocket.iter_text():
@@ -1524,7 +1527,7 @@ async def twilio_stream(websocket: WebSocket):
                     start = data.get("start", {})
                     stream_sid = start.get("streamSid")
                     prebuffer_active = True
-                    frames_since_commit = 0
+                    pending_input_bytes = 0
                     logger.info("Twilio stream event: start")
                     logger.info("Stream started: %s", stream_sid)
 
@@ -1536,30 +1539,54 @@ async def twilio_stream(websocket: WebSocket):
                     if not payload:
                         continue
 
-                    # Append Twilio μ-law audio into Realtime's input buffer
+                    # Measure how many μ-law bytes this frame represents
+                    try:
+                        ulaw_bytes = base64.b64decode(payload)
+                    except Exception:
+                        logger.exception("Failed to base64-decode Twilio payload")
+                        continue
+
+                    frame_len = len(ulaw_bytes)
+                    if frame_len == 0:
+                        continue
+
+                    # 1) Append Twilio μ-law audio into Realtime's input buffer
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": payload,  # base64 g711_ulaw
                     }))
 
-                    # Only commit every ~100ms to satisfy Realtime's requirement
-                    frames_since_commit += 1
-                    if frames_since_commit >= FRAMES_PER_COMMIT:
+                    # 2) Track how many μ-law bytes we've appended since last commit
+                    pending_input_bytes += frame_len
+
+                    # 3) Only commit when we've reached >= ~150ms of audio
+                    if pending_input_bytes >= MIN_COMMIT_BYTES:
                         await openai_ws.send(json.dumps({
                             "type": "input_audio_buffer.commit"
                         }))
-                        frames_since_commit = 0
+                        logger.debug(
+                            "Committed input_audio_buffer after %d bytes (>= %d bytes)",
+                            pending_input_bytes, MIN_COMMIT_BYTES,
+                        )
+                        pending_input_bytes = 0
 
                 elif event_type == "stop":
                     logger.info("Twilio stream event: stop")
-                    # If there's any uncommitted audio, flush it
-                    if frames_since_commit > 0 and openai_ws:
+
+                    # We might have a tiny leftover < 150ms; to avoid commit-empty errors,
+                    # only flush if it's still >= the 100ms minimum.
+                    if pending_input_bytes >= BYTES_PER_MS * 100 and openai_ws:
                         try:
                             await openai_ws.send(json.dumps({
                                 "type": "input_audio_buffer.commit"
                             }))
+                            logger.debug(
+                                "Final commit on stop with %d pending bytes",
+                                pending_input_bytes,
+                            )
                         except Exception:
                             logger.exception("Error committing final audio buffer on stop")
+
                     logger.info("Twilio sent stop; closing call.")
                     break
 
@@ -1591,3 +1618,4 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error closing Twilio WebSocket")
 
         logger.info("WebSocket disconnected while sending audio")
+
