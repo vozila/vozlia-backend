@@ -35,6 +35,27 @@ from deps import get_db
 
 import httpx  # <-- for Google OAuth + Gmail API
 
+
+# ---------- OpenAI Realtime config (env-based) ----------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_REALTIME_MODEL = os.getenv(
+    "OPENAI_REALTIME_MODEL",
+    "gpt-4o-mini-realtime-preview-2024-12-17",
+)
+OPENAI_REALTIME_URL = os.getenv(
+    "OPENAI_REALTIME_URL",
+    f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}",
+)
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY environment variable is not set")
+
+OPENAI_REALTIME_HEADERS = {
+    "Authorization": f"Bearer {OPENAI_API_KEY}",
+    "OpenAI-Beta": "realtime=v1",
+}
+
+
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vozlia")
@@ -99,6 +120,7 @@ def should_route_transcript_to_fsm(text: str) -> bool:
 
 # ---------- FastAPI app ----------
 app = FastAPI()
+
 
 # ---------- Internal call to FSM router (/assistant/route) ----------
 
@@ -790,7 +812,7 @@ def summarize_gmail_messages_for_assistant(
     if max_results > 50:
         max_results = 50
 
-    if not os.getenv("OPENAI_API_KEY"):
+    if not OPENAI_API_KEY:
         data = _gmail_list_messages_core(
             account_id=account_id,
             max_results=max_results,
@@ -969,23 +991,8 @@ def assistant_route(
     return result
 
 
-# ---------- OpenAI config ----------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY is not set. GPT / Realtime calls will fail.")
-
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-OPENAI_REALTIME_MODEL = os.getenv(
-    "OPENAI_REALTIME_MODEL",
-    "gpt-4o-mini-realtime-preview-2024-12-17",
-)
-OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
-
-OPENAI_REALTIME_HEADERS = {
-    "Authorization": f"Bearer {OPENAI_API_KEY}" if OPENAI_API_KEY else "",
-    "OpenAI-Beta": "realtime=v1",
-}
+# ---------- OpenAI client (for text + Gmail summaries) ----------
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 SUPPORTED_VOICES = {
     "alloy",
@@ -1039,8 +1046,6 @@ to clarify or ask a follow-up question.
 """.strip()
 
 
-
-
 # ---------- Audio framing for G.711 μ-law ----------
 SAMPLE_RATE = 8000
 FRAME_MS = 20
@@ -1068,9 +1073,6 @@ async def health():
 # ---------- Debug GPT (text only) ----------
 async def generate_gpt_reply(text: str) -> str:
     logger.info(f"/debug/gpt called with text: {text!r}")
-
-    if not OPENAI_API_KEY or client is None:
-        return "OpenAI API key is not configured on the server."
 
     try:
         resp = client.chat.completions.create(
@@ -1149,14 +1151,17 @@ async def send_initial_greeting(openai_ws):
 
 # ---------- Helper: OpenAI Realtime session via websockets ----------
 async def create_realtime_session():
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set; cannot use Realtime API.")
-
+    """
+    Connect to OpenAI Realtime WebSocket using env vars and configure the session.
+    """
     logger.info("Connecting to OpenAI Realtime WebSocket via websockets...")
 
     openai_ws = await websockets.connect(
         OPENAI_REALTIME_URL,
         extra_headers=OPENAI_REALTIME_HEADERS,
+        ping_interval=None,
+        ping_timeout=None,
+        max_size=None,
     )
 
     session_update = {
@@ -1169,6 +1174,9 @@ async def create_realtime_session():
             "output_audio_format": "g711_ulaw",
             "turn_detection": {
                 "type": "server_vad",
+                # You can tune these later:
+                "threshold": 0.5,
+                "silence_duration_ms": 500,
             },
             "input_audio_transcription": {
                 "model": "gpt-4o-mini-transcribe"
@@ -1179,7 +1187,10 @@ async def create_realtime_session():
     await openai_ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime")
 
-    # NOTE: initial greeting is now sent from /twilio/stream once state is set up
+    # Initial greeting is triggered once state is up
+    await openai_ws.send(json.dumps({"type": "response.create"}))
+    logger.info("Sent initial greeting request to OpenAI Realtime")
+
     return openai_ws
 
 
@@ -1214,7 +1225,6 @@ async def twilio_stream(websocket: WebSocket):
     assistant_last_audio_time: float = 0.0
 
     # Prebuffer state: we hold back sending until we have enough audio
-    PREBUFFER_BYTES = 800  # ~100ms at 8kHz μ-law
     prebuffer_active: bool = True
 
     # Response tracking
@@ -1226,48 +1236,7 @@ async def twilio_stream(websocket: WebSocket):
         # If there's buffered audio or very recent send, treat as "speaking"
         if audio_buffer:
             return True
-        # You can optionally use assistant_last_audio_time vs time.monotonic()
         return False
-
-    # --- Helper: connect to OpenAI Realtime ---------------------------------
-    async def connect_openai_realtime() -> websockets.WebSocketClientProtocol:
-        headers = {
-            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1",
-        }
-
-        ws = await websockets.connect(
-            settings.OPENAI_REALTIME_URL,
-            extra_headers=headers,
-            ping_interval=None,
-        )
-        logger.info("Connecting to OpenAI Realtime WebSocket via websockets...")
-
-        # Configure session
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "model": "gpt-4o-realtime-preview",
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "voice": "coral",
-                "instructions": SYSTEM_PROMPT,
-                "input_audio_transcription": {"enabled": True},
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "silence_duration_ms": 500,
-                },
-            },
-        }
-        await ws.send(json.dumps(session_update))
-        logger.info("Sent session.update to OpenAI Realtime")
-
-        # Initial greeting (first manual response)
-        await ws.send(json.dumps({"type": "response.create"}))
-        logger.info("Sent initial greeting request to OpenAI Realtime")
-
-        return ws
 
     # --- Helper: send μ-law audio TO Twilio ---------------------------------
     async def send_audio_to_twilio():
@@ -1283,8 +1252,8 @@ async def twilio_stream(websocket: WebSocket):
             prebuffer_active = False
             logger.info("Prebuffer complete; starting to send audio to Twilio")
 
-        chunk = bytes(audio_buffer[:160])  # 20ms at 8kHz μ-law
-        audio_buffer = audio_buffer[160:]
+        chunk = bytes(audio_buffer[:BYTES_PER_FRAME])  # 20ms at 8kHz μ-law
+        audio_buffer = audio_buffer[BYTES_PER_FRAME:]
 
         if not chunk:
             return
@@ -1315,9 +1284,11 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         if active_response_id:
-            logger.info("BARGE-IN: user speech started while AI speaking; "
-                        "sending response.cancel for %s and clearing audio buffer.",
-                        active_response_id)
+            logger.info(
+                "BARGE-IN: user speech started while AI speaking; "
+                "sending response.cancel for %s and clearing audio buffer.",
+                active_response_id,
+            )
             try:
                 await openai_ws.send(json.dumps({
                     "type": "response.cancel",
@@ -1332,14 +1303,14 @@ async def twilio_stream(websocket: WebSocket):
         audio_buffer.clear()
 
     # --- Intent helpers ------------------------------------------------------
-    EMAIL_KEYWORDS = [
+    EMAIL_KEYWORDS_LOCAL = [
         "email", "emails", "inbox", "gmail", "messages",
         "how many emails", "read my email", "read my emails",
     ]
 
     def looks_like_email_intent(text: str) -> bool:
         t = text.lower()
-        return any(kw in t for kw in EMAIL_KEYWORDS)
+        return any(kw in t for kw in EMAIL_KEYWORDS_LOCAL)
 
     FILLER_ONLY = {"um", "uh", "er", "hmm"}
     SMALL_TOSS = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks", "thank you"}
@@ -1359,13 +1330,10 @@ async def twilio_stream(websocket: WebSocket):
         Calls your existing /assistant/route FSM endpoint and returns spoken_reply.
         """
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    "https://vozlia-backend.onrender.com/assistant/route",
-                    json={"mode": "phone", "transcript": transcript},
-                )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await call_fsm_router(
+                text=transcript,
+                context={"channel": "phone"},
+            )
             spoken = data.get("spoken_reply")
             logger.info("FSM spoken_reply to send: %r", spoken)
             return spoken
@@ -1433,8 +1401,10 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         if looks_like_email_intent(transcript):
-            logger.info("Debounce: transcript looks like an email/skill request; "
-                        "routing to FSM + backend.")
+            logger.info(
+                "Debounce: transcript looks like an email/skill request; "
+                "routing to FSM + backend."
+            )
             spoken_reply = await route_to_fsm_and_get_reply(transcript)
             if spoken_reply:
                 await create_fsm_spoken_reply(spoken_reply)
@@ -1442,8 +1412,10 @@ async def twilio_stream(websocket: WebSocket):
                 logger.warning("FSM returned no spoken_reply; falling back to generic reply.")
                 await create_generic_response()
         else:
-            logger.info("Debounce: transcript does NOT look like an email/skill intent; "
-                        "using generic GPT response via manual response.create.")
+            logger.info(
+                "Debounce: transcript does NOT look like an email/skill intent; "
+                "using generic GPT response via manual response.create."
+            )
             await create_generic_response()
 
     # --- OpenAI event loop ---------------------------------------------------
@@ -1580,7 +1552,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Main orchestration --------------------------------------------------
     try:
-        openai_ws = await connect_openai_realtime()
+        openai_ws = await create_realtime_session()
         logger.info("connection open")
 
         # Run both loops concurrently until one exits
