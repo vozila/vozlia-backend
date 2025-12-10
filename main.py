@@ -1210,7 +1210,9 @@ async def twilio_stream(websocket: WebSocket):
 
                 etype = event.get("type")
 
-                # ----- AUDIO FROM OPENAI → BUFFER FOR TWILIO -----
+                # --------------------------------------------------
+                # 1) AUDIO FROM OPENAI → BUFFER FOR TWILIO
+                # --------------------------------------------------
                 if etype == "response.audio.delta":
                     audio_chunk_b64 = event.get("delta")
                     if not audio_chunk_b64:
@@ -1222,6 +1224,7 @@ async def twilio_stream(websocket: WebSocket):
                         logger.error(f"Error decoding audio delta: {e}")
                         continue
 
+                    # New utterance → enable prebuffer
                     if len(audio_buffer) == 0:
                         prebuffer_active = True
 
@@ -1234,27 +1237,30 @@ async def twilio_stream(websocket: WebSocket):
                         barge_in_enabled = True
                         logger.info("Barge-in is now ENABLED for subsequent responses.")
 
-                # ----- USER TRANSCRIPT COMPLETED → route through FSM -----
-                elif etype == "input_audio_transcription.completed":
+                # --------------------------------------------------
+                # 2) USER TRANSCRIPT COMPLETED → route through FSM
+                # --------------------------------------------------
+                elif etype == "conversation.item.input_audio_transcription.completed":
                     logger.info(f"Transcript event from OpenAI: {event}")
 
-                    transcript_text = ""
-                    if isinstance(event.get("text"), str):
-                        transcript_text = event["text"]
-                    elif isinstance(event.get("transcript"), str):
-                        transcript_text = event["transcript"]
-                    else:
-                        output = event.get("output")
-                        if isinstance(output, dict) and isinstance(output.get("text"), str):
-                            transcript_text = output["text"]
+                    # Official shape: { type, transcript, item_id, content_index, ... }
+                    transcript_text = (event.get("transcript") or "").strip()
 
-                    transcript_text = (transcript_text or "").strip()
+                    # Extra safety: some variants nest content, so we try to dig it out:
+                    if not transcript_text:
+                        item = event.get("item") or {}
+                        content = item.get("content") or []
+                        if content and isinstance(content, list):
+                            first = content[0] or {}
+                            transcript_text = (first.get("transcript") or first.get("text") or "").strip()
+
                     if not transcript_text:
                         logger.info("Transcript completed event but no text found.")
                         continue
 
                     logger.info(f"USER Transcript completed: {transcript_text!r}")
 
+                    # Call the same FSM + Gmail router your custom GPT uses
                     try:
                         fsm_response = await call_fsm_router(
                             text=transcript_text,
@@ -1262,6 +1268,7 @@ async def twilio_stream(websocket: WebSocket):
                         )
                     except Exception as e:
                         logger.exception(f"Error calling /assistant/route from transcript: {e}")
+                        # Let Realtime handle any follow-up itself
                         continue
 
                     spoken_reply = (fsm_response or {}).get("spoken_reply") or ""
@@ -1271,6 +1278,7 @@ async def twilio_stream(websocket: WebSocket):
 
                     logger.info(f"FSM spoken_reply to send: {spoken_reply!r}")
 
+                    # Inject that reply into the Realtime conversation so it speaks it
                     try:
                         convo_item = {
                             "type": "conversation.item.create",
@@ -1295,7 +1303,9 @@ async def twilio_stream(websocket: WebSocket):
                     except Exception as e:
                         logger.error(f"Error sending FSM reply into Realtime: {e}")
 
-                # ----- TEXT LOGGING (optional) -----
+                # --------------------------------------------------
+                # 3) OPTIONAL: text logs from model (for debugging)
+                # --------------------------------------------------
                 elif etype == "response.text.delta":
                     delta = event.get("delta", "")
                     if delta:
@@ -1306,7 +1316,9 @@ async def twilio_stream(websocket: WebSocket):
                     if text:
                         logger.info(f"AI full text response: {text}")
 
-                # ----- VAD EVENTS: drive user_speaking_vad & barge-in -----
+                # --------------------------------------------------
+                # 4) VAD EVENTS: drive barge-in logic
+                # --------------------------------------------------
                 elif etype == "input_audio_buffer.speech_started":
                     user_speaking_vad = True
                     logger.info("OpenAI VAD: user speech START")
@@ -1320,6 +1332,7 @@ async def twilio_stream(websocket: WebSocket):
                             await openai_ws.send(json.dumps({"type": "response.cancel"}))
                             cancel_in_progress = True
 
+                            # Drop any queued assistant audio so Twilio tail is minimal
                             audio_buffer.clear()
                             prebuffer_active = False
 
@@ -1334,14 +1347,23 @@ async def twilio_stream(websocket: WebSocket):
                     user_speaking_vad = False
                     logger.info("OpenAI VAD: user speech STOP")
 
-                # ----- ERROR EVENTS -----
+                # --------------------------------------------------
+                # 5) ERROR EVENTS
+                # --------------------------------------------------
                 elif etype == "error":
                     logger.error(f"OpenAI error event: {event}")
                     err = event.get("error") or {}
                     code = err.get("code")
 
                     if code == "response_cancel_not_active":
+                        # harmless: we tried to cancel when nothing was active
                         cancel_in_progress = False
+
+                # You can log other event types for debugging if you like:
+                else:
+                    # logger.debug(f"Unhandled Realtime event type: {etype}")
+                    pass
+
 
         async def twilio_audio_sender():
             """
