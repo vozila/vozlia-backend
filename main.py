@@ -6,6 +6,8 @@ import base64
 import time
 from typing import List
 from datetime import datetime, timedelta
+from vozlia_fsm import VozliaFSM  # and Intent if you exposed it
+
 
 import httpx  # <-- for Google OAuth + Gmail API
 
@@ -63,6 +65,49 @@ def decrypt_str(value: str | None) -> str | None:
         return None
     f = get_fernet()
     return f.decrypt(value.encode()).decode()
+
+# ---------- FSM debug endpoint (text-only) ----------
+
+@app.post("/fsm/debug")
+async def fsm_debug(request: Request):
+    """
+    Simple text-only endpoint to exercise the VozliaFSM.
+
+    Body example:
+      { "text": "Do I have any unread emails?" }
+
+    Returns whatever the FSM decides:
+      {
+        "intent": "...",
+        "state": "...",
+        "backend_call": { ... },
+        "spoken_reply": "...",
+        "raw": { ... }   # optional extra info
+      }
+    """
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'text' in request body")
+
+    # New FSM instance per request for now (stateless behavior)
+    fsm = VozliaFSM()
+
+    try:
+        fsm_result = fsm.handle_utterance(text)
+    except Exception as e:
+        logger.exception("Error running VozliaFSM")
+        raise HTTPException(
+            status_code=500,
+            detail=f"FSM error: {e}",
+        )
+
+    # You can normalize the shape here if needed:
+    return {
+        "input": text,
+        "fsm_result": fsm_result,
+    }
 
 
 # ---------- Google / Gmail OAuth config ----------
