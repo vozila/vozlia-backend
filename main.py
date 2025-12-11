@@ -1066,8 +1066,6 @@ if voice_env not in SUPPORTED_VOICES:
 
 VOICE_NAME = voice_env
 
-VOICE_NAME = voice_env
-
 SYSTEM_PROMPT = (
     "You are Vozlia, a warm, friendly, highly capable AI phone assistant using the "
     "Coral voice persona. Speak naturally, confidently, and in a professional tone, "
@@ -1596,9 +1594,43 @@ async def twilio_stream(websocket: WebSocket):
         }))
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
+    # --- Helper: handle transcripts from Realtime ---------------------------
+    async def handle_transcript_event(event: dict):
+        """
+        Handles 'conversation.item.input_audio_transcription.completed' events.
+        Uses email/FSM routing vs generic chit-chat.
+        """
+        transcript: str = event.get("transcript", "").strip()
+        if not transcript:
+            return
+
+        logger.info("USER Transcript completed: %r", transcript)
+
+        if not should_reply(transcript):
+            logger.info("Ignoring filler transcript: %r", transcript)
+            return
+
+        if looks_like_email_intent(transcript):
+            logger.info(
+                "Debounce: transcript looks like an email/skill request; "
+                "routing to FSM + backend."
+            )
+            spoken_reply = await route_to_fsm_and_get_reply(transcript)
+            if spoken_reply:
+                await create_fsm_spoken_reply(spoken_reply)
+            else:
+                logger.warning(
+                    "FSM returned no spoken_reply; falling back to generic reply."
+                )
+                await create_generic_response()
+        else:
+            logger.info(
+                "Debounce: transcript does NOT look like an email/skill intent; "
+                "using generic GPT response via manual response.create."
+            )
+            await create_generic_response()
 
     # --- OpenAI event loop ---------------------------------------------------
-  
     async def openai_loop():
         nonlocal active_response_id, barge_in_enabled, user_speaking_vad, prebuffer_active
 
@@ -1787,5 +1819,3 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error closing Twilio WebSocket")
 
         logger.info("WebSocket disconnected while sending audio")
-
-
