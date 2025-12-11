@@ -1286,7 +1286,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Helper: send μ-law audio TO Twilio ---------------------------------
     async def send_audio_to_twilio():
-        nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time
+        nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled
 
         if stream_sid is None or not audio_buffer:
             return
@@ -1298,12 +1298,18 @@ async def twilio_stream(websocket: WebSocket):
             prebuffer_active = False
             logger.info("Prebuffer complete; starting to send audio to Twilio")
 
-        # Always send exactly one 20ms frame (160 bytes) per call
-        if len(audio_buffer) < BYTES_PER_FRAME:
-            return
+            # 🔓 IMPORTANT: as soon as we actually start speaking,
+            # allow the caller to barge in.
+            if not barge_in_enabled:
+                barge_in_enabled = True
+                logger.info("Barge-in is now ENABLED (audio streaming started).")
 
+        # Always send exactly one 20ms frame (160 bytes) per call
         chunk = bytes(audio_buffer[:BYTES_PER_FRAME])  # 20ms at 8kHz μ-law
-        audio_buffer[:] = audio_buffer[BYTES_PER_FRAME:]
+        audio_buffer = audio_buffer[BYTES_PER_FRAME:]
+
+        if not chunk:
+            return
 
         payload = base64.b64encode(chunk).decode("ascii")
         msg = {
@@ -1313,6 +1319,7 @@ async def twilio_stream(websocket: WebSocket):
         }
         await websocket.send_text(json.dumps(msg))
         assistant_last_audio_time = time.monotonic()
+
 
     # --- Helper: barge-in ----------------------------------------------------
     async def handle_barge_in():
