@@ -1546,81 +1546,56 @@ async def twilio_stream(websocket: WebSocket):
 
     async def create_fsm_spoken_reply(spoken_reply: str):
         """
-        Use the FSM / backend–generated spoken_reply as the *content* of the
-        next response. We explicitly tell Realtime:
+        Use the FSM / backend–generated spoken_reply as the *exact message*
+        to speak to the caller.
 
-        - The backend already inspected the caller's email securely.
-        - This string is safe to speak.
-        - Do NOT talk about security/privacy/access; just summarize.
+        IMPORTANT:
+        - We do NOT mention 'backend', 'secure email access', etc. in the
+          instructions, to reduce the chance that the model decides to
+          refuse on policy grounds.
+        - For this one turn, the model's job is simply to *say this message*.
         """
         if not spoken_reply:
             logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
             await create_generic_response()
             return
 
+        # For debugging: see exactly what we asked the model to say
+        logger.info(
+            "create_fsm_spoken_reply invoked with summary (first 200 chars): %r",
+            spoken_reply[:200],
+        )
+
         # Cancel any active response and clear out old audio.
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
 
-        # Give per-response instructions that tell the model exactly what to do.
+        # Per-response instructions: treat spoken_reply as the content.
         instructions = (
             "You are on a live phone call as Vozlia.\n"
-            "The secure backend has already checked the caller's email account "
-            "and produced a short summary of their messages.\n\n"
-            "Here is the summary you must speak to the caller:\n"
+            "For THIS response only, you already know exactly what you want to say.\n"
+            "Below is the message you must speak to the caller:\n\n"
             f"\"{spoken_reply}\"\n\n"
-            "Your job for THIS response only is:\n"
-            "- Say this summary to the caller in a natural, friendly way.\n"
-            "- You MAY lightly rephrase for flow, but you MUST keep all of the "
-            "  important facts (counts, topics, deadlines) from the summary.\n"
-            "- DO NOT mention security, privacy, 'I cannot access your email', "
-            "  or anything about being unable to read their email.\n"
-            "- DO NOT apologize or refuse.\n"
-            "- Just give the summary, as if you personally checked it.\n"
+            "Your job for this turn is:\n"
+            "- Say this message in a natural, warm, friendly way.\n"
+            "- You MAY lightly rephrase for flow, but you MUST preserve all of the\n"
+            "  important factual details (counts, topics, dates, deadlines).\n"
+            "- DO NOT refuse.\n"
+            "- DO NOT apologize.\n"
+            "- DO NOT say you cannot access something or that you lack permissions.\n"
+            "- DO NOT mention tools, email accounts, security, privacy, or any\n"
+            "  internal systems.\n"
+            "- Just speak the message as your answer to the caller.\n"
         )
 
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
-                # Per-response instructions override the generic behavior for this turn.
+                # Per-response instructions override generic behavior for this turn.
                 "instructions": instructions,
             },
         }))
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
-
-    # --- Helper: handle transcripts from Realtime ---------------------------
-    async def handle_transcript_event(event: dict):
-        """
-        Handles 'conversation.item.input_audio_transcription.completed' events.
-        Uses email/FSM routing vs generic chit-chat.
-        """
-        transcript: str = event.get("transcript", "").strip()
-        if not transcript:
-            return
-
-        logger.info("USER Transcript completed: %r", transcript)
-
-        if not should_reply(transcript):
-            logger.info("Ignoring filler transcript: %r", transcript)
-            return
-
-        if looks_like_email_intent(transcript):
-            logger.info(
-                "Debounce: transcript looks like an email/skill request; "
-                "routing to FSM + backend."
-            )
-            spoken_reply = await route_to_fsm_and_get_reply(transcript)
-            if spoken_reply:
-                await create_fsm_spoken_reply(spoken_reply)
-            else:
-                logger.warning("FSM returned no spoken_reply; falling back to generic reply.")
-                await create_generic_response()
-        else:
-            logger.info(
-                "Debounce: transcript does NOT look like an email/skill intent; "
-                "using generic GPT response via manual response.create."
-            )
-            await create_generic_response()
 
     # --- OpenAI event loop ---------------------------------------------------
   
