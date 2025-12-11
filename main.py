@@ -1238,6 +1238,7 @@ async def create_realtime_session():
 
 
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
+# ---------- Twilio media stream ↔ OpenAI Realtime ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
     """
@@ -1281,9 +1282,7 @@ async def twilio_stream(websocket: WebSocket):
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
         # If there's buffered audio or very recent send, treat as "speaking"
-        if audio_buffer:
-            return True
-        return False
+        return bool(audio_buffer)
 
     # --- Helper: send μ-law audio TO Twilio ---------------------------------
     async def send_audio_to_twilio():
@@ -1300,11 +1299,11 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("Prebuffer complete; starting to send audio to Twilio")
 
         # Always send exactly one 20ms frame (160 bytes) per call
-        chunk = bytes(audio_buffer[:BYTES_PER_FRAME])  # 20ms at 8kHz μ-law
-        audio_buffer = audio_buffer[BYTES_PER_FRAME:]
-
-        if not chunk:
+        if len(audio_buffer) < BYTES_PER_FRAME:
             return
+
+        chunk = bytes(audio_buffer[:BYTES_PER_FRAME])  # 20ms at 8kHz μ-law
+        audio_buffer[:] = audio_buffer[BYTES_PER_FRAME:]
 
         payload = base64.b64encode(chunk).decode("ascii")
         msg = {
@@ -1390,31 +1389,12 @@ async def twilio_stream(websocket: WebSocket):
             return None
 
     # --- Helper: create responses with active_response_id guard -------------
-    async def create_generic_response():
-        """
-        Generic GPT turn: just respond to latest user message in the Realtime conversation.
-        """
-        nonlocal active_response_id
-        if active_response_id is not None:
-            logger.warning(
-                "Skipping generic response.create because active_response_id=%s is still active",
-                active_response_id,
-            )
-            return
-
-        await openai_ws.send(json.dumps({"type": "response.create"}))
-        logger.info("Sent generic response.create for chit-chat turn")
-
-    async def create_fsm_spoken_reply(spoken_reply: str):
-        """
-        Ask Realtime to speak a specific backend-computed reply.
-        If a response is currently active, cancel it first so we don't talk over it.
-        """
-        nonlocal active_response_id
-
+    async def _cancel_active_and_clear_buffer(reason: str):
+        nonlocal active_response_id, audio_buffer
         if active_response_id is not None:
             logger.info(
-                "create_fsm_spoken_reply: canceling active response %s before starting FSM reply",
+                "%s: canceling active response %s before starting new one",
+                reason,
                 active_response_id,
             )
             try:
@@ -1424,8 +1404,33 @@ async def twilio_stream(websocket: WebSocket):
                 }))
             except Exception as e:
                 logger.warning("response.cancel failed (usually harmless): %s", e)
-            # Don’t wait for a cancel event; clear locally so we can move on.
+            # Locally clear so we don't block new turns if cancel event never arrives
             active_response_id = None
+        # Drop any leftover audio for the old response
+        audio_buffer.clear()
+
+    async def create_generic_response():
+        """
+        Generic GPT turn: just respond to latest user message in the Realtime conversation.
+
+        IMPORTANT: we now PREEMPT any active response instead of skipping.
+        This fixes the 'stuck active_response_id => permanent silence' bug.
+        """
+        await _cancel_active_and_clear_buffer("create_generic_response")
+
+        await openai_ws.send(json.dumps({"type": "response.create"}))
+        logger.info("Sent generic response.create for chit-chat turn")
+
+    async def create_fsm_spoken_reply(spoken_reply: str):
+        """
+        Ask Realtime to speak a specific backend-computed reply.
+        If a response is currently active, cancel it first so we don't talk over it.
+        """
+        if not spoken_reply:
+            logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
+            return
+
+        await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
 
         await openai_ws.send(json.dumps({
             "type": "response.create",
@@ -1603,7 +1608,6 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif event_type == "stop":
                     logger.info("Twilio stream event: stop")
-                    # Do NOT send any commit here either; just end the loop.
                     logger.info("Twilio sent stop; closing call.")
                     break
 
