@@ -1544,6 +1544,7 @@ async def twilio_stream(websocket: WebSocket):
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
+
     async def create_fsm_spoken_reply(spoken_reply: str):
         """
         Use the FSM / backend–generated spoken_reply as the content for the
@@ -1597,6 +1598,7 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error sending response.create for FSM summary")
             # Fallback again to a generic response
             await create_generic_response()
+
 
 
     # --- OpenAI event loop ---------------------------------------------------
