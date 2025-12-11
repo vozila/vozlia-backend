@@ -1066,6 +1066,8 @@ if voice_env not in SUPPORTED_VOICES:
 
 VOICE_NAME = voice_env
 
+VOICE_NAME = voice_env
+
 SYSTEM_PROMPT = (
     "You are Vozlia, a warm, friendly, highly capable AI phone assistant using the "
     "Coral voice persona. Speak naturally, confidently, and in a professional tone, "
@@ -1100,6 +1102,23 @@ SYSTEM_PROMPT = (
     "  or directly telling them to 'look it up yourself'. Always add some concrete, "
     "  useful guidance or an approximate answer first.\n\n"
 )
+
+# 🔹 Realtime-specific rules about Gmail / email access
+REALTIME_SYSTEM_PROMPT = SYSTEM_PROMPT + (
+    "EMAIL & GMAIL ACCESS RULES\n"
+    "- You DO have help with email and calendar via a secure backend brain.\n"
+    "- The server may send you short EMAIL SUMMARIES that you must read to the caller.\n"
+    "- NEVER say you 'can’t access email', 'can’t read your Gmail', or similar.\n"
+    "- When you receive an EMAIL SUMMARY, you:\n"
+    "    • Trust it as accurate.\n"
+    "    • Read it out to the caller in natural speech.\n"
+    "    • You may lightly rephrase for flow, but keep counts, topics, and deadlines.\n"
+    "- If the caller asks about email before the backend has sent a summary, say a short "
+    "  bridging phrase like 'Let me check that for you.' and pause while the backend "
+    "  prepares the summary.\n"
+    "- Do not mention tools, APIs, or backend details to the caller.\n"
+)
+
 
 # ---------- Audio framing for G.711 μ-law ----------
 SAMPLE_RATE = 8000        # Hz
@@ -1209,7 +1228,7 @@ async def create_realtime_session():
     session_update = {
         "type": "session.update",
         "session": {
-            "instructions": SYSTEM_PROMPT,
+            "instructions": REALTIME_SYSTEM_PROMPT,
             "voice": VOICE_NAME,
             "modalities": ["text", "audio"],
             "input_audio_format": "g711_ulaw",
@@ -1568,6 +1587,7 @@ async def twilio_stream(websocket: WebSocket):
         }))
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
+
     # --- Helper: handle transcripts from Realtime ---------------------------
     async def handle_transcript_event(event: dict):
         """
@@ -1642,7 +1662,7 @@ async def twilio_stream(websocket: WebSocket):
                             rid,
                         )
 
-                elif etype == "response.audio.delta":
+                                elif etype == "response.audio.delta":
                     # Stream assistant audio back to Twilio
                     resp_id = event.get("response_id")
                     delta_b64 = event.get("delta")
@@ -1668,12 +1688,35 @@ async def twilio_stream(websocket: WebSocket):
                     while len(audio_buffer) >= BYTES_PER_FRAME:
                         await send_audio_to_twilio()
 
+                elif etype == "response.output_text.delta":
+                    # Debug: log any text content the model generates,
+                    # and catch any attempts to deny email access.
+                    resp = event.get("response", {}) or {}
+                    rid = resp.get("id")
+                    delta_obj = event.get("delta", {}) or {}
+                    chunk = delta_obj.get("text", "") or ""
+
+                    if chunk:
+                        logger.info("Realtime text delta [id=%s]: %r", rid, chunk)
+
+                        low = chunk.lower()
+                        if (
+                            "can't access email" in low
+                            or "cannot access email" in low
+                            or "do not have access to your email" in low
+                        ):
+                            logger.error(
+                                "Realtime attempted to deny email access in text delta: %r",
+                                chunk,
+                            )
+
                 elif etype == "input_audio_buffer.speech_started":
                     user_speaking_vad = True
                     logger.info("OpenAI VAD: user speech START")
                     # If assistant is speaking and barge-in is enabled, locally mute
                     if assistant_actively_speaking():
                         await handle_barge_in()
+
 
                 elif etype == "input_audio_buffer.speech_stopped":
                     user_speaking_vad = False
