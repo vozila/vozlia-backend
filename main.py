@@ -1414,13 +1414,12 @@ async def twilio_stream(websocket: WebSocket):
                     stream_sid = start.get("streamSid")
                     logger.info("Twilio stream event: start (streamSid=%s)", stream_sid)
 
-                    # Connect to Deepgram when call starts
-                    if deepgram_ws is None:
-                        deepgram_ws = await connect_deepgram_stream()
+                    # Deepgram is already connected in the main orchestration.
 
                 elif event_type == "media":
                     if not deepgram_ws:
-                        # If Deepgram isn't ready yet, drop this chunk (rare)
+                        # If Deepgram isn't ready yet, drop this chunk (should be rare)
+                        logger.warning("Received media frame before Deepgram ready")
                         continue
 
                     media = data.get("media", {}) or {}
@@ -1459,7 +1458,7 @@ async def twilio_stream(websocket: WebSocket):
         nonlocal call_active, tts_buffer, deepgram_ws
 
         if deepgram_ws is None:
-            # Call might hang up before Deepgram connects
+            logger.warning("deepgram_rx_loop started with no deepgram_ws; exiting")
             return
 
         try:
@@ -1519,6 +1518,10 @@ async def twilio_stream(websocket: WebSocket):
                         # Replace any leftover audio with the new reply
                         tts_buffer.clear()
                         tts_buffer.extend(audio_bytes)
+                        logger.info(
+                            "Queued %d bytes of ElevenLabs audio for playback",
+                            len(audio_bytes),
+                        )
                     else:
                         logger.error("No audio returned from ElevenLabs TTS")
 
@@ -1547,8 +1550,10 @@ async def twilio_stream(websocket: WebSocket):
             call_active = False
 
     # ---------- Main orchestration ----------
-    deepgram_ws = None
     try:
+        # ✅ Connect to Deepgram BEFORE starting the loops
+        deepgram_ws = await connect_deepgram_stream()
+
         # Start all three loops concurrently:
         #  - Twilio RX: audio from Twilio → Deepgram
         #  - Deepgram RX: transcripts → FSM/GPT → ElevenLabs → tts_buffer
