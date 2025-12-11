@@ -1500,16 +1500,27 @@ async def twilio_stream(websocket: WebSocket):
                 elif etype in ("response.completed", "response.failed", "response.canceled"):
                     resp = event.get("response", {})
                     rid = resp.get("id")
-                    if rid == active_response_id:
+
+                    # If this completion corresponds to what we think is active, clear it.
+                    if active_response_id is not None and rid == active_response_id:
                         logger.info(
                             "Response %s finished with event '%s'; clearing active_response_id",
                             rid, etype,
                         )
                         active_response_id = None
-                        # After first full response, enable barge-in
-                        if not barge_in_enabled:
-                            barge_in_enabled = True
-                            logger.info("Barge-in is now ENABLED for subsequent responses.")
+
+                    # IMPORTANT:
+                    # Even if we pre-cleared active_response_id during a manual cancel,
+                    # we STILL want to enable barge-in after the *first* response
+                    # has finished in any way.
+                    if not barge_in_enabled:
+                        barge_in_enabled = True
+                        logger.info(
+                            "First response finished (event=%s, id=%s); "
+                            "barge-in is now ENABLED.",
+                            etype,
+                            rid,
+                        )
 
                 elif etype == "response.audio.delta":
                     # Stream assistant audio back to Twilio
@@ -1559,6 +1570,7 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("OpenAI Realtime WebSocket closed")
         except Exception:
             logger.exception("Error in OpenAI event loop")
+
 
     # --- Twilio event loop ---------------------------------------------------
     async def twilio_loop():
