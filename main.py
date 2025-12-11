@@ -1422,30 +1422,66 @@ async def twilio_stream(websocket: WebSocket):
     async def create_generic_response():
         """
         Generic GPT turn: just respond to latest user message in the Realtime conversation.
+
+        If there's an active response (e.g., the greeting still playing),
+        we preempt it by canceling and clearing buffered audio before starting
+        a new response.
         """
-        nonlocal active_response_id
+        nonlocal active_response_id, audio_buffer
+
+        # If something is already speaking, cancel it and clear buffer
         if active_response_id is not None:
-            logger.warning(
-                "Skipping generic response.create because active_response_id=%s is still active",
+            logger.info(
+                "create_generic_response: canceling active response %s before starting new one",
                 active_response_id,
             )
-            return
+            try:
+                await openai_ws.send(json.dumps({
+                    "type": "response.cancel",
+                    "response_id": active_response_id,
+                }))
+            except Exception:
+                logger.exception("Error canceling active response before generic reply")
 
+            active_response_id = None
+            audio_buffer.clear()
+
+        # Now create a fresh response
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
     async def create_fsm_spoken_reply(spoken_reply: str):
         """
-        Ask Realtime to speak a specific backend-computed reply.
+        Ask Realtime to speak a specific backend-computed reply (e.g., FSM/Gmail).
+
+        If there's an active response (e.g., the greeting still playing),
+        we preempt it by canceling and clearing buffered audio before starting
+        this FSM-driven reply.
         """
-        nonlocal active_response_id
-        if active_response_id is not None:
-            logger.warning(
-                "Skipping FSM response.create because active_response_id=%s is still active",
-                active_response_id,
-            )
+        nonlocal active_response_id, audio_buffer
+
+        if not spoken_reply:
+            logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
             return
 
+        # Preempt any in-progress response
+        if active_response_id is not None:
+            logger.info(
+                "create_fsm_spoken_reply: canceling active response %s before starting FSM reply",
+                active_response_id,
+            )
+            try:
+                await openai_ws.send(json.dumps({
+                    "type": "response.cancel",
+                    "response_id": active_response_id,
+                }))
+            except Exception:
+                logger.exception("Error canceling active response before FSM reply")
+
+            active_response_id = None
+            audio_buffer.clear()
+
+        # Now ask Realtime to say our FSM-computed text
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
