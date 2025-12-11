@@ -1547,11 +1547,19 @@ async def twilio_stream(websocket: WebSocket):
     async def create_fsm_spoken_reply(spoken_reply: str):
         """
         Use the FSM / backend–generated spoken_reply as the *content* of the
-        next response. We explicitly tell Realtime:
+        next response.
 
-        - The backend already inspected the caller's email securely.
-        - This string is safe to speak.
-        - Do NOT talk about security/privacy/access; just summarize.
+        GOAL:
+        - The model must actually SAY the summary.
+        - It must not fall back to generic "I'm here to help" style lines.
+        - It must not say it can't access email.
+
+        We enforce that by:
+        - Cancelling any active response.
+        - Giving very strict, turn-local instructions that:
+          * Provide the summary text.
+          * Forbid generic intros / refusals.
+          * Tell the model to start speaking the summary immediately.
         """
         if not spoken_reply:
             logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
@@ -1561,32 +1569,37 @@ async def twilio_stream(websocket: WebSocket):
         # Cancel any active response and clear out old audio.
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
 
-        # Give per-response instructions that tell the model exactly what to do.
+        # Extremely explicit, one-shot instructions for THIS response.
         instructions = (
             "You are on a live phone call as Vozlia.\n"
-            "The secure backend has already checked the caller's email account "
-            "and produced a short summary of their messages.\n\n"
-            "Here is the summary you must speak to the caller:\n"
-            f"\"{spoken_reply}\"\n\n"
-            "Your job for THIS response only is:\n"
-            "- Say this summary to the caller in a natural, friendly way.\n"
-            "- You MAY lightly rephrase for flow, but you MUST keep all of the "
-            "  important facts (counts, topics, deadlines) from the summary.\n"
-            "- DO NOT mention security, privacy, 'I cannot access your email', "
-            "  or anything about being unable to read their email.\n"
-            "- DO NOT apologize or refuse.\n"
-            "- Just give the summary, as if you personally checked it.\n"
+            "The secure backend has ALREADY checked the caller's email account "
+            "and produced the exact summary you must speak.\n\n"
+            "EMAIL SUMMARY TO SPEAK (IMPORTANT):\n"
+            f"{spoken_reply}\n\n"
+            "For THIS response only, you MUST do ALL of the following:\n"
+            "1) Start speaking the summary content immediately. Do NOT start with a "
+            "   generic line like 'I'm here to answer any questions you may have.'\n"
+            "2) Your entire answer must be based on this summary. You may slightly "
+            "   smooth the wording for natural speech, but you MUST keep all key facts "
+            "   (counts, topics, important notices) and you must not change their meaning.\n"
+            "3) Do NOT say anything about security, privacy, tools, APIs, or that you "
+            "   'can't access' email or Gmail. The email has already been checked.\n"
+            "4) Do NOT apologize or refuse. Do NOT redirect the caller to ask a different "
+            "   question. Your job is ONLY to speak this summary.\n"
+            "5) Do NOT end with 'Is there anything else I can help you with?' unless it is "
+            "   a very short, natural follow-up AFTER giving the summary.\n"
+            "\n"
+            "In short: Immediately give the caller a concise spoken summary of their email, "
+            "directly based on the summary text above, without disclaimers or generic intros.\n"
         )
 
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
-                # Per-response instructions override the generic behavior for this turn.
                 "instructions": instructions,
             },
         }))
         logger.info("Sent FSM-driven spoken reply into Realtime session")
-
 
     # --- Helper: handle transcripts from Realtime ---------------------------
     async def handle_transcript_event(event: dict):
