@@ -1237,8 +1237,6 @@ async def create_realtime_session():
     return openai_ws
 
 
-
-
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
@@ -1436,7 +1434,6 @@ async def twilio_stream(websocket: WebSocket):
 
         return False
 
-
     FILLER_ONLY = {"um", "uh", "er", "hmm"}
     SMALL_TOSS = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks", "thank you"}
 
@@ -1466,9 +1463,7 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error calling /assistant/route")
             return None
 
-    
-
-        # --- Helper: cancel active response & clear audio buffer ----------------
+    # --- Helper: cancel active response & clear audio buffer ----------------
     async def _cancel_active_and_clear_buffer(reason: str):
         """
         Safely cancel the currently active Realtime response (if any)
@@ -1477,39 +1472,47 @@ async def twilio_stream(websocket: WebSocket):
         This is used for clean turn-taking when we *explicitly* start a
         new response (generic chit-chat or FSM/email summary).
         """
-        nonlocal active_response_id, audio_buffer
+        nonlocal active_response_id, audio_buffer, prebuffer_active
+
+        if not openai_ws:
+            logger.info(
+                "_cancel_active_and_clear_buffer: no openai_ws (reason=%s)",
+                reason,
+            )
+            audio_buffer.clear()
+            prebuffer_active = True
+            return
 
         if not active_response_id:
-            logger.info("_cancel_active_and_clear_buffer: no active response (reason=%s)", reason)
+            logger.info(
+                "_cancel_active_and_clear_buffer: no active response (reason=%s)",
+                reason,
+            )
+            audio_buffer.clear()
+            prebuffer_active = True
             return
 
         rid = active_response_id
-        active_response_id = None
-        audio_buffer.clear()
-
-        if not openai_ws:
-            logger.warning(
-                "_cancel_active_and_clear_buffer: openai_ws is None; "
-                "cannot send response.cancel for %s (reason=%s)",
-                rid,
-                reason,
-            )
-            return
+        logger.info(
+            "Sent response.cancel for %s due to %s",
+            rid,
+            reason,
+        )
 
         try:
             await openai_ws.send(json.dumps({
                 "type": "response.cancel",
                 "response_id": rid,
             }))
-            logger.info(
-                "Sent response.cancel for %s due to %s",
-                rid,
-                reason,
-            )
         except Exception:
-            logger.exception("Failed to send response.cancel for %s (reason=%s)", rid, reason)
+            logger.exception("Error sending response.cancel for %s", rid)
 
-    # --- Helpers: create responses WITHOUT response.cancel ------------------
+        # Locally consider it dead either way
+        active_response_id = None
+        audio_buffer.clear()
+        prebuffer_active = True
+
+    # --- Helpers: create responses ------------------------------------------
     async def create_generic_response():
         """
         Generic GPT turn: just respond to latest user message in the Realtime conversation.
@@ -1521,7 +1524,6 @@ async def twilio_stream(websocket: WebSocket):
 
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
-
 
     async def create_fsm_spoken_reply(spoken_reply: str):
         """
@@ -1767,3 +1769,5 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error closing Twilio WebSocket")
 
         logger.info("WebSocket disconnected while sending audio")
+
+
