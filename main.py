@@ -1237,7 +1237,8 @@ async def create_realtime_session():
     return openai_ws
 
 
-# ---------- Twilio media stream ↔ OpenAI Realtime ----------
+
+
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
@@ -1247,7 +1248,7 @@ async def twilio_stream(websocket: WebSocket):
     Key behavior:
     - Tracks EXACTLY ONE active response_id from Realtime.
     - Only streams audio for the active response_id.
-    - Barge-in cancels the correct active response when user starts talking.
+    - Barge-in locally mutes the current response when the user starts talking.
     - Routes certain transcripts to the FSM/email backend via /assistant/route.
 
     Implementation details:
@@ -1262,7 +1263,7 @@ async def twilio_stream(websocket: WebSocket):
     openai_ws: Optional[websockets.WebSocketClientProtocol] = None
     stream_sid: Optional[str] = None
 
-    # After first full greeting, we allow barge-in
+    # After we first start sending assistant audio, we allow barge-in
     barge_in_enabled: bool = False
 
     # Server VAD-based user speech flag (from OpenAI events)
@@ -1277,12 +1278,21 @@ async def twilio_stream(websocket: WebSocket):
 
     # Response tracking
     active_response_id: Optional[str] = None  # The single "currently active" response
-    allowed_response_ids: set[str] = set()    # Responses we accept audio from
+    allowed_response_ids: set[str] = set()    # (kept for future use, mostly logging)
 
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
-        # If there's buffered audio or very recent send, treat as "speaking"
-        return bool(audio_buffer)
+        """
+        Treat the assistant as 'speaking' if:
+        - there's buffered audio we haven't sent yet, OR
+        - we sent audio in the very recent past (e.g. last 500ms).
+        """
+        if audio_buffer:
+            return True
+        if assistant_last_audio_time:
+            if (time.monotonic() - assistant_last_audio_time) < 0.5:
+                return True
+        return False
 
     # --- Helper: send μ-law audio TO Twilio ---------------------------------
     async def send_audio_to_twilio():
@@ -1298,7 +1308,7 @@ async def twilio_stream(websocket: WebSocket):
             prebuffer_active = False
             logger.info("Prebuffer complete; starting to send audio to Twilio")
 
-            # 🔓 IMPORTANT: as soon as we actually start speaking,
+            # 🔓 As soon as we actually start speaking,
             # allow the caller to barge in.
             if not barge_in_enabled:
                 barge_in_enabled = True
@@ -1320,12 +1330,20 @@ async def twilio_stream(websocket: WebSocket):
         await websocket.send_text(json.dumps(msg))
         assistant_last_audio_time = time.monotonic()
 
-
     # --- Helper: barge-in ----------------------------------------------------
     async def handle_barge_in():
         """
         Called when OpenAI VAD says user started speaking while assistant is talking.
-        Cancels the current active response if there is one.
+
+        We keep this SIMPLE and LOCAL:
+        - If barge-in is not enabled yet, ignore.
+        - If the assistant is (recently) speaking, we:
+            * forget active_response_id
+            * clear the outgoing audio buffer
+
+        We DO NOT send response.cancel to OpenAI. Instead, any further
+        response.audio.delta events for that response_id will be dropped
+        because active_response_id is None.
         """
         nonlocal active_response_id, audio_buffer
 
@@ -1334,26 +1352,16 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         if not assistant_actively_speaking():
-            logger.info("BARGE-IN: assistant not actively speaking; nothing to cancel")
+            logger.info("BARGE-IN: assistant not actively speaking; nothing to mute")
             return
 
-        if active_response_id:
-            logger.info(
-                "BARGE-IN: user speech started while AI speaking; "
-                "sending response.cancel for %s and clearing audio buffer.",
-                active_response_id,
-            )
-            try:
-                await openai_ws.send(json.dumps({
-                    "type": "response.cancel",
-                    "response_id": active_response_id,
-                }))
-            except Exception:
-                logger.exception("BARGE-IN: failed to send response.cancel")
-        else:
-            logger.info("BARGE-IN: no active_response_id; skipping response.cancel")
+        logger.info(
+            "BARGE-IN: user speech started while AI speaking; "
+            "locally muting current response and clearing audio buffer."
+        )
 
-        # Clear buffered audio so we stop sending the interrupted response
+        # Locally "kill" the current response:
+        active_response_id = None
         audio_buffer.clear()
 
     # --- Intent helpers ------------------------------------------------------
@@ -1395,58 +1403,60 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error calling /assistant/route")
             return None
 
-    # --- Helper: create responses with active_response_id guard -------------
-    async def _cancel_active_and_clear_buffer(reason: str):
-        nonlocal active_response_id, audio_buffer
-        if active_response_id is not None:
-            logger.info(
-                "%s: canceling active response %s before starting new one",
-                reason,
-                active_response_id,
-            )
-            try:
-                await openai_ws.send(json.dumps({
-                    "type": "response.cancel",
-                    "response_id": active_response_id,
-                }))
-            except Exception as e:
-                logger.warning("response.cancel failed (usually harmless): %s", e)
-            # Locally clear so we don't block new turns if cancel event never arrives
-            active_response_id = None
-        # Drop any leftover audio for the old response
-        audio_buffer.clear()
-
+    # --- Helpers: create responses WITHOUT response.cancel ------------------
     async def create_generic_response():
         """
         Generic GPT turn: just respond to latest user message in the Realtime conversation.
 
-        IMPORTANT: we now PREEMPT any active response instead of skipping.
-        This fixes the 'stuck active_response_id => permanent silence' bug.
+        We do NOT call response.cancel here. Instead, any older response's
+        audio will be ignored if it doesn't match active_response_id.
         """
-        await _cancel_active_and_clear_buffer("create_generic_response")
+        nonlocal active_response_id, audio_buffer
+
+        # Treat a new user transcript as implicitly superseding any prior AI turn.
+        if active_response_id is not None:
+            logger.info(
+                "create_generic_response: superseding previous response %s locally",
+                active_response_id,
+            )
+            active_response_id = None
+            audio_buffer.clear()
 
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
     async def create_fsm_spoken_reply(spoken_reply: str):
         """
-        Ask Realtime to speak a specific backend-computed reply.
-        If a response is currently active, cancel it first so we don't talk over it.
+        Ask Realtime to speak a specific backend-computed reply (from FSM/Gmail).
+
+        We DO NOT send response.cancel to OpenAI. Instead, we:
+        - clear active_response_id
+        - clear the local audio buffer
+        so that any old response's audio is ignored.
         """
+        nonlocal active_response_id, audio_buffer
+
         if not spoken_reply:
-            logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
+            logger.info("create_fsm_spoken_reply called with empty spoken_reply; skipping.")
             return
 
-        await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
+        if active_response_id is not None:
+            logger.info(
+                "create_fsm_spoken_reply: superseding previous response %s locally",
+                active_response_id,
+            )
+            active_response_id = None
+            audio_buffer.clear()
 
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
                 "instructions": (
                     SYSTEM_PROMPT
-                    + "\n\nYou have been given a pre-computed spoken reply. "
-                      "Respond to the caller by conveying the following content in a natural voice, "
-                      "without adding new facts:\n\n"
+                    + "\n\nThe backend has already computed exactly what you "
+                      "should say next to the caller. Speak the following text "
+                      "in a natural, conversational voice, without adding new "
+                      "details or changing the meaning:\n\n"
                       f"{spoken_reply}"
                 )
             },
@@ -1516,10 +1526,8 @@ async def twilio_stream(websocket: WebSocket):
                         )
                         active_response_id = None
 
-                    # IMPORTANT:
-                    # Even if we pre-cleared active_response_id during a manual cancel,
-                    # we STILL want to enable barge-in after the *first* response
-                    # has finished in any way.
+                    # In case prebuffer never ran (edge case), this ensures
+                    # barge-in is at least enabled *after* the first response.
                     if not barge_in_enabled:
                         barge_in_enabled = True
                         logger.info(
@@ -1558,7 +1566,7 @@ async def twilio_stream(websocket: WebSocket):
                 elif etype == "input_audio_buffer.speech_started":
                     user_speaking_vad = True
                     logger.info("OpenAI VAD: user speech START")
-                    # If assistant is speaking and barge-in is enabled, cancel
+                    # If assistant is speaking and barge-in is enabled, locally mute
                     if assistant_actively_speaking():
                         await handle_barge_in()
 
@@ -1577,7 +1585,6 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("OpenAI Realtime WebSocket closed")
         except Exception:
             logger.exception("Error in OpenAI event loop")
-
 
     # --- Twilio event loop ---------------------------------------------------
     async def twilio_loop():
@@ -1614,7 +1621,6 @@ async def twilio_stream(websocket: WebSocket):
 
                     # Twilio → OpenAI Realtime (μ-law, base64)
                     try:
-                        # quick sanity check decode; then send base64 to OpenAI
                         base64.b64decode(payload)
                     except Exception:
                         logger.exception("Failed to base64-decode Twilio payload")
