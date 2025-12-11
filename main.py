@@ -1623,6 +1623,7 @@ async def twilio_stream(websocket: WebSocket):
             await create_generic_response()
 
     # --- OpenAI event loop ---------------------------------------------------
+  
     async def openai_loop():
         nonlocal active_response_id, barge_in_enabled, user_speaking_vad, prebuffer_active
 
@@ -1632,7 +1633,7 @@ async def twilio_stream(websocket: WebSocket):
                 etype = event.get("type")
 
                 if etype == "response.created":
-                    resp = event.get("response", {})
+                    resp = event.get("response", {}) or {}
                     rid = resp.get("id")
                     if rid:
                         active_response_id = rid
@@ -1640,7 +1641,7 @@ async def twilio_stream(websocket: WebSocket):
                         logger.info("Tracking allowed MANUAL response_id: %s", rid)
 
                 elif etype in ("response.completed", "response.failed", "response.canceled"):
-                    resp = event.get("response", {})
+                    resp = event.get("response", {}) or {}
                     rid = resp.get("id")
 
                     # If this completion corresponds to what we think is active, clear it.
@@ -1662,7 +1663,7 @@ async def twilio_stream(websocket: WebSocket):
                             rid,
                         )
 
-                                elif etype == "response.audio.delta":
+                elif etype == "response.audio.delta":
                     # Stream assistant audio back to Twilio
                     resp_id = event.get("response_id")
                     delta_b64 = event.get("delta")
@@ -1716,7 +1717,6 @@ async def twilio_stream(websocket: WebSocket):
                     # If assistant is speaking and barge-in is enabled, locally mute
                     if assistant_actively_speaking():
                         await handle_barge_in()
-
 
                 elif etype == "input_audio_buffer.speech_stopped":
                     user_speaking_vad = False
