@@ -726,6 +726,25 @@ class AssistantRouteOut(BaseModel):
     fsm: dict
     gmail: dict | None = None
 
+# ---------- Deepgram & ElevenLabs config ----------
+
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+if not DEEPGRAM_API_KEY:
+    logger.warning("DEEPGRAM_API_KEY is not set. STT will not work.")
+
+# Realtime listening endpoint configured for Twilio μ-law 8kHz audio
+DEEPGRAM_REALTIME_URL = os.getenv(
+    "DEEPGRAM_REALTIME_URL",
+    "wss://api.deepgram.com/v1/listen?"
+    "encoding=mulaw&sample_rate=8000&punctuate=true&interim_results=true&endpointing=500",
+)
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
+
+if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
+    logger.warning("ElevenLabs API key or voice ID not set. TTS will not work.")
+
 
 # ---------- Gmail summary helper for Vozlia (core logic) ----------
 def summarize_gmail_messages_for_assistant(
@@ -1252,498 +1271,129 @@ async def create_realtime_session():
     logger.info("Sent initial greeting request to OpenAI Realtime")
 
     return openai_ws
+# ---------- Deepgram helper (streaming STT) ----------
+
+async def connect_deepgram_stream():
+    """
+    Open a realtime streaming connection to Deepgram configured for
+    8kHz μ-law audio from Twilio.
+    """
+    if not DEEPGRAM_API_KEY:
+        raise RuntimeError("DEEPGRAM_API_KEY is not configured")
+
+    logger.info("Connecting to Deepgram realtime WebSocket...")
+    dg_ws = await websockets.connect(
+        DEEPGRAM_REALTIME_URL,
+        extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+        ping_interval=None,
+        ping_timeout=None,
+        max_size=None,
+    )
+    logger.info("Connected to Deepgram realtime.")
+    return dg_ws
 
 
-# ---------- Twilio media stream ↔ OpenAI Realtime ----------
+# ---------- ElevenLabs helper (TTS → μ-law 8kHz) ----------
+
+async def synthesize_with_elevenlabs(text: str) -> bytes:
+    """
+    Use ElevenLabs TTS to synthesize 'text' into 8kHz μ-law audio suitable
+    for Twilio media streams.
+
+    Returns raw μ-law bytes (8kHz, mono). If something fails, returns b"".
+    """
+    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
+        logger.error("ElevenLabs API key or voice ID is missing.")
+        return b""
+
+    if not text:
+        return b""
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+
+    # Ask ElevenLabs for telephony-friendly μ-law 8kHz audio
+    params = {"output_format": "ulaw_8000"}
+
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        # Accept is technically optional when using output_format, but explicit is nice
+        "Accept": "audio/ulaw;rate=8000",
+    }
+
+    payload = {
+        "text": text,
+        # Optional: you can add model_id / voice_settings here later if you want
+        # "model_id": "eleven_turbo_v2",
+        # "voice_settings": {...},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client_http:
+            resp = await client_http.post(
+                url,
+                headers=headers,
+                params=params,
+                json=payload,
+            )
+            resp.raise_for_status()
+            audio_bytes = resp.content
+            logger.info("Received %d bytes of ElevenLabs audio", len(audio_bytes))
+            return audio_bytes
+    except Exception as e:
+        logger.exception("Error calling ElevenLabs TTS: %s", e)
+        return b""
+
+
+# ---------- Twilio media stream ↔ Deepgram STT ↔ ElevenLabs TTS ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
     """
-    Handles Twilio <-> OpenAI Realtime audio for a single phone call.
+    New architecture (no OpenAI Realtime in the audio path):
 
-    Key behavior:
-    - Tracks EXACTLY ONE active response_id from Realtime.
-    - Only streams audio for the active response_id.
-    - Barge-in locally mutes the current response when the user starts talking.
-    - Routes certain transcripts to the FSM/email backend via /assistant/route.
+    Twilio MediaStream (μ-law 8kHz)  →  Deepgram realtime STT
+                                   ←  ElevenLabs TTS (μ-law 8kHz)
 
-    Implementation details:
-    - Uses server-side VAD in Realtime (no input_audio_buffer.commit).
-    - Streams assistant audio back to Twilio in 20 ms G.711 μ-law frames.
+    Reasoning (FSM + Gmail + GPT) still happens via /assistant/route +
+    OpenAI chat completions, same as before.
     """
 
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
-    # --- Call + AI state -----------------------------------------------------
-    openai_ws: Optional[websockets.WebSocketClientProtocol] = None
     stream_sid: Optional[str] = None
+    deepgram_ws: Optional[websockets.WebSocketClientProtocol] = None
 
-    # After we first start sending assistant audio, we allow barge-in
-    barge_in_enabled: bool = False
+    # Buffer for outgoing TTS audio in μ-law bytes
+    tts_buffer = bytearray()
 
-    # Server VAD-based user speech flag (from OpenAI events)
-    user_speaking_vad: bool = False
+    # Simple flag so we can stop all loops cleanly
+    call_active = True
 
-    # Outgoing assistant audio buffer (raw μ-law bytes)
-    audio_buffer = bytearray()
-    assistant_last_audio_time: float = 0.0
+    # ---------- Helper: send one 20ms frame of μ-law audio to Twilio ----------
+    async def send_one_frame_to_twilio():
+        nonlocal tts_buffer
 
-    # Prebuffer state: we hold back sending until we have enough audio
-    prebuffer_active: bool = True
-
-    # Response tracking
-    active_response_id: Optional[str] = None  # The single "currently active" response
-    allowed_response_ids: set[str] = set()    # (kept for future use, mostly logging)
-
-    # --- Simple helper: is assistant currently speaking? ---------------------
-    def assistant_actively_speaking() -> bool:
-        """
-        Treat the assistant as 'speaking' if:
-        - there's buffered audio we haven't sent yet, OR
-        - we sent audio in the very recent past (e.g. last 500ms).
-        """
-        if audio_buffer:
-            return True
-        if assistant_last_audio_time:
-            if (time.monotonic() - assistant_last_audio_time) < 0.5:
-                return True
-        return False
-
-    # --- Helper: send μ-law audio TO Twilio ---------------------------------
-    async def send_audio_to_twilio():
-        nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled
-
-        if stream_sid is None or not audio_buffer:
+        if not stream_sid:
+            return
+        if len(tts_buffer) < BYTES_PER_FRAME:
             return
 
-        # Prebuffer: wait until we have at least PREBUFFER_BYTES, then start streaming
-        if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
-            return
-        elif prebuffer_active and len(audio_buffer) >= PREBUFFER_BYTES:
-            prebuffer_active = False
-            logger.info("Prebuffer complete; starting to send audio to Twilio")
-
-            # 🔓 As soon as we actually start speaking,
-            # allow the caller to barge in.
-            if not barge_in_enabled:
-                barge_in_enabled = True
-                logger.info("Barge-in is now ENABLED (audio streaming started).")
-
-        # Always send exactly one 20ms frame (160 bytes) per call
-        chunk = bytes(audio_buffer[:BYTES_PER_FRAME])  # 20ms at 8kHz μ-law
-        audio_buffer = audio_buffer[BYTES_PER_FRAME:]
-
-        if not chunk:
-            return
+        chunk = bytes(tts_buffer[:BYTES_PER_FRAME])
+        tts_buffer = tts_buffer[BYTES_PER_FRAME:]
 
         payload = base64.b64encode(chunk).decode("ascii")
+
         msg = {
             "event": "media",
             "streamSid": stream_sid,
             "media": {"payload": payload},
         }
         await websocket.send_text(json.dumps(msg))
-        assistant_last_audio_time = time.monotonic()
 
-    # --- Helper: barge-in ----------------------------------------------------
-    async def handle_barge_in():
-        """
-        Called when OpenAI VAD says user started speaking while assistant is talking.
-
-        We keep this SIMPLE and LOCAL:
-        - If barge-in is not enabled yet, ignore.
-        - If the assistant is (recently) speaking, we:
-            * forget active_response_id
-            * clear the outgoing audio buffer
-
-        We DO NOT send response.cancel to OpenAI. Instead, any further
-        response.audio.delta events for that response_id will be dropped
-        because active_response_id is None.
-        """
-        nonlocal active_response_id, audio_buffer
-
-        if not barge_in_enabled:
-            logger.info("BARGE-IN: ignored (not yet enabled)")
-            return
-
-        if not assistant_actively_speaking():
-            logger.info("BARGE-IN: assistant not actively speaking; nothing to mute")
-            return
-
-        logger.info(
-            "BARGE-IN: user speech started while AI speaking; "
-            "locally muting current response and clearing audio buffer."
-        )
-
-        # Locally "kill" the current response:
-        active_response_id = None
-        audio_buffer.clear()
-
-    # --- Intent helpers ------------------------------------------------------
-    EMAIL_KEYWORDS_LOCAL = [
-        "email",
-        "emails",
-        "e-mail",
-        "e-mails",
-        "inbox",
-        "gmail",
-        "g mail",
-        "mailbox",
-        "my mail",
-        "my messages",
-        "unread",
-        "new mail",
-        "new emails",
-        "today's emails",
-        "today emails",
-        "read my email",
-        "read my emails",
-        "check my email",
-        "check my emails",
-        "how many emails",
-        "how many messages",
-        "email today",
-        "emails today",
-    ]
-
-    def looks_like_email_intent(text: str) -> bool:
-        """
-        Heuristic: does this utterance sound like an email / inbox question?
-        We normalize punctuation & dashes to avoid missing 'e-mail', etc.
-        """
-        if not text:
-            return False
-
-        t = text.lower()
-
-        # normalize common punctuation / dash variants
-        normalized = []
-        for ch in t:
-            if ch.isalnum() or ch.isspace():
-                normalized.append(ch)
-            else:
-                # turn punctuation (.,?!-/ etc.) into spaces
-                normalized.append(" ")
-        normalized = " ".join("".join(normalized).split())
-
-        # 1) direct keyword / phrase hits
-        for kw in EMAIL_KEYWORDS_LOCAL:
-            if kw in normalized:
-                return True
-
-        # 2) patterns like "how many ... today" with mail-ish words
-        if "how many" in normalized and (
-            "mail" in normalized or "message" in normalized or "inbox" in normalized
-        ):
-            return True
-
-        # 3) simple 'check my inbox' / 'check my gmail' without 'email'
-        if "check my" in normalized and (
-            "inbox" in normalized or "gmail" in normalized or "g mail" in normalized
-        ):
-            return True
-
-        # 4) 'read my messages' variants
-        if "read my" in normalized and (
-            "messages" in normalized or "mail" in normalized or "inbox" in normalized
-        ):
-            return True
-
-        return False
-
-    FILLER_ONLY = {"um", "uh", "er", "hmm"}
-    SMALL_TOSS = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks", "thank you"}
-
-    def should_reply(text: str) -> bool:
-        t = text.strip().lower()
-        if not t:
-            return False
-        words = t.split()
-        if len(words) == 1 and (words[0] in FILLER_ONLY or words[0] in SMALL_TOSS):
-            return False
-        return True
-
-    # --- Helper: call FSM/email backend -------------------------------------
-    async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
-        """
-        Calls your existing /assistant/route FSM endpoint and returns spoken_reply.
-        """
-        try:
-            data = await call_fsm_router(
-                text=transcript,
-                context={"channel": "phone"},
-            )
-            spoken = data.get("spoken_reply")
-            logger.info("FSM spoken_reply to send: %r", spoken)
-            return spoken
-        except Exception:
-            logger.exception("Error calling /assistant/route")
-            return None
-
-    # --- Helper: cancel active response & clear audio buffer ----------------
-    async def _cancel_active_and_clear_buffer(reason: str):
-        """
-        Safely cancel the currently active Realtime response (if any)
-        and clear any pending assistant audio.
-
-        This is used for clean turn-taking when we *explicitly* start a
-        new response (generic chit-chat or FSM/email summary).
-        """
-        nonlocal active_response_id, audio_buffer, prebuffer_active
-
-        if not openai_ws:
-            logger.info(
-                "_cancel_active_and_clear_buffer: no openai_ws (reason=%s)",
-                reason,
-            )
-            audio_buffer.clear()
-            prebuffer_active = True
-            return
-
-        if not active_response_id:
-            logger.info(
-                "_cancel_active_and_clear_buffer: no active response (reason=%s)",
-                reason,
-            )
-            audio_buffer.clear()
-            prebuffer_active = True
-            return
-
-        rid = active_response_id
-        logger.info(
-            "Sent response.cancel for %s due to %s",
-            rid,
-            reason,
-        )
-
-        try:
-            await openai_ws.send(json.dumps({
-                "type": "response.cancel",
-                "response_id": rid,
-            }))
-        except Exception:
-            logger.exception("Error sending response.cancel for %s", rid)
-
-        # Locally consider it dead either way
-        active_response_id = None
-        audio_buffer.clear()
-        prebuffer_active = True
-
-    # --- Helpers: create responses ------------------------------------------
-    async def create_generic_response():
-        """
-        Generic GPT turn: just respond to latest user message in the Realtime conversation.
-
-        We explicitly cancel any active response first to keep Realtime happy
-        and avoid 'conversation_already_has_active_response' errors.
-        """
-        await _cancel_active_and_clear_buffer("create_generic_response")
-
-        await openai_ws.send(json.dumps({"type": "response.create"}))
-        logger.info("Sent generic response.create for chit-chat turn")
-
-    async def create_fsm_spoken_reply(spoken_reply: str):
-        """
-        Use the FSM / backend–generated spoken_reply as the *exact message*
-        to speak to the caller.
-
-        IMPORTANT:
-        - We do NOT mention 'backend', 'secure email access', etc. in the
-          instructions, to reduce the chance that the model decides to
-          refuse on policy grounds.
-        - For this one turn, the model's job is simply to *say this message*.
-        """
-        if not spoken_reply:
-            logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
-            await create_generic_response()
-            return
-
-        # For debugging: see exactly what we asked the model to say
-        logger.info(
-            "create_fsm_spoken_reply invoked with summary (first 200 chars): %r",
-            spoken_reply[:200],
-        )
-
-        # Cancel any active response and clear out old audio.
-        await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
-
-        # Per-response instructions: treat spoken_reply as the content.
-        instructions = (
-            "You are on a live phone call as Vozlia.\n"
-            "For THIS response only, you already know exactly what you want to say.\n"
-            "Below is the message you must speak to the caller:\n\n"
-            f"\"{spoken_reply}\"\n\n"
-            "Your job for this turn is:\n"
-            "- Say this message in a natural, warm, friendly way.\n"
-            "- You MAY lightly rephrase for flow, but you MUST preserve all of the\n"
-            "  important factual details (counts, topics, dates, deadlines).\n"
-            "- DO NOT refuse.\n"
-            "- DO NOT apologize.\n"
-            "- DO NOT say you cannot access something or that you lack permissions.\n"
-            "- DO NOT mention tools, email accounts, security, privacy, or any\n"
-            "  internal systems.\n"
-            "- Just speak the message as your answer to the caller.\n"
-        )
-
-        await openai_ws.send(json.dumps({
-            "type": "response.create",
-            "response": {
-                # Per-response instructions override generic behavior for this turn.
-                "instructions": instructions,
-            },
-        }))
-        logger.info("Sent FSM-driven spoken reply into Realtime session")
-
-    # --- Helper: handle transcripts from Realtime ---------------------------
-    async def handle_transcript_event(event: dict):
-        """
-        Handles 'conversation.item.input_audio_transcription.completed' events.
-        Uses email/FSM routing vs generic chit-chat.
-        """
-        transcript: str = event.get("transcript", "").strip()
-        if not transcript:
-            return
-
-        logger.info("USER Transcript completed: %r", transcript)
-
-        if not should_reply(transcript):
-            logger.info("Ignoring filler transcript: %r", transcript)
-            return
-
-        if looks_like_email_intent(transcript):
-            logger.info(
-                "Debounce: transcript looks like an email/skill request; "
-                "routing to FSM + backend."
-            )
-            spoken_reply = await route_to_fsm_and_get_reply(transcript)
-            if spoken_reply:
-                await create_fsm_spoken_reply(spoken_reply)
-            else:
-                logger.warning(
-                    "FSM returned no spoken_reply; falling back to generic reply."
-                )
-                await create_generic_response()
-        else:
-            logger.info(
-                "Debounce: transcript does NOT look like an email/skill intent; "
-                "using generic GPT response via manual response.create."
-            )
-            await create_generic_response()
-
-    # --- OpenAI event loop ---------------------------------------------------
-    async def openai_loop():
-        nonlocal active_response_id, barge_in_enabled, user_speaking_vad, prebuffer_active
-
-        try:
-            async for raw in openai_ws:
-                event = json.loads(raw)
-                etype = event.get("type")
-
-                if etype == "response.created":
-                    resp = event.get("response", {}) or {}
-                    rid = resp.get("id")
-                    if rid:
-                        active_response_id = rid
-                        allowed_response_ids.add(rid)
-                        logger.info("Tracking allowed MANUAL response_id: %s", rid)
-
-                elif etype in ("response.completed", "response.failed", "response.canceled"):
-                    resp = event.get("response", {}) or {}
-                    rid = resp.get("id")
-
-                    # If this completion corresponds to what we think is active, clear it.
-                    if active_response_id is not None and rid == active_response_id:
-                        logger.info(
-                            "Response %s finished with event '%s'; clearing active_response_id",
-                            rid, etype,
-                        )
-                        active_response_id = None
-
-                    # In case prebuffer never ran (edge case), this ensures
-                    # barge-in is at least enabled *after* the first response.
-                    if not barge_in_enabled:
-                        barge_in_enabled = True
-                        logger.info(
-                            "First response finished (event=%s, id=%s); "
-                            "barge-in is now ENABLED.",
-                            etype,
-                            rid,
-                        )
-
-                elif etype == "response.audio.delta":
-                    # Stream assistant audio back to Twilio
-                    resp_id = event.get("response_id")
-                    delta_b64 = event.get("delta")
-
-                    if resp_id != active_response_id:
-                        logger.info(
-                            "Dropping unsolicited audio for response_id=%s (active=%s)",
-                            resp_id, active_response_id,
-                        )
-                        continue
-
-                    if not delta_b64:
-                        continue
-
-                    try:
-                        delta_bytes = base64.b64decode(delta_b64)
-                    except Exception:
-                        logger.exception("Failed to decode response.audio.delta")
-                        continue
-
-                    # Accumulate bytes, then ship them to Twilio in 20ms frames.
-                    audio_buffer.extend(delta_bytes)
-                    while len(audio_buffer) >= BYTES_PER_FRAME:
-                        await send_audio_to_twilio()
-
-                elif etype == "response.output_text.delta":
-                    # Debug: log any text content the model generates,
-                    # and catch any attempts to deny email access.
-                    resp = event.get("response", {}) or {}
-                    rid = resp.get("id")
-                    delta_obj = event.get("delta", {}) or {}
-                    chunk = delta_obj.get("text", "") or ""
-
-                    if chunk:
-                        logger.info("Realtime text delta [id=%s]: %r", rid, chunk)
-
-                        low = chunk.lower()
-                        if (
-                            "can't access email" in low
-                            or "cannot access email" in low
-                            or "do not have access to your email" in low
-                        ):
-                            logger.error(
-                                "Realtime attempted to deny email access in text delta: %r",
-                                chunk,
-                            )
-
-                elif etype == "input_audio_buffer.speech_started":
-                    user_speaking_vad = True
-                    logger.info("OpenAI VAD: user speech START")
-                    # If assistant is speaking and barge-in is enabled, locally mute
-                    if assistant_actively_speaking():
-                        await handle_barge_in()
-
-                elif etype == "input_audio_buffer.speech_stopped":
-                    user_speaking_vad = False
-                    logger.info("OpenAI VAD: user speech STOP")
-
-                elif etype == "conversation.item.input_audio_transcription.completed":
-                    # Handle transcript → FSM or generic
-                    await handle_transcript_event(event)
-
-                elif etype == "error":
-                    logger.error("OpenAI error event: %s", event)
-
-        except websockets.ConnectionClosed:
-            logger.info("OpenAI Realtime WebSocket closed")
-        except Exception:
-            logger.exception("Error in OpenAI event loop")
-
-    # --- Twilio event loop ---------------------------------------------------
-    async def twilio_loop():
-        nonlocal stream_sid, prebuffer_active, openai_ws
+    # ---------- Helper: Twilio → Deepgram (audio in) ----------
+    async def twilio_rx_loop():
+        nonlocal stream_sid, call_active, deepgram_ws
 
         try:
             async for msg in websocket.iter_text():
@@ -1760,62 +1410,165 @@ async def twilio_stream(websocket: WebSocket):
                     logger.info("Twilio reports call connected")
 
                 elif event_type == "start":
-                    start = data.get("start", {})
+                    start = data.get("start", {}) or {}
                     stream_sid = start.get("streamSid")
-                    prebuffer_active = True
-                    logger.info("Twilio stream event: start")
-                    logger.info("Stream started: %s", stream_sid)
+                    logger.info("Twilio stream event: start (streamSid=%s)", stream_sid)
+
+                    # Connect to Deepgram when call starts
+                    if deepgram_ws is None:
+                        deepgram_ws = await connect_deepgram_stream()
 
                 elif event_type == "media":
-                    if not openai_ws:
+                    if not deepgram_ws:
+                        # If Deepgram isn't ready yet, drop this chunk (rare)
                         continue
-                    media = data.get("media", {})
+
+                    media = data.get("media", {}) or {}
                     payload = media.get("payload")
                     if not payload:
                         continue
 
-                    # Twilio → OpenAI Realtime (μ-law, base64)
                     try:
-                        base64.b64decode(payload)
+                        audio_bytes = base64.b64decode(payload)
                     except Exception:
                         logger.exception("Failed to base64-decode Twilio payload")
                         continue
 
-                    await openai_ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": payload,  # base64 g711_ulaw
-                    }))
+                    # Send raw μ-law bytes to Deepgram
+                    try:
+                        await deepgram_ws.send(audio_bytes)
+                    except Exception:
+                        logger.exception("Error sending audio to Deepgram")
+                        break
 
                 elif event_type == "stop":
                     logger.info("Twilio stream event: stop")
                     logger.info("Twilio sent stop; closing call.")
+                    call_active = False
                     break
 
         except WebSocketDisconnect:
             logger.info("Twilio WebSocket disconnected")
+            call_active = False
         except Exception:
-            logger.exception("Error in Twilio event loop")
+            logger.exception("Error in Twilio RX loop")
+            call_active = False
 
-    # --- Main orchestration --------------------------------------------------
-    try:
-        openai_ws = await create_realtime_session()
-        logger.info("connection open")
+    # ---------- Helper: Deepgram → FSM/GPT → ElevenLabs ----------
+    async def deepgram_rx_loop():
+        nonlocal call_active, tts_buffer, deepgram_ws
 
-        # Run both loops concurrently until one exits
-        await asyncio.gather(
-            openai_loop(),
-            twilio_loop(),
-        )
+        if deepgram_ws is None:
+            # Call might hang up before Deepgram connects
+            return
 
-    finally:
         try:
-            if openai_ws is not None:
-                await openai_ws.close()
+            async for raw in deepgram_ws:
+                # Deepgram sends JSON text frames for transcripts
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("Non-JSON frame from Deepgram: %r", raw)
+                    continue
+
+                # We care about transcription results
+                if event.get("type") not in (None, "results", "transcript"):
+                    continue
+
+                channel = event.get("channel", {}) or {}
+                alts = channel.get("alternatives", [])
+                if not alts:
+                    continue
+
+                transcript = alts[0].get("transcript", "").strip()
+                if not transcript:
+                    continue
+
+                is_final = event.get("is_final", False)
+                speech_final = event.get("speech_final", False)
+
+                logger.info(
+                    "Deepgram transcript (final=%s speech_final=%s): %r",
+                    is_final,
+                    speech_final,
+                    transcript,
+                )
+
+                # We treat "speech_final" as the end of a user utterance
+                if speech_final:
+                    # Call the FSM/backend router to interpret + fetch email, etc.
+                    try:
+                        fsm_data = await call_fsm_router(
+                            text=transcript,
+                            context={"channel": "phone"},
+                        )
+                        spoken_reply = fsm_data.get("spoken_reply") or (
+                            "I heard you, but I'm not sure how to respond yet."
+                        )
+                        logger.info("FSM spoken_reply to synthesize: %r", spoken_reply)
+                    except Exception:
+                        logger.exception("Error calling /assistant/route")
+                        spoken_reply = (
+                            "Something went wrong while checking that. "
+                            "Please try again in a moment."
+                        )
+
+                    # Synthesize via ElevenLabs and push into TTS buffer
+                    audio_bytes = await synthesize_with_elevenlabs(spoken_reply)
+                    if audio_bytes:
+                        # Replace any leftover audio with the new reply
+                        tts_buffer.clear()
+                        tts_buffer.extend(audio_bytes)
+                    else:
+                        logger.error("No audio returned from ElevenLabs TTS")
+
+                if not call_active:
+                    break
+
+        except websockets.ConnectionClosed:
+            logger.info("Deepgram WebSocket closed")
         except Exception:
-            logger.exception("Error closing OpenAI WebSocket")
+            logger.exception("Error in Deepgram RX loop")
+        finally:
+            call_active = False
+
+    # ---------- Helper: Twilio TX loop (send TTS frames) ----------
+    async def twilio_tx_loop():
+        nonlocal call_active
+
+        try:
+            while call_active:
+                # Send one 20ms frame every FRAME_INTERVAL
+                await send_one_frame_to_twilio()
+                await asyncio.sleep(FRAME_INTERVAL)
+        except Exception:
+            logger.exception("Error in Twilio TX loop")
+        finally:
+            call_active = False
+
+    # ---------- Main orchestration ----------
+    deepgram_ws = None
+    try:
+        # Start all three loops concurrently:
+        #  - Twilio RX: audio from Twilio → Deepgram
+        #  - Deepgram RX: transcripts → FSM/GPT → ElevenLabs → tts_buffer
+        #  - Twilio TX: tts_buffer → Twilio audio frames
+        await asyncio.gather(
+            twilio_rx_loop(),
+            deepgram_rx_loop(),
+            twilio_tx_loop(),
+        )
+    finally:
+        # Clean up Deepgram & Twilio sockets
+        try:
+            if deepgram_ws is not None:
+                await deepgram_ws.close()
+        except Exception:
+            logger.exception("Error closing Deepgram WebSocket")
+
         try:
             await websocket.close()
         except Exception:
             logger.exception("Error closing Twilio WebSocket")
 
-        logger.info("WebSocket disconnected while sending audio")
+        logger.info("Twilio media stream handler completed")
