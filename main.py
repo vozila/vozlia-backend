@@ -1546,94 +1546,58 @@ async def twilio_stream(websocket: WebSocket):
 
     async def create_fsm_spoken_reply(spoken_reply: str):
         """
-        Use the FSM / backend–generated spoken_reply as the *content* of the
-        next response.
+        Use the FSM / backend–generated spoken_reply as the content for the
+        next response, by injecting it as input_text into the Realtime
+        conversation and then asking the model to answer that.
 
-        GOAL:
-        - The model must actually SAY the summary.
-        - It must not fall back to generic "I'm here to help" style lines.
-        - It must not say it can't access email.
-
-        We enforce that by:
-        - Cancelling any active response.
-        - Giving very strict, turn-local instructions that:
-          * Provide the summary text.
-          * Forbid generic intros / refusals.
-          * Tell the model to start speaking the summary immediately.
+        This is more reliable than only using per-response 'instructions',
+        because the model now treats the summary as the latest user turn.
         """
         if not spoken_reply:
             logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
             await create_generic_response()
             return
 
-        # Cancel any active response and clear out old audio.
+        # 1) Cancel any active response and clear out old audio.
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
 
-        # Extremely explicit, one-shot instructions for THIS response.
-        instructions = (
-            "You are on a live phone call as Vozlia.\n"
-            "The secure backend has ALREADY checked the caller's email account "
-            "and produced the exact summary you must speak.\n\n"
-            "EMAIL SUMMARY TO SPEAK (IMPORTANT):\n"
-            f"{spoken_reply}\n\n"
-            "For THIS response only, you MUST do ALL of the following:\n"
-            "1) Start speaking the summary content immediately. Do NOT start with a "
-            "   generic line like 'I'm here to answer any questions you may have.'\n"
-            "2) Your entire answer must be based on this summary. You may slightly "
-            "   smooth the wording for natural speech, but you MUST keep all key facts "
-            "   (counts, topics, important notices) and you must not change their meaning.\n"
-            "3) Do NOT say anything about security, privacy, tools, APIs, or that you "
-            "   'can't access' email or Gmail. The email has already been checked.\n"
-            "4) Do NOT apologize or refuse. Do NOT redirect the caller to ask a different "
-            "   question. Your job is ONLY to speak this summary.\n"
-            "5) Do NOT end with 'Is there anything else I can help you with?' unless it is "
-            "   a very short, natural follow-up AFTER giving the summary.\n"
-            "\n"
-            "In short: Immediately give the caller a concise spoken summary of their email, "
-            "directly based on the summary text above, without disclaimers or generic intros.\n"
+        # 2) Inject the summary as an input_text event.
+        #
+        # The system prompt already tells the model that it *can* talk about
+        # email and should not refuse. Here we give it a very explicit
+        # “user” message that says: speak this summary to the caller.
+        summary_text = (
+            "EMAIL SUMMARY FOR CALLER (READ THIS ALOUD AS YOUR ANSWER): "
+            f"{spoken_reply}"
         )
 
-        await openai_ws.send(json.dumps({
-            "type": "response.create",
-            "response": {
-                "instructions": instructions,
-            },
-        }))
-        logger.info("Sent FSM-driven spoken reply into Realtime session")
-
-    # --- Helper: handle transcripts from Realtime ---------------------------
-    async def handle_transcript_event(event: dict):
-        """
-        Handles 'conversation.item.input_audio_transcription.completed' events.
-        Uses email/FSM routing vs generic chit-chat.
-        """
-        transcript: str = event.get("transcript", "").strip()
-        if not transcript:
-            return
-
-        logger.info("USER Transcript completed: %r", transcript)
-
-        if not should_reply(transcript):
-            logger.info("Ignoring filler transcript: %r", transcript)
-            return
-
-        if looks_like_email_intent(transcript):
-            logger.info(
-                "Debounce: transcript looks like an email/skill request; "
-                "routing to FSM + backend."
-            )
-            spoken_reply = await route_to_fsm_and_get_reply(transcript)
-            if spoken_reply:
-                await create_fsm_spoken_reply(spoken_reply)
-            else:
-                logger.warning("FSM returned no spoken_reply; falling back to generic reply.")
-                await create_generic_response()
-        else:
-            logger.info(
-                "Debounce: transcript does NOT look like an email/skill intent; "
-                "using generic GPT response via manual response.create."
-            )
+        try:
+            await openai_ws.send(json.dumps({
+                "type": "input_text",
+                "text": summary_text,
+            }))
+        except Exception:
+            logger.exception("Error sending input_text with FSM email summary")
+            # As a fallback, just do a generic response
             await create_generic_response()
+            return
+
+        # 3) Ask Realtime to generate a response to that input_text.
+        #
+        # We *don’t* add extra per-response instructions here; the system
+        # prompt + the explicit summary text should be enough, and this
+        # avoids the model ignoring a huge instructions blob.
+        try:
+            await openai_ws.send(json.dumps({
+                "type": "response.create"
+            }))
+            logger.info("Sent FSM-driven spoken reply into Realtime session "
+                        "(via input_text + response.create)")
+        except Exception:
+            logger.exception("Error sending response.create for FSM summary")
+            # Fallback again to a generic response
+            await create_generic_response()
+
 
     # --- OpenAI event loop ---------------------------------------------------
   
@@ -1677,7 +1641,7 @@ async def twilio_stream(websocket: WebSocket):
                         )
 
                 elif etype == "response.audio.delta":
-                    # Stream assistant audio back to Twilio
+                    # Stream assistant audio back to Twilio, paced in real time
                     resp_id = event.get("response_id")
                     delta_b64 = event.get("delta")
 
@@ -1697,10 +1661,19 @@ async def twilio_stream(websocket: WebSocket):
                         logger.exception("Failed to decode response.audio.delta")
                         continue
 
-                    # Accumulate bytes, then ship them to Twilio in 20ms frames.
+                    # Accumulate bytes in our buffer
                     audio_buffer.extend(delta_bytes)
-                    while len(audio_buffer) >= BYTES_PER_FRAME:
+
+                    # Only send ONE frame at a time, and only if:
+                    # - we have at least 1 frame worth of audio, AND
+                    # - it's been at least FRAME_INTERVAL since the last frame.
+                    now = time.monotonic()
+                    if (
+                        len(audio_buffer) >= BYTES_PER_FRAME
+                        and (now - assistant_last_audio_time) >= FRAME_INTERVAL
+                    ):
                         await send_audio_to_twilio()
+
 
                 elif etype == "response.output_text.delta":
                     # Debug: log any text content the model generates,
