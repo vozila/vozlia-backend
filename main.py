@@ -1366,13 +1366,76 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Intent helpers ------------------------------------------------------
     EMAIL_KEYWORDS_LOCAL = [
-        "email", "emails", "inbox", "gmail", "messages",
-        "how many emails", "read my email", "read my emails",
+        "email",
+        "emails",
+        "e-mail",
+        "e-mails",
+        "inbox",
+        "gmail",
+        "g mail",
+        "mailbox",
+        "my mail",
+        "my messages",
+        "unread",
+        "new mail",
+        "new emails",
+        "today's emails",
+        "today emails",
+        "read my email",
+        "read my emails",
+        "check my email",
+        "check my emails",
+        "how many emails",
+        "how many messages",
+        "email today",
+        "emails today",
     ]
 
     def looks_like_email_intent(text: str) -> bool:
+        """
+        Heuristic: does this utterance sound like an email / inbox question?
+        We normalize punctuation & dashes to avoid missing 'e-mail', etc.
+        """
+        if not text:
+            return False
+
         t = text.lower()
-        return any(kw in t for kw in EMAIL_KEYWORDS_LOCAL)
+
+        # normalize common punctuation / dash variants
+        normalized = []
+        for ch in t:
+            if ch.isalnum() or ch.isspace():
+                normalized.append(ch)
+            else:
+                # turn punctuation (.,?!-/ etc.) into spaces
+                normalized.append(" ")
+        normalized = " ".join("".join(normalized).split())
+
+        # 1) direct keyword / phrase hits
+        for kw in EMAIL_KEYWORDS_LOCAL:
+            if kw in normalized:
+                return True
+
+        # 2) patterns like "how many ... today" with mail-ish words
+        if "how many" in normalized and (
+            "mail" in normalized or "message" in normalized or "inbox" in normalized
+        ):
+            return True
+
+        # 3) simple 'check my inbox' / 'check my gmail' without 'email'
+        if "check my" in normalized and (
+            "inbox" in normalized or "gmail" in normalized or "g mail" in normalized
+        ):
+            return True
+
+        # 4) 'read my messages' variants
+        if "read my" in normalized and (
+            "messages" in normalized or "mail" in normalized or "inbox" in normalized
+        ):
+            return True
+
+        return False
+
 
     FILLER_ONLY = {"um", "uh", "er", "hmm"}
     SMALL_TOSS = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks", "thank you"}
@@ -1403,62 +1466,102 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error calling /assistant/route")
             return None
 
+    
+
+        # --- Helper: cancel active response & clear audio buffer ----------------
+    async def _cancel_active_and_clear_buffer(reason: str):
+        """
+        Safely cancel the currently active Realtime response (if any)
+        and clear any pending assistant audio.
+
+        This is used for clean turn-taking when we *explicitly* start a
+        new response (generic chit-chat or FSM/email summary).
+        """
+        nonlocal active_response_id, audio_buffer
+
+        if not active_response_id:
+            logger.info("_cancel_active_and_clear_buffer: no active response (reason=%s)", reason)
+            return
+
+        rid = active_response_id
+        active_response_id = None
+        audio_buffer.clear()
+
+        if not openai_ws:
+            logger.warning(
+                "_cancel_active_and_clear_buffer: openai_ws is None; "
+                "cannot send response.cancel for %s (reason=%s)",
+                rid,
+                reason,
+            )
+            return
+
+        try:
+            await openai_ws.send(json.dumps({
+                "type": "response.cancel",
+                "response_id": rid,
+            }))
+            logger.info(
+                "Sent response.cancel for %s due to %s",
+                rid,
+                reason,
+            )
+        except Exception:
+            logger.exception("Failed to send response.cancel for %s (reason=%s)", rid, reason)
+
     # --- Helpers: create responses WITHOUT response.cancel ------------------
     async def create_generic_response():
         """
         Generic GPT turn: just respond to latest user message in the Realtime conversation.
 
-        We do NOT call response.cancel here. Instead, any older response's
-        audio will be ignored if it doesn't match active_response_id.
+        We explicitly cancel any active response first to keep Realtime happy
+        and avoid 'conversation_already_has_active_response' errors.
         """
-        nonlocal active_response_id, audio_buffer
-
-        # Treat a new user transcript as implicitly superseding any prior AI turn.
-        if active_response_id is not None:
-            logger.info(
-                "create_generic_response: superseding previous response %s locally",
-                active_response_id,
-            )
-            active_response_id = None
-            audio_buffer.clear()
+        await _cancel_active_and_clear_buffer("create_generic_response")
 
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
+
     async def create_fsm_spoken_reply(spoken_reply: str):
         """
-        Ask Realtime to speak a specific backend-computed reply (from FSM/Gmail).
+        Use the FSM / backend–generated spoken_reply as the *content* of the
+        next response. We explicitly tell Realtime:
 
-        We DO NOT send response.cancel to OpenAI. Instead, we:
-        - clear active_response_id
-        - clear the local audio buffer
-        so that any old response's audio is ignored.
+        - The backend already inspected the caller's email securely.
+        - This string is safe to speak.
+        - Do NOT talk about security/privacy/access; just summarize.
         """
-        nonlocal active_response_id, audio_buffer
-
         if not spoken_reply:
-            logger.info("create_fsm_spoken_reply called with empty spoken_reply; skipping.")
+            logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
+            await create_generic_response()
             return
 
-        if active_response_id is not None:
-            logger.info(
-                "create_fsm_spoken_reply: superseding previous response %s locally",
-                active_response_id,
-            )
-            active_response_id = None
-            audio_buffer.clear()
+        # Cancel any active response and clear out old audio.
+        await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
+
+        # Give per-response instructions that tell the model exactly what to do.
+        instructions = (
+            "You are on a live phone call as Vozlia.\n"
+            "The secure backend has already checked the caller's email account "
+            "and produced a short summary of their messages.\n\n"
+            "Here is the summary you must speak to the caller:\n"
+            f"\"{spoken_reply}\"\n\n"
+            "Your job for THIS response only is:\n"
+            "- Say this summary to the caller in a natural, friendly way.\n"
+            "- You MAY lightly rephrase for flow, but you MUST keep all of the "
+            "  important facts (counts, topics, deadlines) from the summary.\n"
+            "- DO NOT mention security, privacy, 'I cannot access your email', "
+            "  or anything about being unable to read their email.\n"
+            "- DO NOT apologize or refuse.\n"
+            "- Just give the summary, as if you personally checked it.\n"
+        )
 
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
-                "instructions": (
-                    SYSTEM_PROMPT
-                    + "\n\nThe backend has already computed exactly what you "
-                      "should say next to the caller. Speak the following text "
-                      "in a natural, conversational voice, without adding new "
-                      "details or changing the meaning:\n\n"
-                      f"{spoken_reply}"
-                )
+                # Per-response instructions override the generic behavior for this turn.
+                "instructions": instructions,
             },
         }))
         logger.info("Sent FSM-driven spoken reply into Realtime session")
