@@ -4,14 +4,28 @@ import time
 import base64
 import asyncio
 import logging
+import signal
 from typing import Optional, Dict, Any
 
 import httpx
 import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import PlainTextResponse
-import signal
 
+# -------------------------
+# Logging
+# -------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vozlia")
+
+# -------------------------
+# App (must exist before decorators)
+# -------------------------
+app = FastAPI()
+
+# -------------------------
+# Lifecycle + SIGTERM (must be after logger+app)
+# -------------------------
 @app.on_event("startup")
 async def _startup():
     logger.info("APP STARTUP")
@@ -22,6 +36,7 @@ async def _shutdown():
 
 def _handle_sigterm(*_):
     logger.warning("SIGTERM received")
+
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
 # -------------------------
