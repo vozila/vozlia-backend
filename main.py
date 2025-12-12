@@ -5,6 +5,7 @@ import base64
 import asyncio
 import logging
 import signal
+import re
 from typing import Optional, Dict, Any
 
 import httpx
@@ -34,7 +35,8 @@ router_client: httpx.AsyncClient | None = None
 # -------------------------
 # Per-call state (session memory)
 # -------------------------
-CALL_STATE: dict[str, dict] = {}  # streamSid -> {"topic": str|None, "last_user": str, "last_bot": str}
+# streamSid -> {"topic": str|None, "last_user": str, "last_bot": str}
+CALL_STATE: dict[str, dict] = {}
 
 # -------------------------
 # Env / Config
@@ -68,7 +70,6 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 async def startup():
     global openai_client, eleven_client, router_client
     logger.info("APP STARTUP")
-    # http2=True requires `h2` dependency. Keep it off for Render simplicity.
     openai_client = httpx.AsyncClient(timeout=25.0)
     eleven_client = httpx.AsyncClient(timeout=45.0)
     router_client = httpx.AsyncClient(timeout=25.0)
@@ -157,7 +158,8 @@ async def stream_ulaw_audio_to_twilio(
     ulaw_audio: bytes,
     cancel_event: asyncio.Event,
 ):
-    frame_size = 160  # 20ms @ 8kHz μ-law
+    # 20ms @ 8kHz μ-law = 160 bytes
+    frame_size = 160
     idx = 0
     while idx < len(ulaw_audio):
         if cancel_event.is_set():
@@ -187,7 +189,9 @@ async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
         r = await eleven_client.post(url, headers=headers, json=body)
 
     r.raise_for_status()
-    logger.info(f"ElevenLabs OK: content-type={r.headers.get('content-type')} bytes={len(r.content)} first10={r.content[:10]}")
+    logger.info(
+        f"ElevenLabs OK: content-type={r.headers.get('content-type')} bytes={len(r.content)} first10={r.content[:10]}"
+    )
     return r.content
 
 async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> str:
@@ -209,17 +213,46 @@ async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> s
         if isinstance(data, str) and data.strip():
             return data.strip()
 
-        return "Got it."
+        return "Okay."
 
     except Exception as e:
         logger.exception(f"FSM router call failed: {e}")
-        return "I’m having trouble reaching my skills service right now. Please try again."
+        return "I’m having trouble reaching my brain service right now. Please try again."
+
+# -------------------------
+# Topic inference (generic, light)
+# -------------------------
+_TOPIC_PREFIXES = [
+    "tell me about ",
+    "learn about ",
+    "what is ",
+    "what are ",
+    "explain ",
+    "help me understand ",
+]
+
+def _infer_topic(text: str) -> Optional[str]:
+    if not text:
+        return None
+    low = text.lower().strip()
+    for p in _TOPIC_PREFIXES:
+        if low.startswith(p) and len(text) > len(p) + 2:
+            return text[len(p):].strip(" .?!")
+    return None
+
+def _is_short_followup(text: str) -> bool:
+    # One to three words like: "breeds", "history", "price", "steps"
+    t = (text or "").strip()
+    t = re.sub(r"[^\w\s']", "", t.lower()).strip()
+    if not t:
+        return False
+    return len(t.split()) <= 3
 
 # -------------------------
 # OpenAI helpers
 # -------------------------
 def _extract_openai_text(data: dict) -> str:
-    # 1) output -> content -> output_text
+    # 1) output -> content -> output_text (and nested variants)
     out = data.get("output")
     if isinstance(out, list):
         parts = []
@@ -227,23 +260,34 @@ def _extract_openai_text(data: dict) -> str:
             if not isinstance(item, dict):
                 continue
             content = item.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "output_text":
-                    t = part.get("text")
-                    if isinstance(t, str) and t.strip():
-                        parts.append(t.strip())
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        t = part.get("text")
+                        if isinstance(t, str) and t.strip():
+                            parts.append(t.strip())
+                    # nested content variant
+                    inner = part.get("content") if isinstance(part, dict) else None
+                    if isinstance(inner, list):
+                        for p2 in inner:
+                            if isinstance(p2, dict) and p2.get("type") == "output_text":
+                                t2 = p2.get("text")
+                                if isinstance(t2, str) and t2.strip():
+                                    parts.append(t2.strip())
         joined = "\n".join(parts).strip()
         if joined:
             return joined
 
-    # 2) data["text"] can be str, list, or dict depending on server tier/format
+    # 2) output_text direct
+    ot = data.get("output_text")
+    if isinstance(ot, str) and ot.strip():
+        return ot.strip()
+
+    # 3) text may be str/dict/list depending on server tier/format
     t = data.get("text")
     if isinstance(t, str) and t.strip():
         return t.strip()
     if isinstance(t, dict):
-        # common shapes: {"value": "..."} or {"text": "..."}
         for k in ("value", "text", "content"):
             v = t.get(k)
             if isinstance(v, str) and v.strip():
@@ -261,120 +305,110 @@ def _extract_openai_text(data: dict) -> str:
         if joined:
             return joined
 
-    # 3) fallback
-    ot = data.get("output_text")
-    if isinstance(ot, str) and ot.strip():
-        return ot.strip()
-
     return ""
 
 async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -> str:
     if not OPENAI_API_KEY:
         return "OpenAI isn’t configured yet. Set OPENAI_API_KEY in Render."
 
-    topic = (state or {}).get("topic") or "none"
+    st = state or {}
+    topic = st.get("topic") or "unknown"
+    last_user = st.get("last_user") or ""
+    last_bot = st.get("last_bot") or ""
 
     system = (
-        "You are Vozlia, a calm, confident AI voice assistant. "
-        "PHONE RULES: answer first in 1–2 sentences. "
-        "Do NOT ask clarifying questions unless absolutely required. "
-        "Do NOT end with 'what would you like to do next'. "
-        "If user asks something broad, give a short overview + 2 options. "
-        f"Current topic: {topic}."
+        "You are Vozlia, a calm, confident AI voice assistant.\n"
+        "PHONE STYLE:\n"
+        "- Answer immediately with a helpful response (1–3 sentences).\n"
+        "- If the user asks something broad, give a quick overview + offer up to 3 options.\n"
+        "- If the user gives a short follow-up like 'breeds', 'history', 'price', 'steps', 'care tips', etc.,\n"
+        "  interpret it in the context of the CURRENT TOPIC and continue.\n"
+        "- Do NOT say: 'Tell me what you want to know' or 'What would you like to do next?'\n"
+    )
+
+    context = (
+        f"CURRENT_TOPIC: {topic}\n"
+        f"LAST_USER: {last_user}\n"
+        f"LAST_ASSISTANT: {last_bot}\n"
     )
 
     payload = {
         "model": OPENAI_MODEL,
         "input": [
             {"role": "system", "content": system},
+            {"role": "system", "content": context},
             {"role": "user", "content": user_text},
         ],
-        "max_output_tokens": 180,
+        "max_output_tokens": 220,
     }
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    try:
+    async def _call(p: dict) -> dict:
         if openai_client is None:
             async with httpx.AsyncClient(timeout=25.0) as client:
-                r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+                r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=p)
         else:
-            r = await openai_client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-
+            r = await openai_client.post("https://api.openai.com/v1/responses", headers=headers, json=p)
         r.raise_for_status()
-        data = r.json()
+        return r.json()
 
+    try:
+        data = await _call(payload)
         text_out = _extract_openai_text(data)
         if text_out:
             return text_out
 
-        logger.warning(f"OpenAI response had no parsable text. Keys={list(data.keys())}")
-        return "Got it. Tell me what you want to know."
+        logger.warning(f"OpenAI parse failed. keys={list(data.keys())} output_type={type(data.get('output'))}")
+
+        # Retry once with explicit plain text instruction
+        payload2 = dict(payload)
+        payload2["input"] = [
+            {"role": "system", "content": system + "\nReturn plain text only."},
+            {"role": "system", "content": context},
+            {"role": "user", "content": user_text},
+        ]
+        data2 = await _call(payload2)
+        text_out2 = _extract_openai_text(data2)
+        if text_out2:
+            return text_out2
+
+        logger.warning(f"OpenAI parse failed again. keys={list(data2.keys())} output_type={type(data2.get('output'))}")
+
+        return "I can help—say the topic in one phrase and what you want: overview, steps, options, or pros and cons."
 
     except Exception as e:
         logger.exception(f"OpenAI reply failed: {e}")
         return "I had trouble reaching my brain service. Please try again."
 
 # -------------------------
-# Router endpoint (THIS is where the behavior is enforced)
+# Router endpoint (topic-agnostic)
 # -------------------------
 @app.post("/assistant/route")
 async def assistant_route(request: Request):
     body = await request.json()
     text = (body.get("text") or "").strip()
     meta = body.get("meta") or {}
+
     state = (meta.get("state") if isinstance(meta, dict) else None) or {"topic": None, "last_user": "", "last_bot": ""}
 
     if not text:
         return {"spoken_reply": "I didn’t catch that. Can you say it again?", "intent": "general", "actions": [], "state": state}
 
-    low = text.lower()
+    # Infer/update topic
+    inferred = _infer_topic(text)
+    if inferred:
+        state["topic"] = inferred
 
-    # ---- Topic lock: cats (more robust) ----
-    if "cat" in low or "cats" in low or "cat breeds" in low:
-        state["topic"] = "cats"
-    topic = state.get("topic")
+    # If user gives a short follow-up, keep the current topic
+    # (OpenAI will use CURRENT_TOPIC + LAST_USER/LAST_ASSISTANT to interpret)
+    # No topic hardcoding here.
 
-    # ---- Hard guardrail: cat breeds request should NOT go to OpenAI clarifiers ----
-    # Catch many phrasings: "learn about cat breeds", "tell me about cat breeds", "summarize cat breeds"
-    if ("breed" in low or "breeds" in low) and (("cat" in low) or topic == "cats"):
-        # If they asked to summarize, do a concise summary rather than asking registry/species
-        if any(k in low for k in ["summarize", "summary", "different breeds", "all cat breeds", "all breeds"]):
-            reply = (
-                "There are dozens of recognized cat breeds, but here’s a clean overview by type: "
-                "1) Longhair: Maine Coon, Persian, Ragdoll. "
-                "2) Shorthair: British Shorthair, American Shorthair, Russian Blue. "
-                "3) Vocal/social: Siamese, Oriental Shorthair. "
-                "4) Active/athletic: Bengal, Abyssinian. "
-                "5) Unique coats: Sphynx (hairless), Devon Rex (curly). "
-                "If you tell me your vibe—calm, playful, low-shedding—I’ll recommend 2–3 perfect matches."
-            )
-            return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
-
-        reply = (
-            "Sure. Popular cat breeds include Maine Coon, Ragdoll, British Shorthair, Siamese, Persian, Bengal, and Sphynx. "
-            "Do you want a calm family cat, a playful cat, or low-shedding?"
-        )
-        return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
-
-    # ---- Answer-first: open-ended cats requests (broadened) ----
-    if topic == "cats" and (
-        "learn about" in low
-        or "tell me about" in low
-        or "about cats" in low
-        or low.strip() in ["cats", "cats.", "cat", "cat."]
-        or "just tell" in low
-        or "i don't know" in low
-    ):
-        reply = (
-            "Cats are intelligent, curious animals that often bond strongly with people. "
-            "Day to day, the big keys are good food, daily play, clean litter, and regular vet care. "
-            "Want care tips, behavior, or breeds?"
-        )
-        return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
-
-    # ---- Default: OpenAI ----
     reply = await openai_reply(text, state=state)
+
+    state["last_user"] = text
+    state["last_bot"] = reply
+
     return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
 
 # -------------------------
@@ -482,13 +516,12 @@ async def twilio_stream(websocket: WebSocket):
                 if not stream_sid:
                     continue
 
-                # Lively: instant ack
-                await speak("Okay.")
-
+                # Pull state for this call
                 state = CALL_STATE.get(stream_sid) or {"topic": None, "last_user": "", "last_bot": ""}
                 state["last_user"] = transcript
                 CALL_STATE[stream_sid] = state
 
+                # Route (calls our local /assistant/route by default)
                 reply = await call_fsm_router(transcript, meta={"stream_sid": stream_sid, "state": state})
                 logger.info(f"Router reply: {reply}")
 
