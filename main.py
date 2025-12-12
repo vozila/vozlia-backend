@@ -482,28 +482,22 @@ def _classify_intent(text: str) -> str:
     return "general"
 
 async def openai_reply(user_text: str, meta: Optional[Dict[str, Any]] = None) -> str:
-    """
-    Text-only brain response via OpenAI Responses API.
-    Uses Bearer auth and /v1/responses. :contentReference[oaicite:2]{index=2}
-    """
     if not OPENAI_API_KEY:
         return "OpenAI isn’t configured yet. Set OPENAI_API_KEY in Render."
 
     system = (
         "You are Vozlia, a calm, competent AI voice assistant for life and work. "
-        "Keep answers concise for phone calls. Ask one short follow-up question when needed. "
-        "If the user asks for emails or calendar, acknowledge and say you’ll use the connected tools, "
-        "but do not invent email contents."
+        "Keep answers concise for phone calls (1–3 sentences). "
+        "If the user’s request is vague, ask ONE short follow-up question. "
+        "Do not end every response with 'what next'."
     )
 
     payload = {
         "model": OPENAI_MODEL,
         "input": [
             {"role": "system", "content": system},
-            # include small meta to give context without bloating tokens
-            {"role": "user", "content": f"User said: {user_text}\nMeta: {json.dumps(meta or {}, ensure_ascii=False)}"},
+            {"role": "user", "content": user_text},
         ],
-        # keep phone replies short
         "max_output_tokens": 220,
     }
 
@@ -518,28 +512,41 @@ async def openai_reply(user_text: str, meta: Optional[Dict[str, Any]] = None) ->
             r.raise_for_status()
             data = r.json()
 
-        # Responses API returns an output array with content parts; easiest is to use output_text when present
-        # (Some SDKs expose this; in raw JSON, we can safely extract text from output content parts.)
-        # We'll handle both patterns.
-        if isinstance(data, dict):
-            if isinstance(data.get("output_text"), str) and data["output_text"].strip():
-                return data["output_text"].strip()
+        # --- Robust extraction for Responses API ---
+        # Look through: data["output"][*]["content"][*] for type == "output_text"
+        text_out = ""
 
-            out = data.get("output", [])
-            texts = []
+        out = data.get("output")
+        if isinstance(out, list):
+            parts = []
             for item in out:
-                for part in item.get("content", []) if isinstance(item, dict) else []:
-                    if part.get("type") == "output_text" and isinstance(part.get("text"), str):
-                        texts.append(part["text"])
-            joined = "\n".join(t.strip() for t in texts if t and t.strip()).strip()
-            if joined:
-                return joined
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        t = part.get("text")
+                        if isinstance(t, str) and t.strip():
+                            parts.append(t.strip())
+            text_out = "\n".join(parts).strip()
 
-        return "Okay—what would you like to do next?"
+        # Some variants may include output_text at top-level
+        if not text_out and isinstance(data.get("output_text"), str):
+            text_out = data["output_text"].strip()
+
+        if text_out:
+            return text_out
+
+        # Log the shape once if we can't parse it
+        logger.warning(f"OpenAI response had no parsable text. Keys={list(data.keys())}")
+        return "I’m here. What would you like to do?"
 
     except Exception as e:
         logger.exception(f"OpenAI reply failed: {e}")
         return "I had trouble reaching my brain service. Please try again."
+
 
 
 # -------------------------
