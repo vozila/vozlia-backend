@@ -34,8 +34,8 @@ router_client: httpx.AsyncClient | None = None
 
 # -------------------------
 # Per-call state (session memory)
-# -------------------------
 # streamSid -> {"topic": str|None, "last_user": str, "last_bot": str}
+# -------------------------
 CALL_STATE: dict[str, dict] = {}
 
 # -------------------------
@@ -158,8 +158,7 @@ async def stream_ulaw_audio_to_twilio(
     ulaw_audio: bytes,
     cancel_event: asyncio.Event,
 ):
-    # 20ms @ 8kHz μ-law = 160 bytes
-    frame_size = 160
+    frame_size = 160  # 20ms @ 8kHz μ-law
     idx = 0
     while idx < len(ulaw_audio):
         if cancel_event.is_set():
@@ -241,7 +240,6 @@ def _infer_topic(text: str) -> Optional[str]:
     return None
 
 def _is_short_followup(text: str) -> bool:
-    # One to three words like: "breeds", "history", "price", "steps"
     t = (text or "").strip()
     t = re.sub(r"[^\w\s']", "", t.lower()).strip()
     if not t:
@@ -252,60 +250,102 @@ def _is_short_followup(text: str) -> bool:
 # OpenAI helpers
 # -------------------------
 def _extract_openai_text(data: dict) -> str:
-    # 1) output -> content -> output_text (and nested variants)
+    """
+    Robust extraction for OpenAI Responses API across multiple shapes.
+    Handles:
+      - output[*].content[*].type == "output_text"
+      - output[*].content[*].type == "text" / "message" with nested text
+      - output_text at top level
+      - text at top level (str/list/dict)
+    """
+    texts: list[str] = []
+
+    def add(s: Any):
+        if isinstance(s, str):
+            s2 = s.strip()
+            if s2:
+                texts.append(s2)
+
+    # 0) direct convenience fields
+    add(data.get("output_text"))
+    add(data.get("text"))
+
+    # 1) output array
     out = data.get("output")
     if isinstance(out, list):
-        parts = []
         for item in out:
             if not isinstance(item, dict):
                 continue
+
+            add(item.get("text"))
+            add(item.get("output_text"))
+
             content = item.get("content")
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "output_text":
-                        t = part.get("text")
-                        if isinstance(t, str) and t.strip():
-                            parts.append(t.strip())
-                    # nested content variant
-                    inner = part.get("content") if isinstance(part, dict) else None
-                    if isinstance(inner, list):
-                        for p2 in inner:
-                            if isinstance(p2, dict) and p2.get("type") == "output_text":
-                                t2 = p2.get("text")
-                                if isinstance(t2, str) and t2.strip():
-                                    parts.append(t2.strip())
-        joined = "\n".join(parts).strip()
-        if joined:
-            return joined
+            if not isinstance(content, list):
+                continue
 
-    # 2) output_text direct
-    ot = data.get("output_text")
-    if isinstance(ot, str) and ot.strip():
-        return ot.strip()
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
 
-    # 3) text may be str/dict/list depending on server tier/format
+                ptype = part.get("type")
+
+                if ptype == "output_text":
+                    add(part.get("text"))
+                    continue
+
+                if ptype in ("text", "message"):
+                    add(part.get("text"))
+                    add(part.get("content"))
+                    continue
+
+                # Nested variants: {"text":{"value":"..."}}
+                t = part.get("text")
+                if isinstance(t, dict):
+                    add(t.get("value"))
+                    add(t.get("text"))
+                    add(t.get("content"))
+
+                # {"content":[{"type":"text","text":"..."}]}
+                inner = part.get("content")
+                if isinstance(inner, list):
+                    for p2 in inner:
+                        if not isinstance(p2, dict):
+                            continue
+                        add(p2.get("text"))
+                        if isinstance(p2.get("text"), dict):
+                            add(p2["text"].get("value"))
+
+    # 2) Sometimes "text" is a list of blocks
     t = data.get("text")
-    if isinstance(t, str) and t.strip():
-        return t.strip()
-    if isinstance(t, dict):
-        for k in ("value", "text", "content"):
-            v = t.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
     if isinstance(t, list):
-        parts = []
         for blk in t:
-            if isinstance(blk, str) and blk.strip():
-                parts.append(blk.strip())
+            if isinstance(blk, str):
+                add(blk)
             elif isinstance(blk, dict):
-                v = blk.get("text") or blk.get("value") or blk.get("content")
-                if isinstance(v, str) and v.strip():
-                    parts.append(v.strip())
-        joined = "\n".join([p for p in parts if p]).strip()
-        if joined:
-            return joined
+                add(blk.get("text"))
+                add(blk.get("value"))
+                add(blk.get("content"))
 
-    return ""
+    return "\n".join(texts).strip()
+
+def _log_openai_parse_failure(data: dict, label: str = "OpenAI parse failed"):
+    try:
+        sample = data.get("output", [])
+        sample_types = []
+        if isinstance(sample, list):
+            for it in sample[:2]:
+                if isinstance(it, dict):
+                    c = it.get("content")
+                    c_types = []
+                    if isinstance(c, list):
+                        for p in c[:3]:
+                            if isinstance(p, dict):
+                                c_types.append(p.get("type"))
+                    sample_types.append({"item_type": it.get("type"), "content_types": c_types})
+        logger.warning(f"{label}. output_sample_types={sample_types}")
+    except Exception:
+        logger.warning(f"{label} (could not sample output).")
 
 async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -> str:
     if not OPENAI_API_KEY:
@@ -359,7 +399,7 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
         if text_out:
             return text_out
 
-        logger.warning(f"OpenAI parse failed. keys={list(data.keys())} output_type={type(data.get('output'))}")
+        _log_openai_parse_failure(data, "OpenAI parse failed")
 
         # Retry once with explicit plain text instruction
         payload2 = dict(payload)
@@ -373,9 +413,9 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
         if text_out2:
             return text_out2
 
-        logger.warning(f"OpenAI parse failed again. keys={list(data2.keys())} output_type={type(data2.get('output'))}")
+        _log_openai_parse_failure(data2, "OpenAI parse failed again")
 
-        return "I can help—say the topic in one phrase and what you want: overview, steps, options, or pros and cons."
+        return "I’m having trouble formatting my reply, but I did hear you. Please repeat that once."
 
     except Exception as e:
         logger.exception(f"OpenAI reply failed: {e}")
@@ -400,11 +440,13 @@ async def assistant_route(request: Request):
     if inferred:
         state["topic"] = inferred
 
-    # If user gives a short follow-up, keep the current topic
-    # (OpenAI will use CURRENT_TOPIC + LAST_USER/LAST_ASSISTANT to interpret)
-    # No topic hardcoding here.
+    # If user gives a short follow-up and we already have a topic, treat it as a continuation
+    # by enriching the user_text before sending to OpenAI (helps "breeds", "pros and cons", etc.)
+    user_text_for_llm = text
+    if _is_short_followup(text) and state.get("topic"):
+        user_text_for_llm = f"About {state['topic']}: {text}"
 
-    reply = await openai_reply(text, state=state)
+    reply = await openai_reply(user_text_for_llm, state=state)
 
     state["last_user"] = text
     state["last_bot"] = reply
@@ -521,7 +563,6 @@ async def twilio_stream(websocket: WebSocket):
                 state["last_user"] = transcript
                 CALL_STATE[stream_sid] = state
 
-                # Route (calls our local /assistant/route by default)
                 reply = await call_fsm_router(transcript, meta={"stream_sid": stream_sid, "state": state})
                 logger.info(f"Router reply: {reply}")
 
