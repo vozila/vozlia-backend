@@ -10,6 +10,19 @@ import httpx
 import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import PlainTextResponse
+import signal
+
+@app.on_event("startup")
+async def _startup():
+    logger.info("APP STARTUP")
+
+@app.on_event("shutdown")
+async def _shutdown():
+    logger.warning("APP SHUTDOWN (process terminated)")
+
+def _handle_sigterm(*_):
+    logger.warning("SIGTERM received")
+signal.signal(signal.SIGTERM, _handle_sigterm)
 
 # -------------------------
 # Logging
