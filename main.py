@@ -6,8 +6,7 @@ import asyncio
 import logging
 import signal
 import re
-import random
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, Tuple
 
 import httpx
 import websockets
@@ -27,7 +26,6 @@ app = FastAPI()
 
 # -------------------------
 # Shared HTTP clients (performance)
-# NOTE: Do NOT use http2=True unless you install httpx[http2] (h2).
 # -------------------------
 openai_client: httpx.AsyncClient | None = None
 eleven_client: httpx.AsyncClient | None = None
@@ -61,20 +59,22 @@ DEEPGRAM_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "en-US")
 FINAL_UTTERANCE_COOLDOWN_MS = int(os.getenv("FINAL_UTTERANCE_COOLDOWN_MS", "450"))
 MIN_FINAL_CHARS = int(os.getenv("MIN_FINAL_CHARS", "2"))
 
+# OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-# Fallback model when OpenAI returns “reasoning-only” output or intermittent 500s
-OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
+# Optional: allow disabling reasoning if it causes "reasoning-only" outputs
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip().lower()
+# Values: "", "low", "medium", "high"
 
-# Retries/backoff
-OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
-OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "25"))
+# Voice / streaming safeguards
+# Twilio expects 20ms frames for 8k mulaw: 160 bytes
+TWILIO_FRAME_BYTES = 160
+TWILIO_FRAME_SECONDS = 0.02
 
-# Voice agent behavior
-VOICE_MAX_TOKENS = int(os.getenv("VOICE_MAX_TOKENS", "240"))
-VOICE_ACK_ENABLED = os.getenv("VOICE_ACK_ENABLED", "0").strip() == "1"
-VOICE_ACK_TEXT = os.getenv("VOICE_ACK_TEXT", "Okay.")
+# Keep TTS outputs short enough to avoid long “dead air” stretches
+MAX_SPOKEN_CHARS = int(os.getenv("MAX_SPOKEN_CHARS", "700"))  # ~45–60s depending on voice
+ACK_BEFORE_THINKING = os.getenv("ACK_BEFORE_THINKING", "0") == "1"  # optional
 
 # -------------------------
 # Lifecycle + SIGTERM
@@ -83,7 +83,7 @@ VOICE_ACK_TEXT = os.getenv("VOICE_ACK_TEXT", "Okay.")
 async def startup():
     global openai_client, eleven_client, router_client
     logger.info("APP STARTUP")
-    openai_client = httpx.AsyncClient(timeout=OPENAI_TIMEOUT_S)
+    openai_client = httpx.AsyncClient(timeout=25.0)
     eleven_client = httpx.AsyncClient(timeout=45.0)
     router_client = httpx.AsyncClient(timeout=25.0)
 
@@ -165,22 +165,42 @@ async def twilio_clear(twilio_ws: WebSocket, stream_sid: str):
     except Exception:
         logger.exception("Failed to send Twilio clear")
 
+def _trim_for_voice(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return "Okay."
+    if len(t) <= MAX_SPOKEN_CHARS:
+        return t
+    # Try to cut at a sentence boundary
+    cut = t[:MAX_SPOKEN_CHARS]
+    m = re.search(r"(.+?[.!?])\s", cut[::-1])  # reverse search is messy; do forward instead
+    # Simpler: find last sentence end in cut
+    last = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+    if last > 200:
+        return cut[: last + 1].strip() + " If you want, I can keep going."
+    return cut.strip() + "… If you want, I can keep going."
+
 async def stream_ulaw_audio_to_twilio(
     twilio_ws: WebSocket,
     stream_sid: str,
     ulaw_audio: bytes,
     cancel_event: asyncio.Event,
 ):
-    # 20ms @ 8kHz μ-law = 160 bytes
-    frame_size = 160
+    """
+    CRITICAL: pace the stream. Twilio media expects near-realtime audio.
+    Sending a whole TTS blob as fast as possible often makes the call sound dead or drop.
+    """
     idx = 0
-    while idx < len(ulaw_audio):
+    total = len(ulaw_audio)
+    while idx < total:
         if cancel_event.is_set():
             return
-        chunk = ulaw_audio[idx: idx + frame_size]
-        idx += frame_size
+        chunk = ulaw_audio[idx: idx + TWILIO_FRAME_BYTES]
+        idx += TWILIO_FRAME_BYTES
         msg = {"event": "media", "streamSid": stream_sid, "media": {"payload": _bytes_to_b64(chunk)}}
         await twilio_ws.send_text(json.dumps(msg))
+        # pace at 20ms per frame
+        await asyncio.sleep(TWILIO_FRAME_SECONDS)
 
 async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}?output_format=ulaw_8000"
@@ -208,10 +228,6 @@ async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
     return r.content
 
 async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> str:
-    """
-    By default FSM_ROUTER_URL points to our own /assistant/route,
-    but you can set it to a separate skills router later.
-    """
     payload = {"text": text, "meta": meta or {}}
     try:
         if router_client is None:
@@ -257,10 +273,14 @@ def _infer_topic(text: str) -> Optional[str]:
             return text[len(p):].strip(" .?!")
     return None
 
+def _normalize_short(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = re.sub(r"[^\w\s']", "", t).strip()
+    return t
+
 def _is_short_followup(text: str) -> bool:
-    # One to three words like: "breeds", "history", "price", "steps"
-    t = (text or "").strip()
-    t = re.sub(r"[^\w\s']", "", t.lower()).strip()
+    # One to three words like: "breeds", "history", "price", "steps", "habitat", "three"
+    t = _normalize_short(text)
     if not t:
         return False
     return len(t.split()) <= 3
@@ -269,173 +289,147 @@ def _is_short_followup(text: str) -> bool:
 # OpenAI helpers
 # -------------------------
 def _extract_openai_text(data: dict) -> str:
-    """
-    Responses API returns an 'output' array which can include messages, tool calls,
-    and reasoning items. We must aggregate all output_text blocks from message items.
-    """
-    out = data.get("output")
-    parts: List[str] = []
-
-    if isinstance(out, list):
-        for item in out:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") != "message":
-                continue
-            content = item.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "output_text":
-                    t = part.get("text")
-                    if isinstance(t, str) and t.strip():
-                        parts.append(t.strip())
-
-    joined = "\n".join(parts).strip()
-    if joined:
-        return joined
-
-    # Some SDKs expose response.output_text, but the raw API may not.
+    # Best-case: Responses API provides output_text directly
     ot = data.get("output_text")
     if isinstance(ot, str) and ot.strip():
         return ot.strip()
 
+    # Next: scan output items for message content
+    out = data.get("output")
+    if isinstance(out, list):
+        parts = []
+        for item in out:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        t = part.get("text")
+                        if isinstance(t, str) and t.strip():
+                            parts.append(t.strip())
+        joined = "\n".join(parts).strip()
+        if joined:
+            return joined
+
+    # Last: some server tiers put text in "text"
     t = data.get("text")
     if isinstance(t, str) and t.strip():
         return t.strip()
+    if isinstance(t, dict):
+        for k in ("value", "text", "content"):
+            v = t.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
 
     return ""
 
-def _summarize_output_types(data: dict) -> List[dict]:
-    """
-    For logging only: show item types and any content types.
-    """
+def _output_sample_types(data: dict) -> list:
     out = data.get("output")
-    if not isinstance(out, list):
-        return []
-    sample = []
-    for item in out[:3]:
-        if not isinstance(item, dict):
-            continue
-        itype = item.get("type")
-        ctypes = []
-        c = item.get("content")
-        if isinstance(c, list):
-            for p in c[:3]:
-                if isinstance(p, dict) and p.get("type"):
-                    ctypes.append(p.get("type"))
-        sample.append({"item_type": itype, "content_types": ctypes})
-    return sample
+    types = []
+    if isinstance(out, list):
+        for item in out[:3]:
+            if isinstance(item, dict):
+                types.append(
+                    {
+                        "item_type": item.get("type"),
+                        "content_types": [c.get("type") for c in (item.get("content") or []) if isinstance(c, dict)],
+                    }
+                )
+    return types
 
-async def _openai_post_with_retries(payload: dict) -> dict:
-    if openai_client is None:
-        client = httpx.AsyncClient(timeout=OPENAI_TIMEOUT_S)
-        close_client = True
-    else:
-        client = openai_client
-        close_client = False
-
+async def _openai_post(payload: dict) -> Tuple[int, dict, str]:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    last_err: Exception | None = None
+    if openai_client is None:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+    else:
+        r = await openai_client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
 
+    status = r.status_code
+    txt = r.text or ""
+    data = {}
     try:
-        for attempt in range(OPENAI_MAX_RETRIES + 1):
-            try:
-                r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-                r.raise_for_status()
-                return r.json()
-            except httpx.HTTPStatusError as e:
-                last_err = e
-                status = e.response.status_code if e.response is not None else None
-                # Retry on transient 5xx
-                if status is not None and 500 <= status <= 599 and attempt < OPENAI_MAX_RETRIES:
-                    backoff = (0.6 * (2 ** attempt)) + random.random() * 0.2
-                    logger.warning(f"OpenAI 5xx (status={status}); retrying in {backoff:.2f}s")
-                    await asyncio.sleep(backoff)
-                    continue
-                raise
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
-                last_err = e
-                if attempt < OPENAI_MAX_RETRIES:
-                    backoff = (0.6 * (2 ** attempt)) + random.random() * 0.2
-                    logger.warning(f"OpenAI network/timeout; retrying in {backoff:.2f}s")
-                    await asyncio.sleep(backoff)
-                    continue
-                raise
-
-        raise last_err or RuntimeError("OpenAI call failed")
-    finally:
-        if close_client:
-            await client.aclose()
+        data = r.json()
+    except Exception:
+        data = {}
+    if status >= 400:
+        # Raise after we capture details
+        r.raise_for_status()
+    return status, data, txt
 
 async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -> str:
     if not OPENAI_API_KEY:
         return "OpenAI isn’t configured yet. Set OPENAI_API_KEY in Render."
 
     st = state or {}
-    topic = (st.get("topic") or "").strip() or "unknown"
-    last_user = (st.get("last_user") or "").strip()
-    last_bot = (st.get("last_bot") or "").strip()
+    topic = st.get("topic") or "unknown"
+    last_user = st.get("last_user") or ""
+    last_bot = st.get("last_bot") or ""
 
-    # Use high-authority `instructions` per OpenAI docs. :contentReference[oaicite:3]{index=3}
-    instructions = (
+    # If user says a short follow-up, nudge the model to treat it as a follow-up
+    followup = _is_short_followup(user_text)
+
+    system = (
         "You are Vozlia, a calm, confident AI voice assistant.\n"
         "PHONE STYLE:\n"
         "- Answer immediately with a helpful response (1–3 sentences).\n"
-        "- If the user asks something broad, give a quick overview + offer up to 3 options.\n"
-        "- If the user gives a short follow-up like 'breeds', 'history', 'price', 'steps', 'care tips', etc.,\n"
-        "  interpret it in the context of the CURRENT TOPIC and continue.\n"
+        "- If broad, give a quick overview + offer up to 3 options.\n"
+        "- If the user gives a short follow-up (like 'breeds', 'history', 'steps', 'habitat', 'three'),\n"
+        "  interpret it in the context of the CURRENT_TOPIC and continue.\n"
         "- Do NOT say: 'Tell me what you want to know' or 'What would you like to do next?'\n"
-        "- Keep it natural, like a great phone assistant.\n"
-        "- Return plain text only.\n"
+        "- Keep responses short enough for voice; avoid long essays.\n"
     )
 
-    # Light context (helps follow-ups)
     context = (
         f"CURRENT_TOPIC: {topic}\n"
         f"LAST_USER: {last_user}\n"
         f"LAST_ASSISTANT: {last_bot}\n"
+        f"IS_SHORT_FOLLOWUP: {str(followup).lower()}\n"
     )
 
-    # If the user says a very short follow-up, nudge the model to treat it as continuation.
-    effective_user_text = user_text
-    if _is_short_followup(user_text) and topic != "unknown":
-        effective_user_text = f"Follow-up on topic '{topic}': {user_text}"
+    payload: dict = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "system", "content": context},
+            {"role": "user", "content": user_text},
+        ],
+        "max_output_tokens": 220,
+    }
 
-    async def _run(model_name: str) -> Tuple[str, dict]:
-        payload = {
-            "model": model_name,
-            "instructions": instructions,
-            # Lower reasoning for voice latency; still smart. :contentReference[oaicite:4]{index=4}
-            "reasoning": {"effort": "low"},
-            "input": [
-                {"role": "system", "content": context},
-                {"role": "user", "content": effective_user_text},
-            ],
-            "max_output_tokens": VOICE_MAX_TOKENS,
-        }
-        data = await _openai_post_with_retries(payload)
-        text_out = _extract_openai_text(data)
-        return text_out, data
+    # Optional reasoning. If it causes "reasoning-only" outputs, set OPENAI_REASONING_EFFORT="" in Render.
+    if OPENAI_REASONING_EFFORT in ("low", "medium", "high"):
+        payload["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
 
     try:
-        text1, data1 = await _run(OPENAI_MODEL)
-        if text1:
-            return text1
+        # First attempt
+        _, data, _raw = await _openai_post(payload)
+        text_out = _extract_openai_text(data)
+        if text_out:
+            return _trim_for_voice(text_out)
 
-        logger.warning(f"OpenAI parse failed. output_sample_types={_summarize_output_types(data1)}")
+        logger.warning(f"OpenAI parse failed. output_sample_types={_output_sample_types(data)}")
 
-        # Fallback model (often fixes “reasoning-only” outputs + transient weirdness)
-        if OPENAI_FALLBACK_MODEL and OPENAI_FALLBACK_MODEL != OPENAI_MODEL:
-            text2, data2 = await _run(OPENAI_FALLBACK_MODEL)
-            if text2:
-                logger.warning(f"Recovered via fallback model={OPENAI_FALLBACK_MODEL}")
-                return text2
-            logger.warning(f"Fallback parse failed. output_sample_types={_summarize_output_types(data2)}")
+        # Retry once: disable reasoning + force plain text
+        payload2 = dict(payload)
+        payload2.pop("reasoning", None)
+        payload2["input"] = [
+            {"role": "system", "content": system + "\nReturn plain text only."},
+            {"role": "system", "content": context},
+            {"role": "user", "content": user_text},
+        ]
+        _, data2, _raw2 = await _openai_post(payload2)
+        text_out2 = _extract_openai_text(data2)
+        if text_out2:
+            return _trim_for_voice(text_out2)
 
-        # Last resort (still phone-friendly)
-        return "I’m having trouble formatting my reply, but I did hear you. Please repeat that once."
+        logger.warning(f"OpenAI parse failed again. output_sample_types={_output_sample_types(data2)}")
+        return "I heard you — can you say that one more time in a single sentence?"
 
+    except httpx.HTTPStatusError as e:
+        logger.exception(f"OpenAI HTTP error: {e}")
+        return "I had trouble reaching my brain service. Please try again."
     except Exception as e:
         logger.exception(f"OpenAI reply failed: {e}")
         return "I had trouble reaching my brain service. Please try again."
@@ -454,10 +448,18 @@ async def assistant_route(request: Request):
     if not text:
         return {"spoken_reply": "I didn’t catch that. Can you say it again?", "intent": "general", "actions": [], "state": state}
 
-    # Infer/update topic from “tell me about X”, etc.
+    # Infer/update topic from explicit "tell me about X" style asks
     inferred = _infer_topic(text)
     if inferred:
         state["topic"] = inferred
+
+    # Also allow topic updates if user says "switch topic to X" or "new topic: X"
+    low = text.lower().strip()
+    m = re.search(r"(?:new topic|switch topic|topic is|topic:)\s*(.+)$", low)
+    if m:
+        cand = m.group(1).strip(" .?!")
+        if cand:
+            state["topic"] = cand
 
     reply = await openai_reply(text, state=state)
 
@@ -478,8 +480,10 @@ async def twilio_stream(websocket: WebSocket):
 
     dg_ws = None
     dg_task: Optional[asyncio.Task] = None
+
     speak_task: Optional[asyncio.Task] = None
     speak_cancel = asyncio.Event()
+    speak_lock = asyncio.Lock()
 
     last_final_ts = 0.0
     last_final_text = ""
@@ -500,29 +504,35 @@ async def twilio_stream(websocket: WebSocket):
         speak_cancel.clear()
 
     async def speak(text: str):
+        """
+        Serialize speech to avoid overlapping tasks and audio glitches.
+        Also trims overly-long text to reduce call “dead air”.
+        """
         nonlocal speak_task, assistant_speaking
         if not stream_sid:
             logger.warning("speak() called before stream_sid; skipping")
             return
 
-        await cancel_speaking()
+        async with speak_lock:
+            await cancel_speaking()
 
-        assistant_speaking = True
-        speak_cancel.clear()
+            assistant_speaking = True
+            speak_cancel.clear()
+            spoken = _trim_for_voice(text)
 
-        async def _run():
-            nonlocal assistant_speaking
-            try:
-                ulaw = await elevenlabs_tts_ulaw_bytes(text)
-                await stream_ulaw_audio_to_twilio(websocket, stream_sid, ulaw, speak_cancel)
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.exception(f"ElevenLabs/Twilio speak failed: {e}")
-            finally:
-                assistant_speaking = False
+            async def _run():
+                nonlocal assistant_speaking
+                try:
+                    ulaw = await elevenlabs_tts_ulaw_bytes(spoken)
+                    await stream_ulaw_audio_to_twilio(websocket, stream_sid, ulaw, speak_cancel)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.exception(f"ElevenLabs/Twilio speak failed: {e}")
+                finally:
+                    assistant_speaking = False
 
-        speak_task = asyncio.create_task(_run())
+            speak_task = asyncio.create_task(_run())
 
     async def deepgram_reader():
         nonlocal last_final_ts, last_final_text, assistant_speaking
@@ -545,7 +555,7 @@ async def twilio_stream(websocket: WebSocket):
 
                 is_final = bool(data.get("is_final"))
 
-                # barge-in: if user speaks while assistant talking
+                # barge-in: if user speaks while assistant talking (interim is enough)
                 if assistant_speaking and not is_final:
                     await cancel_speaking()
 
@@ -571,16 +581,17 @@ async def twilio_stream(websocket: WebSocket):
                 if not stream_sid:
                     continue
 
-                # Pull state for this call
+                # Optional: small acknowledgement BEFORE long thinking
+                if ACK_BEFORE_THINKING:
+                    try:
+                        await speak("Okay.")
+                    except Exception:
+                        pass
+
                 state = CALL_STATE.get(stream_sid) or {"topic": None, "last_user": "", "last_bot": ""}
                 state["last_user"] = transcript
                 CALL_STATE[stream_sid] = state
 
-                # Optional “ack” (can be annoying; default OFF)
-                if VOICE_ACK_ENABLED:
-                    await speak(VOICE_ACK_TEXT)
-
-                # Route (calls our local /assistant/route by default)
                 reply = await call_fsm_router(transcript, meta={"stream_sid": stream_sid, "state": state})
                 logger.info(f"Router reply: {reply}")
 
