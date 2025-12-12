@@ -130,29 +130,44 @@ async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> s
 async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
     """
     Returns μ-law 8k bytes suitable for Twilio streaming.
-    Uses ElevenLabs output_format=ulaw_8000.
+    Hard-forces output_format=ulaw_8000 and validates we did not receive MP3/WAV.
     """
     if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
         raise RuntimeError("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID")
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+    # IMPORTANT: output_format forced as QUERY PARAM (do not rely on JSON body for this)
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}?output_format=ulaw_8000"
+
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json",
-        "Accept": "audio/mulaw",
+        # Twilio expects audio/x-mulaw; request the same
+        "Accept": "audio/x-mulaw",
     }
+
     body = {
         "text": text,
         "model_id": ELEVENLABS_MODEL_ID,
-        "output_format": "ulaw_8000",
-        # optional voice settings
         "voice_settings": {"stability": 0.4, "similarity_boost": 0.75},
     }
 
     async with httpx.AsyncClient(timeout=45.0) as client:
         r = await client.post(url, headers=headers, json=body)
+        logger.info(f"ElevenLabs TTS status={r.status_code} content-type={r.headers.get('content-type')} len={len(r.content)}")
         r.raise_for_status()
-        return r.content
+        audio = r.content
+
+    # ---- Guardrails: catch wrong formats that cause STATIC ----
+    # MP3 often starts with "ID3" or 0xFF 0xFB frame sync
+    if audio[:3] == b"ID3" or (len(audio) > 2 and audio[0] == 0xFF and (audio[1] & 0xE0) == 0xE0):
+        raise RuntimeError("ElevenLabs returned MP3 audio; expected μ-law (ulaw_8000). This will sound like static in Twilio.")
+
+    # WAV starts with "RIFF"
+    if audio[:4] == b"RIFF":
+        raise RuntimeError("ElevenLabs returned WAV audio; expected μ-law (ulaw_8000). This will sound like static in Twilio.")
+
+    # μ-law has no fixed magic header; if we got here it's likely raw mulaw.
+    return audio
 
 
 async def stream_ulaw_audio_to_twilio(
@@ -180,7 +195,7 @@ async def stream_ulaw_audio_to_twilio(
             "media": {"payload": _bytes_to_b64(chunk)},
         }
         await twilio_ws.send_text(json.dumps(msg))
-        await asyncio.sleep(0.02)  # pace ~20ms
+        #await asyncio.sleep(0.02)  # pace ~20ms
 
 
 async def twilio_clear(twilio_ws: WebSocket, stream_sid: str):
