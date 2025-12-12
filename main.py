@@ -447,15 +447,150 @@ async def twilio_stream(websocket: WebSocket):
 # Placeholder router endpoint (optional)
 # If you already have /assistant/route elsewhere, you can remove this.
 # -------------------------
+# -------------------------
+# OpenAI brain + lightweight task store (drop-in)
+# -------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+
+# super-light "task engine" v0 (RAM only). Later you’ll persist to DB.
+TASKS = []  # list[dict]: {"text": str, "created_ts": float, "done": bool}
+
+def _classify_intent(text: str) -> str:
+    t = (text or "").lower().strip()
+    if any(k in t for k in ["email", "inbox", "gmail", "message from", "read my mail"]):
+        return "email"
+    if any(k in t for k in ["task", "todo", "to do", "remind me", "reminder", "add a task", "add task", "list tasks"]):
+        return "tasks"
+    if any(k in t for k in ["calendar", "appointment", "meeting", "schedule", "book me", "set up a call"]):
+        return "calendar"
+    return "general"
+
+async def openai_reply(user_text: str, meta: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Text-only brain response via OpenAI Responses API.
+    Uses Bearer auth and /v1/responses. :contentReference[oaicite:2]{index=2}
+    """
+    if not OPENAI_API_KEY:
+        return "OpenAI isn’t configured yet. Set OPENAI_API_KEY in Render."
+
+    system = (
+        "You are Vozlia, a calm, competent AI voice assistant for life and work. "
+        "Keep answers concise for phone calls. Ask one short follow-up question when needed. "
+        "If the user asks for emails or calendar, acknowledge and say you’ll use the connected tools, "
+        "but do not invent email contents."
+    )
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system},
+            # include small meta to give context without bloating tokens
+            {"role": "user", "content": f"User said: {user_text}\nMeta: {json.dumps(meta or {}, ensure_ascii=False)}"},
+        ],
+        # keep phone replies short
+        "max_output_tokens": 220,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+
+        # Responses API returns an output array with content parts; easiest is to use output_text when present
+        # (Some SDKs expose this; in raw JSON, we can safely extract text from output content parts.)
+        # We'll handle both patterns.
+        if isinstance(data, dict):
+            if isinstance(data.get("output_text"), str) and data["output_text"].strip():
+                return data["output_text"].strip()
+
+            out = data.get("output", [])
+            texts = []
+            for item in out:
+                for part in item.get("content", []) if isinstance(item, dict) else []:
+                    if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                        texts.append(part["text"])
+            joined = "\n".join(t.strip() for t in texts if t and t.strip()).strip()
+            if joined:
+                return joined
+
+        return "Okay—what would you like to do next?"
+
+    except Exception as e:
+        logger.exception(f"OpenAI reply failed: {e}")
+        return "I had trouble reaching my brain service. Please try again."
+
+
+# -------------------------
+# DROP-IN: replace your existing /assistant/route with this
+# -------------------------
 @app.post("/assistant/route")
 async def assistant_route(request: Request):
     body = await request.json()
     text = (body.get("text") or "").strip()
+    meta = body.get("meta") or {}
+
     if not text:
-        return {"spoken_reply": "I didn’t catch that. Please say it again."}
+        return {"spoken_reply": "I didn’t catch that. Can you say it again?", "intent": "general", "actions": []}
 
-    # Minimal fallback behavior (replace with your real FSM)
-    if "email" in text.lower():
-        return {"spoken_reply": "Email access is connected through the skills router. Tell me which inbox to read."}
+    intent = _classify_intent(text)
+    actions = []
 
-    return {"spoken_reply": f"You said: {text}. What would you like to do next?"}
+    # ---- TASKS (v0) ----
+    if intent == "tasks":
+        t = text.lower()
+
+        # list tasks
+        if "list" in t and "task" in t:
+            if not TASKS:
+                return {"spoken_reply": "You have no tasks right now.", "intent": "tasks", "actions": []}
+            lines = []
+            for i, task in enumerate(TASKS[-10:], start=max(1, len(TASKS) - 9)):
+                status = "done" if task.get("done") else "open"
+                lines.append(f"{i}. {task.get('text')} ({status})")
+            return {"spoken_reply": "Here are your latest tasks: " + " ".join(lines), "intent": "tasks", "actions": []}
+
+        # add task / reminder
+        # naive extraction: everything after "remind me to" or "add a task"
+        task_text = None
+        for key in ["remind me to", "add a task", "add task", "todo", "to do"]:
+            if key in t:
+                idx = t.find(key) + len(key)
+                task_text = text[idx:].strip(" :.-")
+                break
+
+        # fallback: if they said "task" but not clear
+        if not task_text or len(task_text) < 2:
+            return {"spoken_reply": "What’s the task you want to add?", "intent": "tasks", "actions": []}
+
+        TASKS.append({"text": task_text, "created_ts": time.time(), "done": False})
+        actions.append({"type": "task.create", "text": task_text})
+        return {"spoken_reply": f"Got it. I added: {task_text}.", "intent": "tasks", "actions": actions}
+
+    # ---- EMAIL (placeholder until Gmail is wired) ----
+    if intent == "email":
+        # Keep this honest until you re-enable Gmail integration
+        return {
+            "spoken_reply": "Okay. Email is next on my skills list. Do you want me to read your newest emails, or search for a sender or subject?",
+            "intent": "email",
+            "actions": [{"type": "email.request_clarification"}],
+        }
+
+    # ---- CALENDAR (placeholder) ----
+    if intent == "calendar":
+        return {
+            "spoken_reply": "Sure. Tell me the day and time you want, and who it’s with.",
+            "intent": "calendar",
+            "actions": [{"type": "calendar.request_details"}],
+        }
+
+    # ---- GENERAL: OpenAI brain ----
+    reply = await openai_reply(text, meta=meta)
+    return {"spoken_reply": reply, "intent": "general", "actions": []}
+
