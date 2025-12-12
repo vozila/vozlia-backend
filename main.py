@@ -6,7 +6,8 @@ import asyncio
 import logging
 import signal
 import re
-from typing import Optional, Dict, Any, List
+import random
+from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 import websockets
@@ -63,6 +64,18 @@ MIN_FINAL_CHARS = int(os.getenv("MIN_FINAL_CHARS", "2"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
+# Fallback model when OpenAI returns “reasoning-only” output or intermittent 500s
+OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
+
+# Retries/backoff
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
+OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "25"))
+
+# Voice agent behavior
+VOICE_MAX_TOKENS = int(os.getenv("VOICE_MAX_TOKENS", "240"))
+VOICE_ACK_ENABLED = os.getenv("VOICE_ACK_ENABLED", "0").strip() == "1"
+VOICE_ACK_TEXT = os.getenv("VOICE_ACK_TEXT", "Okay.")
+
 # -------------------------
 # Lifecycle + SIGTERM
 # -------------------------
@@ -70,7 +83,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 async def startup():
     global openai_client, eleven_client, router_client
     logger.info("APP STARTUP")
-    openai_client = httpx.AsyncClient(timeout=30.0)
+    openai_client = httpx.AsyncClient(timeout=OPENAI_TIMEOUT_S)
     eleven_client = httpx.AsyncClient(timeout=45.0)
     router_client = httpx.AsyncClient(timeout=25.0)
 
@@ -170,9 +183,6 @@ async def stream_ulaw_audio_to_twilio(
         await twilio_ws.send_text(json.dumps(msg))
 
 async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
-    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
-        raise RuntimeError("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID")
-
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}?output_format=ulaw_8000"
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
@@ -199,8 +209,8 @@ async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
 
 async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> str:
     """
-    Default points to our local /assistant/route (via FSM_ROUTER_URL),
-    so Twilio->Deepgram transcripts go through the same logic.
+    By default FSM_ROUTER_URL points to our own /assistant/route,
+    but you can set it to a separate skills router later.
     """
     payload = {"text": text, "meta": meta or {}}
     try:
@@ -260,14 +270,13 @@ def _is_short_followup(text: str) -> bool:
 # -------------------------
 def _extract_openai_text(data: dict) -> str:
     """
-    Responses API returns an 'output' array with items like:
-      - {type:'message', content:[{type:'output_text', text:'...'}], role:'assistant'}
-      - {type:'reasoning', ...}
-    We only want the assistant text.
+    Responses API returns an 'output' array which can include messages, tool calls,
+    and reasoning items. We must aggregate all output_text blocks from message items.
     """
     out = data.get("output")
+    parts: List[str] = []
+
     if isinstance(out, list):
-        parts: List[str] = []
         for item in out:
             if not isinstance(item, dict):
                 continue
@@ -281,129 +290,150 @@ def _extract_openai_text(data: dict) -> str:
                     t = part.get("text")
                     if isinstance(t, str) and t.strip():
                         parts.append(t.strip())
-        joined = "\n".join(parts).strip()
-        if joined:
-            return joined
 
-    # Sometimes providers include a 'text' field; keep as backup
+    joined = "\n".join(parts).strip()
+    if joined:
+        return joined
+
+    # Some SDKs expose response.output_text, but the raw API may not.
+    ot = data.get("output_text")
+    if isinstance(ot, str) and ot.strip():
+        return ot.strip()
+
     t = data.get("text")
     if isinstance(t, str) and t.strip():
         return t.strip()
 
     return ""
 
-def _output_item_types(data: dict) -> list[dict]:
+def _summarize_output_types(data: dict) -> List[dict]:
     """
-    Small debug helper for logs: show what types we got back.
+    For logging only: show item types and any content types.
     """
     out = data.get("output")
     if not isinstance(out, list):
         return []
     sample = []
-    for it in out[:3]:
-        if not isinstance(it, dict):
+    for item in out[:3]:
+        if not isinstance(item, dict):
             continue
-        content = it.get("content")
-        ct = []
-        if isinstance(content, list):
-            for c in content[:3]:
-                if isinstance(c, dict):
-                    ct.append(c.get("type"))
-        sample.append({"item_type": it.get("type"), "content_types": ct})
+        itype = item.get("type")
+        ctypes = []
+        c = item.get("content")
+        if isinstance(c, list):
+            for p in c[:3]:
+                if isinstance(p, dict) and p.get("type"):
+                    ctypes.append(p.get("type"))
+        sample.append({"item_type": itype, "content_types": ctypes})
     return sample
+
+async def _openai_post_with_retries(payload: dict) -> dict:
+    if openai_client is None:
+        client = httpx.AsyncClient(timeout=OPENAI_TIMEOUT_S)
+        close_client = True
+    else:
+        client = openai_client
+        close_client = False
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    last_err: Exception | None = None
+
+    try:
+        for attempt in range(OPENAI_MAX_RETRIES + 1):
+            try:
+                r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+                r.raise_for_status()
+                return r.json()
+            except httpx.HTTPStatusError as e:
+                last_err = e
+                status = e.response.status_code if e.response is not None else None
+                # Retry on transient 5xx
+                if status is not None and 500 <= status <= 599 and attempt < OPENAI_MAX_RETRIES:
+                    backoff = (0.6 * (2 ** attempt)) + random.random() * 0.2
+                    logger.warning(f"OpenAI 5xx (status={status}); retrying in {backoff:.2f}s")
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                last_err = e
+                if attempt < OPENAI_MAX_RETRIES:
+                    backoff = (0.6 * (2 ** attempt)) + random.random() * 0.2
+                    logger.warning(f"OpenAI network/timeout; retrying in {backoff:.2f}s")
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+
+        raise last_err or RuntimeError("OpenAI call failed")
+    finally:
+        if close_client:
+            await client.aclose()
 
 async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -> str:
     if not OPENAI_API_KEY:
         return "OpenAI isn’t configured yet. Set OPENAI_API_KEY in Render."
 
     st = state or {}
-    topic = st.get("topic") or "unknown"
-    last_user = st.get("last_user") or ""
-    last_bot = st.get("last_bot") or ""
+    topic = (st.get("topic") or "").strip() or "unknown"
+    last_user = (st.get("last_user") or "").strip()
+    last_bot = (st.get("last_bot") or "").strip()
 
-    # If user says a very short follow-up, prepend topic context to help continuity.
-    # (This prevents "Got it, tell me what you want" loops.)
-    composed_user = user_text
-    if _is_short_followup(user_text) and topic and topic != "unknown":
-        composed_user = f"Context topic: {topic}. The user follow-up is: {user_text}"
-
-    system = (
+    # Use high-authority `instructions` per OpenAI docs. :contentReference[oaicite:3]{index=3}
+    instructions = (
         "You are Vozlia, a calm, confident AI voice assistant.\n"
         "PHONE STYLE:\n"
         "- Answer immediately with a helpful response (1–3 sentences).\n"
         "- If the user asks something broad, give a quick overview + offer up to 3 options.\n"
-        "- If the user gives a short follow-up (1–3 words), interpret it in context and continue.\n"
+        "- If the user gives a short follow-up like 'breeds', 'history', 'price', 'steps', 'care tips', etc.,\n"
+        "  interpret it in the context of the CURRENT TOPIC and continue.\n"
         "- Do NOT say: 'Tell me what you want to know' or 'What would you like to do next?'\n"
-        "- Prefer being helpful over asking questions.\n"
+        "- Keep it natural, like a great phone assistant.\n"
+        "- Return plain text only.\n"
     )
 
+    # Light context (helps follow-ups)
     context = (
         f"CURRENT_TOPIC: {topic}\n"
         f"LAST_USER: {last_user}\n"
         f"LAST_ASSISTANT: {last_bot}\n"
     )
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    # If the user says a very short follow-up, nudge the model to treat it as continuation.
+    effective_user_text = user_text
+    if _is_short_followup(user_text) and topic != "unknown":
+        effective_user_text = f"Follow-up on topic '{topic}': {user_text}"
 
-    async def _post_with_retry(payload: dict, max_tries: int = 3) -> dict:
-        last_err: Exception | None = None
-        for attempt in range(1, max_tries + 1):
-            try:
-                if openai_client is None:
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-                else:
-                    r = await openai_client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-
-                # Retry on transient 5xx
-                if 500 <= r.status_code <= 599:
-                    raise httpx.HTTPStatusError(f"OpenAI {r.status_code}", request=r.request, response=r)
-
-                r.raise_for_status()
-                return r.json()
-
-            except Exception as e:
-                last_err = e
-                # basic backoff
-                await asyncio.sleep(0.35 * attempt)
-        raise last_err if last_err else RuntimeError("OpenAI request failed")
-
-    # IMPORTANT FIXES:
-    # - reasoning effort low (prevents "reasoning-only" outputs)
-    # - enough tokens for a spoken reply
-    base_payload = {
-        "model": OPENAI_MODEL,
-        "reasoning": {"effort": "low"},
-        "max_output_tokens": 550,
-        "input": [
-            {"role": "system", "content": system},
-            {"role": "system", "content": context},
-            {"role": "user", "content": composed_user},
-        ],
-    }
+    async def _run(model_name: str) -> Tuple[str, dict]:
+        payload = {
+            "model": model_name,
+            "instructions": instructions,
+            # Lower reasoning for voice latency; still smart. :contentReference[oaicite:4]{index=4}
+            "reasoning": {"effort": "low"},
+            "input": [
+                {"role": "system", "content": context},
+                {"role": "user", "content": effective_user_text},
+            ],
+            "max_output_tokens": VOICE_MAX_TOKENS,
+        }
+        data = await _openai_post_with_retries(payload)
+        text_out = _extract_openai_text(data)
+        return text_out, data
 
     try:
-        data = await _post_with_retry(base_payload, max_tries=3)
-        text_out = _extract_openai_text(data)
-        if text_out:
-            return text_out
+        text1, data1 = await _run(OPENAI_MODEL)
+        if text1:
+            return text1
 
-        logger.warning(f"OpenAI parse failed. output_sample_types={_output_item_types(data)}")
+        logger.warning(f"OpenAI parse failed. output_sample_types={_summarize_output_types(data1)}")
 
-        # Retry once more with stronger instruction + larger budget
-        payload2 = dict(base_payload)
-        payload2["max_output_tokens"] = 800
-        payload2["input"] = [
-            {"role": "system", "content": system + "\nReturn a direct answer in plain text."},
-            {"role": "system", "content": context},
-            {"role": "user", "content": composed_user},
-        ]
-        data2 = await _post_with_retry(payload2, max_tries=2)
-        text_out2 = _extract_openai_text(data2)
-        if text_out2:
-            return text_out2
+        # Fallback model (often fixes “reasoning-only” outputs + transient weirdness)
+        if OPENAI_FALLBACK_MODEL and OPENAI_FALLBACK_MODEL != OPENAI_MODEL:
+            text2, data2 = await _run(OPENAI_FALLBACK_MODEL)
+            if text2:
+                logger.warning(f"Recovered via fallback model={OPENAI_FALLBACK_MODEL}")
+                return text2
+            logger.warning(f"Fallback parse failed. output_sample_types={_summarize_output_types(data2)}")
 
-        logger.warning(f"OpenAI parse failed again. output_sample_types={_output_item_types(data2)}")
+        # Last resort (still phone-friendly)
         return "I’m having trouble formatting my reply, but I did hear you. Please repeat that once."
 
     except Exception as e:
@@ -424,17 +454,16 @@ async def assistant_route(request: Request):
     if not text:
         return {"spoken_reply": "I didn’t catch that. Can you say it again?", "intent": "general", "actions": [], "state": state}
 
+    # Infer/update topic from “tell me about X”, etc.
     inferred = _infer_topic(text)
     if inferred:
         state["topic"] = inferred
 
-    # Keep last turn context updated before calling the model (helps continuity)
-    # but don’t overwrite last_bot yet.
-    state["last_user"] = text
-
     reply = await openai_reply(text, state=state)
 
+    state["last_user"] = text
     state["last_bot"] = reply
+
     return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
 
 # -------------------------
@@ -547,6 +576,11 @@ async def twilio_stream(websocket: WebSocket):
                 state["last_user"] = transcript
                 CALL_STATE[stream_sid] = state
 
+                # Optional “ack” (can be annoying; default OFF)
+                if VOICE_ACK_ENABLED:
+                    await speak(VOICE_ACK_TEXT)
+
+                # Route (calls our local /assistant/route by default)
                 reply = await call_fsm_router(transcript, meta={"stream_sid": stream_sid, "state": state})
                 logger.info(f"Router reply: {reply}")
 
