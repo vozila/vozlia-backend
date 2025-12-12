@@ -6,7 +6,7 @@ import asyncio
 import logging
 import signal
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import httpx
 import websockets
@@ -70,7 +70,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 async def startup():
     global openai_client, eleven_client, router_client
     logger.info("APP STARTUP")
-    openai_client = httpx.AsyncClient(timeout=25.0)
+    openai_client = httpx.AsyncClient(timeout=30.0)
     eleven_client = httpx.AsyncClient(timeout=45.0)
     router_client = httpx.AsyncClient(timeout=25.0)
 
@@ -158,7 +158,8 @@ async def stream_ulaw_audio_to_twilio(
     ulaw_audio: bytes,
     cancel_event: asyncio.Event,
 ):
-    frame_size = 160  # 20ms @ 8kHz μ-law
+    # 20ms @ 8kHz μ-law = 160 bytes
+    frame_size = 160
     idx = 0
     while idx < len(ulaw_audio):
         if cancel_event.is_set():
@@ -169,6 +170,9 @@ async def stream_ulaw_audio_to_twilio(
         await twilio_ws.send_text(json.dumps(msg))
 
 async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
+    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
+        raise RuntimeError("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID")
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}?output_format=ulaw_8000"
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
@@ -194,6 +198,10 @@ async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
     return r.content
 
 async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Default points to our local /assistant/route (via FSM_ROUTER_URL),
+    so Twilio->Deepgram transcripts go through the same logic.
+    """
     payload = {"text": text, "meta": meta or {}}
     try:
         if router_client is None:
@@ -240,6 +248,7 @@ def _infer_topic(text: str) -> Optional[str]:
     return None
 
 def _is_short_followup(text: str) -> bool:
+    # One to three words like: "breeds", "history", "price", "steps"
     t = (text or "").strip()
     t = re.sub(r"[^\w\s']", "", t.lower()).strip()
     if not t:
@@ -251,101 +260,57 @@ def _is_short_followup(text: str) -> bool:
 # -------------------------
 def _extract_openai_text(data: dict) -> str:
     """
-    Robust extraction for OpenAI Responses API across multiple shapes.
-    Handles:
-      - output[*].content[*].type == "output_text"
-      - output[*].content[*].type == "text" / "message" with nested text
-      - output_text at top level
-      - text at top level (str/list/dict)
+    Responses API returns an 'output' array with items like:
+      - {type:'message', content:[{type:'output_text', text:'...'}], role:'assistant'}
+      - {type:'reasoning', ...}
+    We only want the assistant text.
     """
-    texts: list[str] = []
-
-    def add(s: Any):
-        if isinstance(s, str):
-            s2 = s.strip()
-            if s2:
-                texts.append(s2)
-
-    # 0) direct convenience fields
-    add(data.get("output_text"))
-    add(data.get("text"))
-
-    # 1) output array
     out = data.get("output")
     if isinstance(out, list):
+        parts: List[str] = []
         for item in out:
             if not isinstance(item, dict):
                 continue
-
-            add(item.get("text"))
-            add(item.get("output_text"))
-
+            if item.get("type") != "message":
+                continue
             content = item.get("content")
             if not isinstance(content, list):
                 continue
-
             for part in content:
-                if not isinstance(part, dict):
-                    continue
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    t = part.get("text")
+                    if isinstance(t, str) and t.strip():
+                        parts.append(t.strip())
+        joined = "\n".join(parts).strip()
+        if joined:
+            return joined
 
-                ptype = part.get("type")
-
-                if ptype == "output_text":
-                    add(part.get("text"))
-                    continue
-
-                if ptype in ("text", "message"):
-                    add(part.get("text"))
-                    add(part.get("content"))
-                    continue
-
-                # Nested variants: {"text":{"value":"..."}}
-                t = part.get("text")
-                if isinstance(t, dict):
-                    add(t.get("value"))
-                    add(t.get("text"))
-                    add(t.get("content"))
-
-                # {"content":[{"type":"text","text":"..."}]}
-                inner = part.get("content")
-                if isinstance(inner, list):
-                    for p2 in inner:
-                        if not isinstance(p2, dict):
-                            continue
-                        add(p2.get("text"))
-                        if isinstance(p2.get("text"), dict):
-                            add(p2["text"].get("value"))
-
-    # 2) Sometimes "text" is a list of blocks
+    # Sometimes providers include a 'text' field; keep as backup
     t = data.get("text")
-    if isinstance(t, list):
-        for blk in t:
-            if isinstance(blk, str):
-                add(blk)
-            elif isinstance(blk, dict):
-                add(blk.get("text"))
-                add(blk.get("value"))
-                add(blk.get("content"))
+    if isinstance(t, str) and t.strip():
+        return t.strip()
 
-    return "\n".join(texts).strip()
+    return ""
 
-def _log_openai_parse_failure(data: dict, label: str = "OpenAI parse failed"):
-    try:
-        sample = data.get("output", [])
-        sample_types = []
-        if isinstance(sample, list):
-            for it in sample[:2]:
-                if isinstance(it, dict):
-                    c = it.get("content")
-                    c_types = []
-                    if isinstance(c, list):
-                        for p in c[:3]:
-                            if isinstance(p, dict):
-                                c_types.append(p.get("type"))
-                    sample_types.append({"item_type": it.get("type"), "content_types": c_types})
-        logger.warning(f"{label}. output_sample_types={sample_types}")
-    except Exception:
-        logger.warning(f"{label} (could not sample output).")
+def _output_item_types(data: dict) -> list[dict]:
+    """
+    Small debug helper for logs: show what types we got back.
+    """
+    out = data.get("output")
+    if not isinstance(out, list):
+        return []
+    sample = []
+    for it in out[:3]:
+        if not isinstance(it, dict):
+            continue
+        content = it.get("content")
+        ct = []
+        if isinstance(content, list):
+            for c in content[:3]:
+                if isinstance(c, dict):
+                    ct.append(c.get("type"))
+        sample.append({"item_type": it.get("type"), "content_types": ct})
+    return sample
 
 async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -> str:
     if not OPENAI_API_KEY:
@@ -356,14 +321,20 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
     last_user = st.get("last_user") or ""
     last_bot = st.get("last_bot") or ""
 
+    # If user says a very short follow-up, prepend topic context to help continuity.
+    # (This prevents "Got it, tell me what you want" loops.)
+    composed_user = user_text
+    if _is_short_followup(user_text) and topic and topic != "unknown":
+        composed_user = f"Context topic: {topic}. The user follow-up is: {user_text}"
+
     system = (
         "You are Vozlia, a calm, confident AI voice assistant.\n"
         "PHONE STYLE:\n"
         "- Answer immediately with a helpful response (1–3 sentences).\n"
         "- If the user asks something broad, give a quick overview + offer up to 3 options.\n"
-        "- If the user gives a short follow-up like 'breeds', 'history', 'price', 'steps', 'care tips', etc.,\n"
-        "  interpret it in the context of the CURRENT TOPIC and continue.\n"
+        "- If the user gives a short follow-up (1–3 words), interpret it in context and continue.\n"
         "- Do NOT say: 'Tell me what you want to know' or 'What would you like to do next?'\n"
+        "- Prefer being helpful over asking questions.\n"
     )
 
     context = (
@@ -372,49 +343,67 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
         f"LAST_ASSISTANT: {last_bot}\n"
     )
 
-    payload = {
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
+    async def _post_with_retry(payload: dict, max_tries: int = 3) -> dict:
+        last_err: Exception | None = None
+        for attempt in range(1, max_tries + 1):
+            try:
+                if openai_client is None:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+                else:
+                    r = await openai_client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+
+                # Retry on transient 5xx
+                if 500 <= r.status_code <= 599:
+                    raise httpx.HTTPStatusError(f"OpenAI {r.status_code}", request=r.request, response=r)
+
+                r.raise_for_status()
+                return r.json()
+
+            except Exception as e:
+                last_err = e
+                # basic backoff
+                await asyncio.sleep(0.35 * attempt)
+        raise last_err if last_err else RuntimeError("OpenAI request failed")
+
+    # IMPORTANT FIXES:
+    # - reasoning effort low (prevents "reasoning-only" outputs)
+    # - enough tokens for a spoken reply
+    base_payload = {
         "model": OPENAI_MODEL,
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 550,
         "input": [
             {"role": "system", "content": system},
             {"role": "system", "content": context},
-            {"role": "user", "content": user_text},
+            {"role": "user", "content": composed_user},
         ],
-        "max_output_tokens": 220,
     }
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-
-    async def _call(p: dict) -> dict:
-        if openai_client is None:
-            async with httpx.AsyncClient(timeout=25.0) as client:
-                r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=p)
-        else:
-            r = await openai_client.post("https://api.openai.com/v1/responses", headers=headers, json=p)
-        r.raise_for_status()
-        return r.json()
-
     try:
-        data = await _call(payload)
+        data = await _post_with_retry(base_payload, max_tries=3)
         text_out = _extract_openai_text(data)
         if text_out:
             return text_out
 
-        _log_openai_parse_failure(data, "OpenAI parse failed")
+        logger.warning(f"OpenAI parse failed. output_sample_types={_output_item_types(data)}")
 
-        # Retry once with explicit plain text instruction
-        payload2 = dict(payload)
+        # Retry once more with stronger instruction + larger budget
+        payload2 = dict(base_payload)
+        payload2["max_output_tokens"] = 800
         payload2["input"] = [
-            {"role": "system", "content": system + "\nReturn plain text only."},
+            {"role": "system", "content": system + "\nReturn a direct answer in plain text."},
             {"role": "system", "content": context},
-            {"role": "user", "content": user_text},
+            {"role": "user", "content": composed_user},
         ]
-        data2 = await _call(payload2)
+        data2 = await _post_with_retry(payload2, max_tries=2)
         text_out2 = _extract_openai_text(data2)
         if text_out2:
             return text_out2
 
-        _log_openai_parse_failure(data2, "OpenAI parse failed again")
-
+        logger.warning(f"OpenAI parse failed again. output_sample_types={_output_item_types(data2)}")
         return "I’m having trouble formatting my reply, but I did hear you. Please repeat that once."
 
     except Exception as e:
@@ -435,22 +424,17 @@ async def assistant_route(request: Request):
     if not text:
         return {"spoken_reply": "I didn’t catch that. Can you say it again?", "intent": "general", "actions": [], "state": state}
 
-    # Infer/update topic
     inferred = _infer_topic(text)
     if inferred:
         state["topic"] = inferred
 
-    # If user gives a short follow-up and we already have a topic, treat it as a continuation
-    # by enriching the user_text before sending to OpenAI (helps "breeds", "pros and cons", etc.)
-    user_text_for_llm = text
-    if _is_short_followup(text) and state.get("topic"):
-        user_text_for_llm = f"About {state['topic']}: {text}"
-
-    reply = await openai_reply(user_text_for_llm, state=state)
-
+    # Keep last turn context updated before calling the model (helps continuity)
+    # but don’t overwrite last_bot yet.
     state["last_user"] = text
-    state["last_bot"] = reply
 
+    reply = await openai_reply(text, state=state)
+
+    state["last_bot"] = reply
     return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
 
 # -------------------------
