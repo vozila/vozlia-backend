@@ -1344,7 +1344,6 @@ async def synthesize_with_elevenlabs(text: str) -> bytes:
         logger.exception("Error calling ElevenLabs TTS: %s", e)
         return b""
 
-
 # ---------- Twilio media stream ↔ Deepgram STT ↔ ElevenLabs TTS ----------
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
@@ -1372,7 +1371,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # ---------- Helper: send one 20ms frame of μ-law audio to Twilio ----------
     async def send_one_frame_to_twilio():
-        nonlocal tts_buffer
+        nonlocal tts_buffer, stream_sid
 
         if not stream_sid:
             return
@@ -1392,187 +1391,145 @@ async def twilio_stream(websocket: WebSocket):
         await websocket.send_text(json.dumps(msg))
 
     # ---------- Helper: Twilio → Deepgram (audio in) ----------
-   async def twilio_rx_loop():
-    nonlocal stream_sid, call_active, deepgram_ws, tts_buffer
+    async def twilio_rx_loop():
+        nonlocal stream_sid, call_active, deepgram_ws
 
-    try:
-        async for msg in websocket.iter_text():
-            # -------------------------
-            # Parse incoming Twilio WS
-            # -------------------------
-            try:
-                data = json.loads(msg)
-            except json.JSONDecodeError:
-                logger.warning("Non-JSON frame from Twilio: %r", msg)
-                continue
-
-            event_type = data.get("event")
-
-            # -------------------------
-            # CONNECTED
-            # -------------------------
-            if event_type == "connected":
-                logger.info("Twilio stream event: connected")
-                logger.info("Twilio reports call connected")
-
-            # -------------------------
-            # START (stream begins)
-            # -------------------------
-            elif event_type == "start":
-                start = data.get("start", {}) or {}
-                stream_sid = start.get("streamSid")
-                logger.info("Twilio stream event: start (streamSid=%s)", stream_sid)
-
-                # Connect to Deepgram
-                if deepgram_ws is None:
-                    deepgram_ws = await connect_deepgram_stream()
-
-                # ---------------------------------------------
-                # 🔊 Initial Greeting (ElevenLabs TTS)
-                # ---------------------------------------------
+        try:
+            async for msg in websocket.iter_text():
                 try:
-                    greeting = (
-                        "Hi, this is Vozlia. How can I help you today?"
-                    )
-                    audio_bytes = await synthesize_with_elevenlabs(greeting)
-
-                    if audio_bytes:
-                        tts_buffer.clear()
-                        tts_buffer.extend(audio_bytes)
-                        logger.info(
-                            "Queued initial greeting (%d bytes) into TTS buffer",
-                            len(audio_bytes)
-                        )
-                    else:
-                        logger.error("No audio returned from ElevenLabs for greeting.")
-                except Exception:
-                    logger.exception("Error generating initial greeting via ElevenLabs")
-
-            # -------------------------
-            # MEDIA (audio from caller)
-            # -------------------------
-            elif event_type == "media":
-                if not deepgram_ws:
-                    continue  # Deepgram not ready yet
-
-                media = data.get("media", {}) or {}
-                payload = media.get("payload")
-                if not payload:
+                    data = json.loads(msg)
+                except json.JSONDecodeError:
+                    logger.warning("Non-JSON frame from Twilio: %r", msg)
                     continue
 
-                try:
-                    audio_bytes = base64.b64decode(payload)
-                except Exception:
-                    logger.exception("Failed to base64-decode Twilio payload")
-                    continue
+                event_type = data.get("event")
 
-                # Forward raw μ-law audio to Deepgram
-                try:
-                    await deepgram_ws.send(audio_bytes)
-                except Exception:
-                    logger.exception("Error sending audio to Deepgram")
+                if event_type == "connected":
+                    logger.info("Twilio stream event: connected")
+                    logger.info("Twilio reports call connected")
+
+                elif event_type == "start":
+                    start = data.get("start", {}) or {}
+                    stream_sid = start.get("streamSid")
+                    logger.info("Twilio stream event: start (streamSid=%s)", stream_sid)
+
+                    # Connect to Deepgram when call starts
+                    if deepgram_ws is None:
+                        deepgram_ws = await connect_deepgram_stream()
+
+                elif event_type == "media":
+                    if not deepgram_ws:
+                        # If Deepgram isn't ready yet, drop this chunk (rare)
+                        continue
+
+                    media = data.get("media", {}) or {}
+                    payload = media.get("payload")
+                    if not payload:
+                        continue
+
+                    try:
+                        audio_bytes = base64.b64decode(payload)
+                    except Exception:
+                        logger.exception("Failed to base64-decode Twilio payload")
+                        continue
+
+                    # Send raw μ-law bytes to Deepgram
+                    try:
+                        await deepgram_ws.send(audio_bytes)
+                    except Exception:
+                        logger.exception("Error sending audio to Deepgram")
+                        break
+
+                elif event_type == "stop":
+                    logger.info("Twilio stream event: stop")
+                    logger.info("Twilio sent stop; closing call.")
+                    call_active = False
                     break
 
-            # -------------------------
-            # STOP
-            # -------------------------
-            elif event_type == "stop":
-                logger.info("Twilio stream event: stop")
-                logger.info("Twilio sent stop; closing call.")
-                call_active = False
-                break
-
-    except WebSocketDisconnect:
-        logger.info("Twilio WebSocket disconnected")
-        call_active = False
-
-    except Exception:
-        logger.exception("Error in Twilio RX loop")
-        call_active = False
+        except WebSocketDisconnect:
+            logger.info("Twilio WebSocket disconnected")
+            call_active = False
+        except Exception:
+            logger.exception("Error in Twilio RX loop")
+            call_active = False
 
     # ---------- Helper: Deepgram → FSM/GPT → ElevenLabs ----------
     async def deepgram_rx_loop():
-    """
-    Receive transcription events from Deepgram.
-    When Deepgram signals a final utterance (speech_final=True),
-    call FSM/GPT backend → synthesize with ElevenLabs → load into tts_buffer.
-    """
-    nonlocal call_active, tts_buffer, deepgram_ws
+        nonlocal call_active, tts_buffer, deepgram_ws
 
-    if deepgram_ws is None:
-        return  # Call may end before Deepgram connects
+        if deepgram_ws is None:
+            # Call might hang up before Deepgram connects
+            return
 
-    try:
-        async for raw in deepgram_ws:
-            # Deepgram always sends JSON text frames for transcripts
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning("Deepgram sent non-JSON frame: %r", raw)
-                continue
-
-            # Event must have a channel.alternatives[0].transcript
-            channel = event.get("channel", {}) or {}
-            alts = channel.get("alternatives", [])
-            if not alts:
-                continue
-
-            transcript = alts[0].get("transcript", "")
-            transcript = (transcript or "").strip()
-            if not transcript:
-                continue
-
-            is_final = event.get("is_final", False)
-            speech_final = event.get("speech_final", False)
-
-            logger.info(
-                "Deepgram transcript (final=%s speech_final=%s): %r",
-                is_final,
-                speech_final,
-                transcript,
-            )
-
-            # We ONLY react when Deepgram says the utterance is **complete**
-            if speech_final:
+        try:
+            async for raw in deepgram_ws:
+                # Deepgram sends JSON text frames for transcripts
                 try:
-                    # Call your backend router (FSM+skills)
-                    fsm_data = await call_fsm_router(
-                        text=transcript,
-                        context={"channel": "phone"},
-                    )
-                    spoken_reply = fsm_data.get("spoken_reply") or (
-                        "I heard you but I'm not sure how to respond."
-                    )
-                    logger.info("FSM spoken_reply: %r", spoken_reply)
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("Non-JSON frame from Deepgram: %r", raw)
+                    continue
 
-                except Exception:
-                    logger.exception("Error calling /assistant/route")
-                    spoken_reply = (
-                        "Something went wrong while checking that. "
-                        "Please try again in a moment."
-                    )
+                # Expect transcripts in channel.alternatives[0].transcript
+                channel = event.get("channel", {}) or {}
+                alts = channel.get("alternatives", [])
+                if not alts:
+                    continue
 
-                # Synthesize TTS using ElevenLabs
-                audio_bytes = await synthesize_with_elevenlabs(spoken_reply)
+                transcript = alts[0].get("transcript", "") or ""
+                transcript = transcript.strip()
+                if not transcript:
+                    continue
 
-                if audio_bytes:
-                    # Overwrite any previous audio
-                    tts_buffer.clear()
-                    tts_buffer.extend(audio_bytes)
-                else:
-                    logger.error("TTS returned no audio bytes")
+                is_final = event.get("is_final", False)
+                speech_final = event.get("speech_final", False)
 
-            # Stop loop if call is no longer active
-            if not call_active:
-                break
+                logger.info(
+                    "Deepgram transcript (final=%s speech_final=%s): %r",
+                    is_final,
+                    speech_final,
+                    transcript,
+                )
 
-    except websockets.ConnectionClosed:
-        logger.info("Deepgram WebSocket closed")
-    except Exception:
-        logger.exception("Error in Deepgram RX loop")
-    finally:
-        call_active = False
+                # Only react when Deepgram signals utterance is complete
+                if speech_final:
+                    try:
+                        # Call your backend router (FSM+skills)
+                        fsm_data = await call_fsm_router(
+                            text=transcript,
+                            context={"channel": "phone"},
+                        )
+                        spoken_reply = fsm_data.get("spoken_reply") or (
+                            "I heard you but I'm not sure how to respond."
+                        )
+                        logger.info("FSM spoken_reply: %r", spoken_reply)
 
+                    except Exception:
+                        logger.exception("Error calling /assistant/route")
+                        spoken_reply = (
+                            "Something went wrong while checking that. "
+                            "Please try again in a moment."
+                        )
+
+                    # Synthesize TTS using ElevenLabs
+                    audio_bytes = await synthesize_with_elevenlabs(spoken_reply)
+
+                    if audio_bytes:
+                        # Overwrite any previous audio
+                        tts_buffer.clear()
+                        tts_buffer.extend(audio_bytes)
+                    else:
+                        logger.error("TTS returned no audio bytes")
+
+                if not call_active:
+                    break
+
+        except websockets.ConnectionClosed:
+            logger.info("Deepgram WebSocket closed")
+        except Exception:
+            logger.exception("Error in Deepgram RX loop")
+        finally:
+            call_active = False
 
     # ---------- Helper: Twilio TX loop (send TTS frames) ----------
     async def twilio_tx_loop():
@@ -1589,18 +1546,12 @@ async def twilio_stream(websocket: WebSocket):
             call_active = False
 
     # ---------- Main orchestration ----------
+    deepgram_ws = None
     try:
-        # ✅ Connect to Deepgram BEFORE starting the loops
-        deepgram_ws = await connect_deepgram_stream()
-
-        # Start all three loops concurrently:
-        #  - Twilio RX: audio from Twilio → Deepgram
-        #  - Deepgram RX: transcripts → FSM/GPT → ElevenLabs → tts_buffer
-        #  - Twilio TX: tts_buffer → Twilio audio frames
         await asyncio.gather(
-            twilio_rx_loop(),
-            deepgram_rx_loop(),
-            twilio_tx_loop(),
+            twilio_rx_loop(),   # Twilio → Deepgram
+            deepgram_rx_loop(), # Deepgram → FSM/GPT → ElevenLabs → tts_buffer
+            twilio_tx_loop(),   # tts_buffer → Twilio
         )
     finally:
         # Clean up Deepgram & Twilio sockets
