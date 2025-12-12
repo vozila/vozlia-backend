@@ -12,39 +12,34 @@ import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import PlainTextResponse
 
-
 # -------------------------
 # Logging
 # -------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vozlia")
 
-
 # -------------------------
 # App
 # -------------------------
 app = FastAPI()
 
-
 # -------------------------
 # Shared HTTP clients (performance)
+# NOTE: Do NOT use http2=True unless you install httpx[http2] (h2).
 # -------------------------
 openai_client: httpx.AsyncClient | None = None
 eleven_client: httpx.AsyncClient | None = None
 router_client: httpx.AsyncClient | None = None
-
 
 # -------------------------
 # Per-call state (session memory)
 # -------------------------
 CALL_STATE: dict[str, dict] = {}  # streamSid -> {"topic": str|None, "last_user": str, "last_bot": str}
 
-
 # -------------------------
 # Env / Config
 # -------------------------
 PORT = int(os.getenv("PORT", "10000"))
-
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://vozlia-backend.onrender.com").rstrip("/")
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
@@ -66,7 +61,6 @@ MIN_FINAL_CHARS = int(os.getenv("MIN_FINAL_CHARS", "2"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-
 # -------------------------
 # Lifecycle + SIGTERM
 # -------------------------
@@ -74,10 +68,10 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 async def startup():
     global openai_client, eleven_client, router_client
     logger.info("APP STARTUP")
-    openai_client = httpx.AsyncClient(timeout=25.0, http2=True)
-    eleven_client = httpx.AsyncClient(timeout=45.0, http2=True)
-    router_client = httpx.AsyncClient(timeout=25.0, http2=True)
-
+    # http2=True requires `h2` dependency. Keep it off for Render simplicity.
+    openai_client = httpx.AsyncClient(timeout=25.0)
+    eleven_client = httpx.AsyncClient(timeout=45.0)
+    router_client = httpx.AsyncClient(timeout=25.0)
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -90,13 +84,10 @@ async def shutdown():
     if router_client:
         await router_client.aclose()
 
-
 def _handle_sigterm(*_):
     logger.warning("SIGTERM received")
 
-
 signal.signal(signal.SIGTERM, _handle_sigterm)
-
 
 # -------------------------
 # Basic endpoints
@@ -105,11 +96,9 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 def root():
     return {"ok": True, "service": "vozlia-backend", "pipeline": "twilio->deepgram->openai->elevenlabs"}
 
-
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
-
 
 # -------------------------
 # Twilio inbound (TwiML)
@@ -134,17 +123,14 @@ async def twilio_inbound(request: Request):
 """
     return PlainTextResponse(twiml, media_type="application/xml")
 
-
 # -------------------------
 # Helpers
 # -------------------------
 def _b64_to_bytes(b64: str) -> bytes:
     return base64.b64decode(b64.encode("utf-8"))
 
-
 def _bytes_to_b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("utf-8")
-
 
 def deepgram_ws_url() -> str:
     params = (
@@ -159,13 +145,11 @@ def deepgram_ws_url() -> str:
     )
     return f"wss://api.deepgram.com/v1/listen?{params}"
 
-
 async def twilio_clear(twilio_ws: WebSocket, stream_sid: str):
     try:
         await twilio_ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
     except Exception:
         logger.exception("Failed to send Twilio clear")
-
 
 async def stream_ulaw_audio_to_twilio(
     twilio_ws: WebSocket,
@@ -173,7 +157,7 @@ async def stream_ulaw_audio_to_twilio(
     ulaw_audio: bytes,
     cancel_event: asyncio.Event,
 ):
-    frame_size = 160  # 20ms at 8kHz μ-law
+    frame_size = 160  # 20ms @ 8kHz μ-law
     idx = 0
     while idx < len(ulaw_audio):
         if cancel_event.is_set():
@@ -182,8 +166,6 @@ async def stream_ulaw_audio_to_twilio(
         idx += frame_size
         msg = {"event": "media", "streamSid": stream_sid, "media": {"payload": _bytes_to_b64(chunk)}}
         await twilio_ws.send_text(json.dumps(msg))
-        # No sleep; Twilio buffers fine and sleeps can make barge-in feel sluggish.
-
 
 async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}?output_format=ulaw_8000"
@@ -205,11 +187,8 @@ async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
         r = await eleven_client.post(url, headers=headers, json=body)
 
     r.raise_for_status()
-    logger.info(
-        f"ElevenLabs OK: content-type={r.headers.get('content-type')} bytes={len(r.content)} first10={r.content[:10]}"
-    )
+    logger.info(f"ElevenLabs OK: content-type={r.headers.get('content-type')} bytes={len(r.content)} first10={r.content[:10]}")
     return r.content
-
 
 async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> str:
     payload = {"text": text, "meta": meta or {}}
@@ -236,25 +215,11 @@ async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> s
         logger.exception(f"FSM router call failed: {e}")
         return "I’m having trouble reaching my skills service right now. Please try again."
 
-
 # -------------------------
-# OpenAI helpers + Tasks (optional)
+# OpenAI helpers
 # -------------------------
-TASKS = []  # RAM-only v0
-
-
-def _classify_intent(text: str) -> str:
-    t = (text or "").lower().strip()
-    if any(k in t for k in ["email", "inbox", "gmail", "read my email", "read my mail"]):
-        return "email"
-    if any(k in t for k in ["task", "todo", "to do", "remind me", "reminder", "add a task", "list tasks"]):
-        return "tasks"
-    if any(k in t for k in ["calendar", "appointment", "meeting", "schedule", "book me", "set up a call"]):
-        return "calendar"
-    return "general"
-
-
 def _extract_openai_text(data: dict) -> str:
+    # 1) output -> content -> output_text
     out = data.get("output")
     if isinstance(out, list):
         parts = []
@@ -273,27 +238,35 @@ def _extract_openai_text(data: dict) -> str:
         if joined:
             return joined
 
-    # Your logs show "text" exists in responses sometimes
+    # 2) data["text"] can be str, list, or dict depending on server tier/format
     t = data.get("text")
     if isinstance(t, str) and t.strip():
         return t.strip()
+    if isinstance(t, dict):
+        # common shapes: {"value": "..."} or {"text": "..."}
+        for k in ("value", "text", "content"):
+            v = t.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
     if isinstance(t, list):
         parts = []
         for blk in t:
             if isinstance(blk, str) and blk.strip():
                 parts.append(blk.strip())
-            elif isinstance(blk, dict) and isinstance(blk.get("text"), str):
-                parts.append(blk["text"].strip())
+            elif isinstance(blk, dict):
+                v = blk.get("text") or blk.get("value") or blk.get("content")
+                if isinstance(v, str) and v.strip():
+                    parts.append(v.strip())
         joined = "\n".join([p for p in parts if p]).strip()
         if joined:
             return joined
 
+    # 3) fallback
     ot = data.get("output_text")
     if isinstance(ot, str) and ot.strip():
         return ot.strip()
 
     return ""
-
 
 async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -> str:
     if not OPENAI_API_KEY:
@@ -302,11 +275,11 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
     topic = (state or {}).get("topic") or "none"
 
     system = (
-        "You are Vozlia, a calm, competent AI voice assistant for life and work. "
-        "PHONE RULES: Answer first in 1–2 sentences. "
+        "You are Vozlia, a calm, confident AI voice assistant. "
+        "PHONE RULES: answer first in 1–2 sentences. "
+        "Do NOT ask clarifying questions unless absolutely required. "
         "Do NOT end with 'what would you like to do next'. "
-        "Avoid clarifying questions unless absolutely necessary. "
-        "If the user says 'just tell me' or 'I don't know', give a helpful short answer anyway. "
+        "If user asks something broad, give a short overview + 2 options. "
         f"Current topic: {topic}."
     )
 
@@ -316,7 +289,7 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
         ],
-        "max_output_tokens": 160,
+        "max_output_tokens": 180,
     }
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -342,9 +315,8 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
         logger.exception(f"OpenAI reply failed: {e}")
         return "I had trouble reaching my brain service. Please try again."
 
-
 # -------------------------
-# Router endpoint (in same service)
+# Router endpoint (THIS is where the behavior is enforced)
 # -------------------------
 @app.post("/assistant/route")
 async def assistant_route(request: Request):
@@ -354,80 +326,56 @@ async def assistant_route(request: Request):
     state = (meta.get("state") if isinstance(meta, dict) else None) or {"topic": None, "last_user": "", "last_bot": ""}
 
     if not text:
-        return {"spoken_reply": "I didn’t catch that. Can you say it again?", "intent": "general", "actions": []}
+        return {"spoken_reply": "I didn’t catch that. Can you say it again?", "intent": "general", "actions": [], "state": state}
 
     low = text.lower()
 
-    # Topic lock
-    if "cat" in low or "cats" in low:
+    # ---- Topic lock: cats (more robust) ----
+    if "cat" in low or "cats" in low or "cat breeds" in low:
         state["topic"] = "cats"
-
     topic = state.get("topic")
 
-    # Answer-first: cats overview
-    if topic == "cats" and any(
-        p in low for p in ["tell me about cats", "learn about cats", "cats", "just tell", "i don't know"]
-    ):
-        reply = (
-            "Cats are intelligent, curious animals that often bond strongly with people. "
-            "Most of what matters day to day is diet, play, litter hygiene, and regular vet care. "
-            "Want care, behavior, or breeds?"
-        )
-        return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
+    # ---- Hard guardrail: cat breeds request should NOT go to OpenAI clarifiers ----
+    # Catch many phrasings: "learn about cat breeds", "tell me about cat breeds", "summarize cat breeds"
+    if ("breed" in low or "breeds" in low) and (("cat" in low) or topic == "cats"):
+        # If they asked to summarize, do a concise summary rather than asking registry/species
+        if any(k in low for k in ["summarize", "summary", "different breeds", "all cat breeds", "all breeds"]):
+            reply = (
+                "There are dozens of recognized cat breeds, but here’s a clean overview by type: "
+                "1) Longhair: Maine Coon, Persian, Ragdoll. "
+                "2) Shorthair: British Shorthair, American Shorthair, Russian Blue. "
+                "3) Vocal/social: Siamese, Oriental Shorthair. "
+                "4) Active/athletic: Bengal, Abyssinian. "
+                "5) Unique coats: Sphynx (hairless), Devon Rex (curly). "
+                "If you tell me your vibe—calm, playful, low-shedding—I’ll recommend 2–3 perfect matches."
+            )
+            return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
 
-    # Disambiguation: breeds within cats topic
-    if topic == "cats" and ("breed" in low or "breeds" in low):
         reply = (
-            "Popular cat breeds include Maine Coon, Ragdoll, British Shorthair, Siamese, Persian, Bengal, and Sphynx. "
+            "Sure. Popular cat breeds include Maine Coon, Ragdoll, British Shorthair, Siamese, Persian, Bengal, and Sphynx. "
             "Do you want a calm family cat, a playful cat, or low-shedding?"
         )
         return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
 
-    intent = _classify_intent(text)
+    # ---- Answer-first: open-ended cats requests (broadened) ----
+    if topic == "cats" and (
+        "learn about" in low
+        or "tell me about" in low
+        or "about cats" in low
+        or low.strip() in ["cats", "cats.", "cat", "cat."]
+        or "just tell" in low
+        or "i don't know" in low
+    ):
+        reply = (
+            "Cats are intelligent, curious animals that often bond strongly with people. "
+            "Day to day, the big keys are good food, daily play, clean litter, and regular vet care. "
+            "Want care tips, behavior, or breeds?"
+        )
+        return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
 
-    # Tasks v0 (optional)
-    if intent == "tasks":
-        t = low
-        if "list" in t and "task" in t:
-            if not TASKS:
-                return {"spoken_reply": "You have no tasks right now.", "intent": "tasks", "actions": [], "state": state}
-            lines = []
-            for i, task in enumerate(TASKS[-10:], start=max(1, len(TASKS) - 9)):
-                lines.append(f"{i}. {task.get('text')}")
-            return {"spoken_reply": "Your latest tasks are: " + " ".join(lines), "intent": "tasks", "actions": [], "state": state}
-
-        task_text = None
-        for key in ["remind me to", "add a task", "add task", "todo", "to do"]:
-            if key in t:
-                idx = t.find(key) + len(key)
-                task_text = text[idx:].strip(" :.-")
-                break
-
-        if not task_text or len(task_text) < 2:
-            return {"spoken_reply": "What’s the task you want to add?", "intent": "tasks", "actions": [], "state": state}
-
-        TASKS.append({"text": task_text, "created_ts": time.time(), "done": False})
-        return {"spoken_reply": f"Done. I added: {task_text}.", "intent": "tasks", "actions": [{"type": "task.create"}], "state": state}
-
-    if intent == "email":
-        return {
-            "spoken_reply": "Got it. Do you want me to read your newest emails, or search by sender or subject?",
-            "intent": "email",
-            "actions": [{"type": "email.request_clarification"}],
-            "state": state,
-        }
-
-    if intent == "calendar":
-        return {
-            "spoken_reply": "Sure. Tell me the day and time you want, and who it’s with.",
-            "intent": "calendar",
-            "actions": [{"type": "calendar.request_details"}],
-            "state": state,
-        }
-
+    # ---- Default: OpenAI ----
     reply = await openai_reply(text, state=state)
     return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
-
 
 # -------------------------
 # Twilio stream WebSocket
@@ -534,10 +482,9 @@ async def twilio_stream(websocket: WebSocket):
                 if not stream_sid:
                     continue
 
-                # Lively: instant ack while router/OpenAI runs
+                # Lively: instant ack
                 await speak("Okay.")
 
-                # Load state and pass it to router
                 state = CALL_STATE.get(stream_sid) or {"topic": None, "last_user": "", "last_bot": ""}
                 state["last_user"] = transcript
                 CALL_STATE[stream_sid] = state
@@ -556,7 +503,6 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception(f"Deepgram reader error: {e}")
 
     try:
-        # Deepgram connect
         if not DEEPGRAM_API_KEY:
             logger.error("Missing DEEPGRAM_API_KEY; cannot transcribe")
         else:
@@ -572,7 +518,6 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("Connected to Deepgram realtime.")
             dg_task = asyncio.create_task(deepgram_reader())
 
-        # Twilio event loop
         while True:
             raw = await websocket.receive_text()
             evt = json.loads(raw)
@@ -585,7 +530,6 @@ async def twilio_stream(websocket: WebSocket):
             if etype == "start":
                 stream_sid = evt.get("start", {}).get("streamSid")
                 logger.info(f"Twilio stream event: start (streamSid={stream_sid})")
-
                 if stream_sid:
                     CALL_STATE[stream_sid] = {"topic": None, "last_user": "", "last_bot": ""}
 
@@ -635,10 +579,6 @@ async def twilio_stream(websocket: WebSocket):
         try:
             await websocket.close()
         except Exception:
-            pass
-
-        if stream_sid and stream_sid in CALL_STATE:
-            # optional cleanup
             pass
 
         logger.info("Twilio media stream handler completed")
