@@ -1130,7 +1130,7 @@ FRAME_INTERVAL = FRAME_MS / 1000.0  # 0.020 seconds
 
 # Prebuffer at start of each utterance to smooth jitter
 # 4 frames = 80 ms
-PREBUFFER_FRAMES = 4
+PREBUFFER_FRAMES = 10  # ~200ms; reduces pops/underruns on cellular networks
 PREBUFFER_BYTES = PREBUFFER_FRAMES * BYTES_PER_FRAME
 
 # Limit how far ahead we've sent audio to Twilio (in seconds)
