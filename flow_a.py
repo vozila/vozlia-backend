@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import time
+import re
 from typing import Optional, Callable, Any, Dict
 
 import websockets
@@ -15,6 +16,23 @@ EMAIL_KEYWORDS_LOCAL = [
     "emails today","read the email","read that email","read it","just read it",
     "read the first message","read the first email","read the message",
 ]
+
+# Phrases that usually refer to the *current* email context (after a list/summary):
+FOLLOWUP_EMAIL_PHRASES = [
+    "read that",
+    "read it",
+    "read this",
+    "open that",
+    "open it",
+    "show that",
+    "show it",
+    "what does it say",
+    "what does that say",
+    "the one from",
+    "from klarna",
+    "from alibaba",
+]
+
 
 FOLLOWUP_EMAIL_PHRASES = {
     "read it","just read it","read that","read that email","read the email",
@@ -39,15 +57,27 @@ def _looks_like_email_intent(text: str, email_context_active: bool) -> bool:
         return False
     n = _normalize_text(text)
 
+    # Strong signals (works even without prior email context)
+    if re.search(r"\b(email|emails|inbox|gmail|messages|message)\b", n) and re.search(r"\b(read|check|list|open|show|summari[sz]e|search|find)\b", n):
+        return True
+
+    # Common keyword substrings
     for kw in EMAIL_KEYWORDS_LOCAL:
         if kw in n:
             return True
 
+    # Requests like: 'read the email from Klarna', 'first message from Alibaba'
+    if re.search(r"\b(read|open|show)\b.*\b(email|message)\b.*\bfrom\b", n):
+        return True
+    if re.search(r"\b(first|latest|recent)\b.*\b(email|message)\b", n) and re.search(r"\b(read|open|show)\b", n):
+        return True
+
+    # Follow-ups after an email summary/list was just spoken
     if email_context_active:
         for p in FOLLOWUP_EMAIL_PHRASES:
-            if n.startswith(p) or p in n:
+            if n.startswith(p) or (p in n):
                 return True
-        if "from" in n and ("read" in n or "open" in n):
+        if re.search(r"\b(that|this|it)\b", n) and re.search(r"\b(read|open|show)\b", n):
             return True
 
     if "how many" in n and ("mail" in n or "message" in n or "inbox" in n):
@@ -129,6 +159,7 @@ def register_flow_a(
         stream_sid: Optional[str] = None
 
         audio_buffer = bytearray()
+        stop_event = asyncio.Event()  # set when Twilio sends 'stop' or websocket closes
         prebuffer_active = True
         barge_in_enabled = False
         assistant_last_audio_time = 0.0
@@ -186,7 +217,7 @@ def register_flow_a(
             late_ms_max = 0.0
             last_stats = time.monotonic()
 
-            while True:
+            while not stop_event.is_set():
                 if stream_sid is None:
                     await asyncio.sleep(0.01)
                     continue
@@ -393,6 +424,7 @@ def register_flow_a(
 
                     elif event_type == "stop":
                         logger.info("Twilio sent stop; closing call.")
+                        stop_event.set()
                         break
             except WebSocketDisconnect:
                 logger.info("Twilio WebSocket disconnected")
@@ -403,6 +435,11 @@ def register_flow_a(
             openai_ws = await create_realtime_session()
             await asyncio.gather(openai_loop(), twilio_loop())
         finally:
+            stop_event.set()
+            try:
+                await openai_ws.close()
+            except Exception:
+                pass
             try:
                 sender_task.cancel()
             except Exception:
