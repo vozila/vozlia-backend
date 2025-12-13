@@ -1283,11 +1283,15 @@ async def twilio_stream(websocket: WebSocket):
     openai_ws: Optional[websockets.WebSocketClientProtocol] = None
     stream_sid: Optional[str] = None
 
-    # Track Twilio WebSocket lifecycle so background sender exits cleanly
-    twilio_ws_closed: bool = False
-
     # After we first start sending assistant audio, we allow barge-in
     barge_in_enabled: bool = False
+
+    # Lifecycle flag: becomes True when Twilio sends stop or disconnects.
+    # Used to stop background sender tasks cleanly.
+    twilio_ws_closed: bool = False
+
+    # Only run one transcript action at a time (avoid overlapping Gmail fetches).
+    transcript_action_task: Optional[asyncio.Task] = None
 
     # Server VAD-based user speech flag (from OpenAI events)
     user_speaking_vad: bool = False
@@ -1302,9 +1306,6 @@ async def twilio_stream(websocket: WebSocket):
     # Response tracking
     active_response_id: Optional[str] = None  # The single "currently active" response
     allowed_response_ids: set[str] = set()    # (kept for future use, mostly logging)
-
-    # Background task for handling transcripts (prevents blocking the OpenAI receive loop)
-    transcript_action_task: Optional[asyncio.Task] = None
 
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
@@ -1379,10 +1380,8 @@ async def twilio_stream(websocket: WebSocket):
 
         try:
             while True:
-                # Exit cleanly once Twilio WebSocket is closed (prevents send-after-close crashes)
                 if twilio_ws_closed:
                     return
-
                 if stream_sid is None:
                     await asyncio.sleep(0.01)
                     continue
@@ -1460,12 +1459,11 @@ async def twilio_stream(websocket: WebSocket):
                     try:
                         await send_audio_to_twilio()
                     except WebSocketDisconnect:
-                        logger.info("Twilio WebSocket closed; stopping audio sender task")
+                        logger.info('Twilio WebSocket closed; stopping audio sender task')
                         return
                     except Exception:
-                        logger.exception("Error sending audio to Twilio; stopping sender")
+                        logger.exception('Error sending audio to Twilio; stopping sender')
                         return
-
                     frame_idx += 1
                     frames_sent_interval += 1
                 else:
@@ -1525,7 +1523,6 @@ async def twilio_stream(websocket: WebSocket):
         active_response_id = None
         await twilio_clear_buffer()
         audio_buffer.clear()
-        prebuffer_active = True
 
     # --- Intent helpers ------------------------------------------------------
     EMAIL_KEYWORDS_LOCAL = [
@@ -1645,7 +1642,6 @@ async def twilio_stream(websocket: WebSocket):
                 reason,
             )
             audio_buffer.clear()
-        prebuffer_active = True
             prebuffer_active = True
             return
 
@@ -1655,7 +1651,6 @@ async def twilio_stream(websocket: WebSocket):
                 reason,
             )
             audio_buffer.clear()
-        prebuffer_active = True
             prebuffer_active = True
             return
 
@@ -1677,7 +1672,6 @@ async def twilio_stream(websocket: WebSocket):
         # Locally consider it dead either way
         active_response_id = None
         audio_buffer.clear()
-        prebuffer_active = True
         prebuffer_active = True
 
     # --- Helpers: create responses ------------------------------------------
@@ -1736,34 +1730,32 @@ async def twilio_stream(websocket: WebSocket):
         }))
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
-
     async def create_email_processing_ack():
         """
-        Immediately acknowledge an email request so the caller isn't left in silence
-        while the backend fetches Gmail.
-
-        Important:
-        - Keep this VERY short (one sentence).
-        - Do not mention tools/APIs.
-        - It's OK if it overlaps slightly with backend work; we will replace it with the
-          real email summary response once ready.
+        Speak a very short acknowledgement so the caller isn't left in silence
+        while the backend fetches and summarizes email.
         """
-        # Cancel any active response to avoid active-response conflicts.
-        await _cancel_active_and_clear_buffer("email_processing_ack")
+        if not openai_ws:
+            return
 
+        # Keep this extremely short and end quickly.
         instructions = (
-            "You are Vozlia on a live phone call. In ONE short sentence, acknowledge "
-            "that you are checking the caller's email now and there may be a brief pause. "
+            "You are Vozlia on a live phone call. "
+            "The caller just asked you to check their email. "
+            "Say ONE short sentence acknowledging you're checking now, like "
+            "'Okay — I’m checking your email now; one moment.' "
             "Then stop speaking and wait."
         )
 
-        await openai_ws.send(json.dumps({
-            "type": "response.create",
-            "response": {
-                "instructions": instructions,
-            },
-        }))
-        logger.info("Sent email processing acknowledgement into Realtime session")
+        # Do NOT cancel/clear here; we want this to work even if no active response.
+        try:
+            await openai_ws.send(json.dumps({
+                "type": "response.create",
+                "response": {"instructions": instructions},
+            }))
+            logger.info("Sent email processing acknowledgement into Realtime session")
+        except Exception:
+            logger.exception("Failed to send email processing acknowledgement")
 
 
     # --- Helper: handle transcripts from Realtime ---------------------------
@@ -1787,14 +1779,6 @@ async def twilio_stream(websocket: WebSocket):
                 "Debounce: transcript looks like an email/skill request; "
                 "routing to FSM + backend."
             )
-
-            # Immediately acknowledge so caller isn't left in silence while Gmail loads.
-            try:
-                await create_email_processing_ack()
-            except Exception:
-                logger.exception("Failed to send email processing acknowledgement")
-
-            # Now fetch the backend-driven summary.
             spoken_reply = await route_to_fsm_and_get_reply(transcript)
             if spoken_reply:
                 await create_fsm_spoken_reply(spoken_reply)
@@ -1908,18 +1892,17 @@ async def twilio_stream(websocket: WebSocket):
                     logger.info("OpenAI VAD: user speech STOP")
 
                 elif etype == "conversation.item.input_audio_transcription.completed":
-                    # Handle transcript → FSM or generic.
-                    # Important: do NOT block the OpenAI receive loop while we wait on Gmail/FSM.
+                    # Handle transcript → FSM or generic in a background task.
+                    # This prevents long Gmail fetches from stalling the OpenAI receive loop.
                     if transcript_action_task and not transcript_action_task.done():
                         transcript_action_task.cancel()
                     transcript_action_task = asyncio.create_task(handle_transcript_event(event))
 
                 elif etype == "error":
                     err = (event.get("error") or {})
-                    code_ = err.get("code")
-                    if code_ == "response_cancel_not_active":
-                        # Expected race in Realtime; do not treat as fatal.
-                        logger.info("OpenAI cancel race (non-fatal): %s", err.get("message"))
+                    code = err.get("code")
+                    if code == "response_cancel_not_active":
+                        logger.info("OpenAI cancel race (expected): %s", event)
                     else:
                         logger.error("OpenAI error event: %s", event)
 
@@ -1930,7 +1913,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Twilio event loop ---------------------------------------------------
     async def twilio_loop():
-        nonlocal stream_sid, prebuffer_active, openai_ws
+        nonlocal stream_sid, prebuffer_active, openai_ws, twilio_ws_closed
 
         try:
             async for msg in websocket.iter_text():
