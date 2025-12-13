@@ -1274,6 +1274,9 @@ async def twilio_stream(websocket: WebSocket):
     """
 
     await websocket.accept()
+
+    sender_task = None  # will be started after helper defs
+ 
     logger.info("Twilio media stream connected")
 
     # --- Call + AI state -----------------------------------------------------
@@ -1347,7 +1350,85 @@ async def twilio_stream(websocket: WebSocket):
         await websocket.send_text(json.dumps(msg))
         assistant_last_audio_time = time.monotonic()
 
+
+    # --- Background task: paced audio sender to Twilio ----------------------
+    async def twilio_audio_sender():
+        """Send assistant audio to Twilio at real-time cadence.
+
+        Prevents Twilio from buffering too far ahead (which breaks barge-in).
+        """
+        nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled
+
+        next_send_time = time.monotonic()
+        frames_sent = 0
+        play_start_ts = None
+
+        try:
+            while True:
+                if stream_sid is None:
+                    await asyncio.sleep(0.01)
+                    continue
+
+                now = time.monotonic()
+
+                # Pace: one frame every 20ms
+                if now < next_send_time:
+                    await asyncio.sleep(min(0.01, next_send_time - now))
+                    continue
+
+                # Backlog cap: approximate how far ahead we've sent audio.
+                if play_start_ts is None:
+                    play_start_ts = now
+                    frames_sent = 0
+
+                call_elapsed = now - play_start_ts
+                audio_sent_duration = frames_sent * FRAME_INTERVAL
+                backlog_seconds = audio_sent_duration - call_elapsed
+
+                if backlog_seconds > MAX_TWILIO_BACKLOG_SECONDS:
+                    await asyncio.sleep(0.01)
+                    next_send_time = time.monotonic()
+                    continue
+
+                if len(audio_buffer) >= BYTES_PER_FRAME:
+                    # Prebuffer at start of utterance
+                    if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
+                        await asyncio.sleep(0.005)
+                        continue
+                    elif prebuffer_active and len(audio_buffer) >= PREBUFFER_BYTES:
+                        prebuffer_active = False
+                        logger.info("Prebuffer complete; starting to send audio to Twilio")
+
+                        if not barge_in_enabled:
+                            barge_in_enabled = True
+                            logger.info("Barge-in is now ENABLED (audio streaming started).")
+
+                    await send_audio_to_twilio()
+                    frames_sent += 1
+                    next_send_time = time.monotonic() + FRAME_INTERVAL
+                else:
+                    await asyncio.sleep(0.005)
+                    if play_start_ts is not None and (time.monotonic() - assistant_last_audio_time) > 1.0:
+                        play_start_ts = None
+
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("twilio_audio_sender crashed")
+            return
+    sender_task = asyncio.create_task(twilio_audio_sender())
+
+
     # --- Helper: barge-in ----------------------------------------------------
+
+    async def twilio_clear_buffer():
+        """Tell Twilio Media Streams to immediately drop any queued audio."""
+        if stream_sid is None:
+            return
+        try:
+            await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+        except Exception:
+            logger.exception("Failed to send Twilio clear")
     async def handle_barge_in():
         """
         Called when OpenAI VAD says user started speaking while assistant is talking.
@@ -1379,6 +1460,7 @@ async def twilio_stream(websocket: WebSocket):
 
         # Locally "kill" the current response:
         active_response_id = None
+        await twilio_clear_buffer()
         audio_buffer.clear()
 
     # --- Intent helpers ------------------------------------------------------
@@ -1686,8 +1768,7 @@ async def twilio_stream(websocket: WebSocket):
 
                     # Accumulate bytes, then ship them to Twilio in 20ms frames.
                     audio_buffer.extend(delta_bytes)
-                    while len(audio_buffer) >= BYTES_PER_FRAME:
-                        await send_audio_to_twilio()
+                    # NOTE: audio is sent by the paced background sender task
 
                 elif etype == "response.output_text.delta":
                     # Debug: log any text content the model generates,
@@ -1801,6 +1882,11 @@ async def twilio_stream(websocket: WebSocket):
         )
 
     finally:
+
+        try:
+            sender_task.cancel()
+        except Exception:
+            pass
         try:
             if openai_ws is not None:
                 await openai_ws.close()
