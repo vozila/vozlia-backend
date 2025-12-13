@@ -1315,33 +1315,29 @@ async def twilio_stream(websocket: WebSocket):
         return False
 
     # --- Helper: send μ-law audio TO Twilio ---------------------------------
+    
+    # --- Helper: send μ-law audio TO Twilio ---------------------------------
     async def send_audio_to_twilio():
-        nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled
+        """
+        Sends EXACTLY one 20ms (160-byte) μ-law frame to Twilio.
 
-        if stream_sid is None or not audio_buffer:
+        IMPORTANT:
+        - This function must NOT do pacing (that's handled by twilio_audio_sender).
+        - This function must NOT do prebuffer gating (also handled by sender).
+        - All other code should only append to audio_buffer; only the sender task
+          calls this to actually emit audio.
+        """
+        nonlocal audio_buffer, assistant_last_audio_time
+
+        if stream_sid is None:
+            return
+        if len(audio_buffer) < BYTES_PER_FRAME:
             return
 
-        # Prebuffer: wait until we have at least PREBUFFER_BYTES, then start streaming
-        if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
-            return
-        elif prebuffer_active and len(audio_buffer) >= PREBUFFER_BYTES:
-            prebuffer_active = False
-            logger.info("Prebuffer complete; starting to send audio to Twilio")
+        frame = bytes(audio_buffer[:BYTES_PER_FRAME])
+        del audio_buffer[:BYTES_PER_FRAME]
 
-            # 🔓 As soon as we actually start speaking,
-            # allow the caller to barge in.
-            if not barge_in_enabled:
-                barge_in_enabled = True
-                logger.info("Barge-in is now ENABLED (audio streaming started).")
-
-        # Always send exactly one 20ms frame (160 bytes) per call
-        chunk = bytes(audio_buffer[:BYTES_PER_FRAME])  # 20ms at 8kHz μ-law
-        audio_buffer = audio_buffer[BYTES_PER_FRAME:]
-
-        if not chunk:
-            return
-
-        payload = base64.b64encode(chunk).decode("ascii")
+        payload = base64.b64encode(frame).decode("ascii")
         msg = {
             "event": "media",
             "streamSid": stream_sid,
@@ -1351,17 +1347,29 @@ async def twilio_stream(websocket: WebSocket):
         assistant_last_audio_time = time.monotonic()
 
 
+    
     # --- Background task: paced audio sender to Twilio ----------------------
     async def twilio_audio_sender():
-        """Send assistant audio to Twilio at real-time cadence.
+        """
+        Send assistant audio to Twilio at real-time cadence with strict 20ms framing.
 
-        Prevents Twilio from buffering too far ahead (which breaks barge-in).
+        Goals:
+        - Always send 160-byte μ-law frames (20ms @ 8kHz).
+        - Use deadline-based pacing (monotonic schedule) to avoid jitter drift.
+        - Cap how far ahead Twilio can be buffered (limits barge-in "tail").
+        - Add ultra-low-frequency stats (1 line/sec) to diagnose underruns/jitter.
         """
         nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled
 
-        next_send_time = time.monotonic()
-        frames_sent = 0
-        play_start_ts = None
+        # Utterance pacing state
+        send_start_ts: Optional[float] = None
+        frame_idx: int = 0  # total frames sent for current utterance
+
+        # Low-frequency diagnostics (per 1s window)
+        last_stat_ts: float = time.monotonic()
+        frames_sent_interval: int = 0
+        underruns: int = 0
+        late_ms_max: float = 0.0
 
         try:
             while True:
@@ -1371,52 +1379,89 @@ async def twilio_stream(websocket: WebSocket):
 
                 now = time.monotonic()
 
-                # Pace: one frame every 20ms
-                if now < next_send_time:
-                    await asyncio.sleep(min(0.01, next_send_time - now))
+                # Emit 1Hz stats (safe: no per-frame logs)
+                if now - last_stat_ts >= 1.0:
+                    logger.info(
+                        "twilio_send stats: q_bytes=%d frames_sent=%d underruns=%d late_ms_max=%.1f prebuf=%s",
+                        len(audio_buffer),
+                        frames_sent_interval,
+                        underruns,
+                        late_ms_max,
+                        prebuffer_active,
+                    )
+                    last_stat_ts = now
+                    frames_sent_interval = 0
+                    underruns = 0
+                    late_ms_max = 0.0
+
+                # If we have no audio queued, reset pacing state when idle
+                if len(audio_buffer) == 0:
+                    # If we haven't sent audio recently, treat this as idle
+                    if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) > 1.0:
+                        send_start_ts = None
+                        frame_idx = 0
+                    await asyncio.sleep(0.005)
                     continue
 
-                # Backlog cap: approximate how far ahead we've sent audio.
-                if play_start_ts is None:
-                    play_start_ts = now
-                    frames_sent = 0
-
-                call_elapsed = now - play_start_ts
-                audio_sent_duration = frames_sent * FRAME_INTERVAL
-                backlog_seconds = audio_sent_duration - call_elapsed
-
-                if backlog_seconds > MAX_TWILIO_BACKLOG_SECONDS:
-                    await asyncio.sleep(0.01)
-                    next_send_time = time.monotonic()
-                    continue
-
-                if len(audio_buffer) >= BYTES_PER_FRAME:
-                    # Prebuffer at start of utterance
-                    if prebuffer_active and len(audio_buffer) < PREBUFFER_BYTES:
+                # Prebuffer at the start of each utterance to smooth jitter
+                if prebuffer_active:
+                    if len(audio_buffer) < PREBUFFER_BYTES:
                         await asyncio.sleep(0.005)
                         continue
-                    elif prebuffer_active and len(audio_buffer) >= PREBUFFER_BYTES:
-                        prebuffer_active = False
-                        logger.info("Prebuffer complete; starting to send audio to Twilio")
 
-                        if not barge_in_enabled:
-                            barge_in_enabled = True
-                            logger.info("Barge-in is now ENABLED (audio streaming started).")
+                    prebuffer_active = False
+                    logger.info("Prebuffer complete; starting to send audio to Twilio")
+                    if not barge_in_enabled:
+                        barge_in_enabled = True
+                        logger.info("Barge-in is now ENABLED (audio streaming started).")
 
-                    await send_audio_to_twilio()
-                    frames_sent += 1
-                    next_send_time = time.monotonic() + FRAME_INTERVAL
-                else:
+                    # Initialize pacing at the moment we begin sending
+                    send_start_ts = time.monotonic()
+                    frame_idx = 0
+
+                # If pacing not initialized (edge-case), initialize now
+                if send_start_ts is None:
+                    send_start_ts = time.monotonic()
+                    frame_idx = 0
+
+                # Backlog cap: don't let Twilio get too far ahead
+                call_elapsed = now - send_start_ts
+                audio_sent_duration = frame_idx * FRAME_INTERVAL
+                backlog_seconds = audio_sent_duration - call_elapsed
+                if backlog_seconds > MAX_TWILIO_BACKLOG_SECONDS:
                     await asyncio.sleep(0.005)
-                    if play_start_ts is not None and (time.monotonic() - assistant_last_audio_time) > 1.0:
-                        play_start_ts = None
+                    continue
+
+                # Deadline-based pacing: when should the NEXT frame be sent?
+                target = send_start_ts + frame_idx * FRAME_INTERVAL
+                now = time.monotonic()
+                if now < target:
+                    await asyncio.sleep(target - now)
+                    continue
+
+                # Track lateness vs schedule (max per 1s window)
+                now = time.monotonic()
+                late_ms = (now - target) * 1000.0
+                if late_ms > late_ms_max:
+                    late_ms_max = late_ms
+
+                # Send exactly one frame if available; otherwise count underrun
+                if len(audio_buffer) >= BYTES_PER_FRAME:
+                    await send_audio_to_twilio()
+                    frame_idx += 1
+                    frames_sent_interval += 1
+                else:
+                    underruns += 1
+                    await asyncio.sleep(0.005)
 
         except asyncio.CancelledError:
             return
         except Exception:
             logger.exception("twilio_audio_sender crashed")
             return
+
     sender_task = asyncio.create_task(twilio_audio_sender())
+
 
 
     # --- Helper: barge-in ----------------------------------------------------
