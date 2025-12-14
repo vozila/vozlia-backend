@@ -1734,6 +1734,12 @@ async def twilio_stream(websocket: WebSocket):
                         continue
                     audio_buffer.extend(delta_bytes)
 
+                elif etype in ("response.text.delta", "response.output_text.delta"):
+                    # Optional: safe logging only (no indentation risk)
+                    delta = event.get("delta") or ""
+                    if delta:
+                        clog("OpenAI text.delta: %r", delta[:120])
+
                 elif etype == "input_audio_buffer.speech_started":
                     clog("OpenAI VAD: user speech START")
                     if assistant_actively_speaking():
@@ -1751,38 +1757,12 @@ async def twilio_stream(websocket: WebSocket):
                         clog("OpenAI cancel race (expected)")
                     else:
                         clog("OpenAI error event=%s", event)
-                                elif etype in ("response.text.delta", "response.output_text.delta"):
-                    # Text that the realtime model is generating (often mirrors what becomes speech)
-                    delta = event.get("delta") or ""
-                    if delta:
-                        clog("OpenAI TEXT delta: %r", delta[:200])
-
-                elif etype in ("response.text.done", "response.output_text.done"):
-                    text = event.get("text") or ""
-                    if text:
-                        clog("OpenAI TEXT done: %r", text[:400])
-
-                elif etype in (
-                    "response.audio_transcript.delta",
-                    "response.output_audio_transcript.delta",
-                ):
-                    # This is the model's transcript of what it is speaking.
-                    delta = event.get("delta") or ""
-                    if delta:
-                        clog("OpenAI SPOKEN transcript delta: %r", delta[:200])
-
-                elif etype in (
-                    "response.audio_transcript.done",
-                    "response.output_audio_transcript.done",
-                ):
-                    text = event.get("transcript") or event.get("text") or ""
-                    if text:
-                        clog("OpenAI SPOKEN transcript done: %r", text[:400])
 
         except websockets.ConnectionClosed:
             clog("OpenAI Realtime WebSocket closed")
         except Exception:
             logger.exception("Error in OpenAI event loop")
+
 
     async def twilio_loop():
         nonlocal stream_sid, call_sid, prebuffer_active, twilio_ws_closed
