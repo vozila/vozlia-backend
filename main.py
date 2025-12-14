@@ -436,11 +436,11 @@ def _get_default_gmail_account_id(current_user: User, db: Session) -> str | None
             EmailAccount.user_id == current_user.id,
             EmailAccount.provider_type == "gmail",
             EmailAccount.oauth_provider == "google",
-            EmailAccount.is_active is True,
+            EmailAccount.is_active.is_(True),
         )
     )
 
-    primary = q.filter(EmailAccount.is_primary is True).first()
+    primary = q.filter(EmailAccount.is_primary.is_(True)).first()
     if primary:
         return str(primary.id)
 
@@ -449,6 +449,7 @@ def _get_default_gmail_account_id(current_user: User, db: Session) -> str | None
         return str(first.id)
 
     return None
+
 
 
 def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
