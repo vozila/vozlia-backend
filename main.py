@@ -1050,13 +1050,6 @@ VOZLIA_BACKEND_BASE_URL = os.getenv(
     "https://vozlia-backend.onrender.com",
 )
 
-
-# ---------- FSM router helper for external callers (Twilio, ChatGPT tools, etc.) ----------
-VOZLIA_BACKEND_BASE_URL = os.getenv(
-    "VOZLIA_BACKEND_BASE_URL",
-    "https://vozlia-backend.onrender.com",
-)
-
 async def call_fsm_router(
     text: str,
     context: Optional[dict] = None,
@@ -1336,6 +1329,9 @@ async def twilio_stream(websocket: WebSocket):
     # Per-call identifiers (filled on Twilio "start")
     call_sid: Optional[str] = None
     stream_sid: Optional[str] = None
+    spoken_transcripts: dict[str, str] = {}
+    last_create_meta: list[tuple[float, str]] = []  # (ts, reason)
+
 
     logger.info("Twilio media stream connected (awaiting start)")
 
@@ -1570,7 +1566,9 @@ async def twilio_stream(websocket: WebSocket):
             return
         if not openai_ws:
             return
-
+        last_create_meta.append((time.monotonic(), reason))
+        # keep it small
+        del last_create_meta[:-10]
         preview = instructions.replace("\n", " ")[:180]
         clog(
             "response.create about_to_send reason=%s active_response_id=%s preview=%r",
@@ -1676,105 +1674,110 @@ async def twilio_stream(websocket: WebSocket):
         s = (s or "").replace("\n", " ")
         return s[:n] + ("…" if len(s) > n else "")
 
-    def _rid_from_event(event: dict) -> Optional[str]:
-        # Realtime events sometimes carry the response id in different places
-        resp = event.get("response") or {}
-        return resp.get("id") or event.get("response_id")
-
     async def openai_loop():
+        """
+        OpenAI Realtime receiver loop with:
+          • audio streaming
+          • spoken transcript capture per response_id
+          • logging of EXACT spoken words (audio transcript)
+          • best-effort correlation to response.create(reason=...)
+        """
+
         nonlocal active_response_id, openai_response_active, prebuffer_active, transcript_action_task
+
+        def _preview(s: str, n: int = 180) -> str:
+            s = (s or "").replace("\n", " ")
+            return s if len(s) <= n else s[: n - 1] + "…"
+
+        def _rid_from_event(ev: dict) -> str | None:
+            return (
+                ev.get("response_id")
+                or (ev.get("response") or {}).get("id")
+                or ev.get("id")
+            )
+
+        def _best_effort_reason(now_mono: float) -> str | None:
+            try:
+                for ts, reason in reversed(last_create_meta):
+                    if (now_mono - ts) <= 2.0:
+                        return reason
+            except Exception:
+                pass
+            return None
 
         try:
             async for raw in openai_ws:
                 event = json.loads(raw)
                 etype = event.get("type")
+                rid = _rid_from_event(event)
 
+                # ---- Response lifecycle ----
                 if etype == "response.created":
-                    rid = _rid_from_event(event)
+                    resp = event.get("response", {}) or {}
+                    rid = resp.get("id") or rid
                     if rid:
                         active_response_id = rid
                         openai_response_active = True
                         response_idle_event.clear()
-                        clog("OpenAI response.created rid=%s", rid)
+                    clog("OpenAI response.created rid=%s", rid)
 
                 elif etype in ("response.completed", "response.failed", "response.canceled"):
-                    rid = _rid_from_event(event)
                     if active_response_id and rid == active_response_id:
                         openai_response_active = False
                         active_response_id = None
-
-                        # IMPORTANT: do not clear the whole set; only discard this rid
-                        if rid:
-                            muted_response_ids.discard(rid)
-
+                        muted_response_ids.clear()
                         response_idle_event.set()
-                        clog("OpenAI response done etype=%s rid=%s", etype, rid)
-
+                        clog("OpenAI response done rid=%s etype=%s", rid, etype)
                     prebuffer_active = True
 
+                # ---- Audio streaming ----
                 elif etype == "response.audio.delta":
-                    resp_id = _rid_from_event(event)
                     delta_b64 = event.get("delta")
-
                     if not delta_b64:
                         continue
-
-                    # Log that audio arrived even if we drop it
-                    clog(
-                        "OA_AUDIO delta rid=%s b64_len=%d active=%s muted=%s",
-                        resp_id,
-                        len(delta_b64),
-                        active_response_id,
-                        (resp_id in muted_response_ids),
-                    )
-
-                    if resp_id in muted_response_ids:
-                        clog("OA_AUDIO DROP rid=%s reason=muted", resp_id)
+                    if rid in muted_response_ids:
                         continue
-
-                    if active_response_id is None:
-                        clog("OA_AUDIO DROP rid=%s reason=no_active_response", resp_id)
+                    if active_response_id and rid != active_response_id:
                         continue
-
-                    if resp_id != active_response_id:
-                        clog("OA_AUDIO DROP rid=%s reason=not_active (active=%s)", resp_id, active_response_id)
-                        continue
-
                     try:
-                        delta_bytes = base64.b64decode(delta_b64)
+                        audio_buffer.extend(base64.b64decode(delta_b64))
                     except Exception:
                         logger.exception("Failed to decode response.audio.delta")
-                        continue
 
-                    clog("OA_AUDIO ACCEPT rid=%s bytes=%d", resp_id, len(delta_bytes))
-                    audio_buffer.extend(delta_bytes)
+                # ---- SPOKEN TEXT (authoritative) ----
+                elif etype in ("response.audio_transcript.delta", "response.audio_transcript.text.delta"):
+                    delta = event.get("delta") or event.get("text") or ""
+                    if rid and delta:
+                        spoken_transcripts[rid] = spoken_transcripts.get(rid, "") + delta
+                        clog("AI SPOKEN delta rid=%s text=%r", rid, _preview(delta))
 
+                elif etype in ("response.audio_transcript.done", "response.audio_transcript.completed"):
+                    final_text = spoken_transcripts.get(rid, "") or event.get("transcript") or ""
+                    reason = _best_effort_reason(time.monotonic())
+                    clog("AI SPOKEN FINAL rid=%s reason=%s text=%r", rid, reason, _preview(final_text, 600))
+
+                # ---- Optional text channel ----
                 elif etype in ("response.text.delta", "response.output_text.delta"):
-                    resp_id = _rid_from_event(event)
                     delta = event.get("delta") or ""
                     if delta:
-                        clog(
-                            "OA_TEXT delta rid=%s active=%s muted=%s text=%r",
-                            resp_id,
-                            active_response_id,
-                            (resp_id in muted_response_ids),
-                            _preview(delta, 160),
-                        )
+                        clog("OpenAI text.delta rid=%s %r", rid, _preview(delta))
 
+                # ---- VAD ----
                 elif etype == "input_audio_buffer.speech_started":
                     clog("OpenAI VAD: user speech START")
                     if assistant_actively_speaking():
                         await handle_barge_in()
 
+                # ---- Transcript to routing ----
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     if transcript_action_task and not transcript_action_task.done():
                         transcript_action_task.cancel()
                     transcript_action_task = asyncio.create_task(handle_transcript_event(event))
 
+                # ---- Errors ----
                 elif etype == "error":
                     err = (event.get("error") or {})
-                    code = err.get("code")
-                    if code == "response_cancel_not_active":
+                    if err.get("code") == "response_cancel_not_active":
                         clog("OpenAI cancel race (expected)")
                     else:
                         clog("OpenAI error event=%s", event)
@@ -1783,6 +1786,7 @@ async def twilio_stream(websocket: WebSocket):
             clog("OpenAI Realtime WebSocket closed")
         except Exception:
             logger.exception("Error in OpenAI event loop")
+
 
 
     async def twilio_loop():
