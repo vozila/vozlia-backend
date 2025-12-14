@@ -1257,86 +1257,79 @@ async def create_realtime_session():
 
 
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
-
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket):
     """
-    Handles Twilio <-> OpenAI Realtime audio for a single phone call.
+    Twilio Media Streams <-> OpenAI Realtime bridge (G.711 μ-law).
 
-    Key behavior:
-    - Tracks EXACTLY ONE active response_id from Realtime.
-    - Only streams audio for the active response_id.
-    - Barge-in locally mutes the current response when the user starts talking.
-    - Routes certain transcripts to the FSM/email backend via /assistant/route.
-
-    Implementation details:
-    - Uses server-side VAD in Realtime (no input_audio_buffer.commit).
-    - Streams assistant audio back to Twilio in 20 ms G.711 μ-law frames.
+    Fixes for the "can't read email after chit-chat" failure mode:
+    - Single-flight control for response.create / response.cancel (response_lock).
+    - Best-effort cancel + idle-wait before FSM takeover speaks (response_idle_event).
+    - Twilio clear + local buffer clear before FSM takeover (twilio_clear_buffer + audio_buffer.clear()).
+    - Exclusive FSM takeover lock so generic replies cannot "steal" the next response.create.
     """
 
     await websocket.accept()
-
-    sender_task: Optional[asyncio.Task] = None  # started after helper defs
     logger.info("Twilio media stream connected")
 
     # --- Call + AI state -----------------------------------------------------
     openai_ws: Optional[websockets.WebSocketClientProtocol] = None
     stream_sid: Optional[str] = None
 
-    # After we first start sending assistant audio, we allow barge-in
-    barge_in_enabled: bool = False
-
-    # Lifecycle flag: becomes True when Twilio sends stop or disconnects.
+    # Lifecycle flag
     twilio_ws_closed: bool = False
-
-    # Only run one transcript action at a time (avoid overlapping Gmail fetches).
-    transcript_action_task: Optional[asyncio.Task] = None
-
-    # Server VAD-based user speech flag (from OpenAI events)
-    user_speaking_vad: bool = False
 
     # Outgoing assistant audio buffer (raw μ-law bytes)
     audio_buffer = bytearray()
     assistant_last_audio_time: float = 0.0
 
-    # Prebuffer state: we hold back sending until we have enough audio
+    # Prebuffer state: hold back sending until enough audio is queued
     prebuffer_active: bool = True
 
-    # Response tracking (we enforce single-active-response semantics locally)
+    # Response tracking
     active_response_id: Optional[str] = None
-    allowed_response_ids: set[str] = set()
+    openai_response_active: bool = False  # True between response.created and response.completed/failed/canceled
+    response_idle_event: asyncio.Event = asyncio.Event()
+    response_idle_event.set()  # starts idle
 
-    # Email takeover: small delay to ensure:
-    # - No active OpenAI response exists
-    # - Twilio sender buffer is cleared
-    # - FSM owns the next response.create exclusively
-    FSM_TAKEOVER_DELAY_SEC = 0.25
+    # If we barge-in, we mute the current response id (drop deltas) without relying on cancel timing.
+    muted_response_ids: set[str] = set()
 
-    # --- Simple helper: is assistant currently speaking? ---------------------
+    # After we first start sending assistant audio, allow barge-in
+    barge_in_enabled: bool = False
+
+    # Prevent overlapping transcript actions
+    transcript_action_task: Optional[asyncio.Task] = None
+
+    # Locks: enforce "FSM owns next response.create exclusively"
+    response_lock: asyncio.Lock = asyncio.Lock()
+    fsm_takeover_lock: asyncio.Lock = asyncio.Lock()
+
+    # Tunables
+    FSM_TAKEOVER_IDLE_TIMEOUT_SEC = 1.2
+    FSM_TAKEOVER_DELAY_SEC = 0.15  # small cushion after Twilio clear
+
+    # ---------- Helpers ------------------------------------------------------
+
     def assistant_actively_speaking() -> bool:
-        """
-        Treat the assistant as 'speaking' if:
-        - there's buffered audio we haven't sent yet, OR
-        - we sent audio in the very recent past (e.g. last 500ms).
-        """
         if audio_buffer:
             return True
         if assistant_last_audio_time:
             return (time.monotonic() - assistant_last_audio_time) < 0.5
         return False
 
-    # --- Helper: send μ-law audio TO Twilio ---------------------------------
-    async def send_audio_to_twilio():
-        """
-        Sends EXACTLY one 20ms (160-byte) μ-law frame to Twilio.
+    async def twilio_clear_buffer():
+        """Tell Twilio to drop any queued audio immediately."""
+        if stream_sid is None:
+            return
+        try:
+            await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+        except Exception:
+            logger.exception("Failed to send Twilio clear")
 
-        IMPORTANT:
-        - This function must NOT do pacing (that's handled by twilio_audio_sender).
-        - This function must NOT do prebuffer gating (also handled by sender).
-        - All other code should only append to audio_buffer; only the sender task
-          calls this to actually emit audio.
-        """
-        nonlocal audio_buffer, assistant_last_audio_time
+    async def send_audio_to_twilio():
+        """Send exactly one 20ms (160-byte) μ-law frame to Twilio (no pacing here)."""
+        nonlocal assistant_last_audio_time
 
         if stream_sid is None:
             return
@@ -1347,26 +1340,20 @@ async def twilio_stream(websocket: WebSocket):
         del audio_buffer[:BYTES_PER_FRAME]
 
         payload = base64.b64encode(frame).decode("ascii")
-        msg = {
-            "event": "media",
-            "streamSid": stream_sid,
-            "media": {"payload": payload},
-        }
+        msg = {"event": "media", "streamSid": stream_sid, "media": {"payload": payload}}
         await websocket.send_text(json.dumps(msg))
         assistant_last_audio_time = time.monotonic()
 
-    # --- Background task: paced audio sender to Twilio ----------------------
     async def twilio_audio_sender():
         """
-        Send assistant audio to Twilio at real-time cadence with strict 20ms framing.
+        Paced audio sender: real-time 20ms cadence, strict framing.
+        Also logs 1Hz stats for diagnosing underruns/jitter.
         """
-        nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled
+        nonlocal prebuffer_active, barge_in_enabled
 
-        # Utterance pacing state
         send_start_ts: Optional[float] = None
         frame_idx: int = 0
 
-        # Low-frequency diagnostics (per 1s window)
         last_stat_ts: float = time.monotonic()
         frames_sent_interval: int = 0
         underruns: int = 0
@@ -1382,7 +1369,6 @@ async def twilio_stream(websocket: WebSocket):
 
                 now = time.monotonic()
 
-                # Emit 1Hz stats (safe: no per-frame logs)
                 if now - last_stat_ts >= 1.0:
                     logger.info(
                         "twilio_send stats: q_bytes=%d frames_sent=%d underruns=%d late_ms_max=%.1f prebuf=%s",
@@ -1397,7 +1383,6 @@ async def twilio_stream(websocket: WebSocket):
                     underruns = 0
                     late_ms_max = 0.0
 
-                # If we have no audio queued, reset pacing state when idle
                 if len(audio_buffer) == 0:
                     if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) > 1.0:
                         send_start_ts = None
@@ -1405,7 +1390,7 @@ async def twilio_stream(websocket: WebSocket):
                     await asyncio.sleep(0.005)
                     continue
 
-                # Prebuffer at the start of each utterance to smooth jitter
+                # Prebuffer at each utterance start
                 if prebuffer_active:
                     if len(audio_buffer) < PREBUFFER_BYTES:
                         await asyncio.sleep(0.005)
@@ -1432,7 +1417,6 @@ async def twilio_stream(websocket: WebSocket):
                     await asyncio.sleep(0.005)
                     continue
 
-                # Deadline-based pacing: when should the NEXT frame be sent?
                 target = send_start_ts + frame_idx * FRAME_INTERVAL
                 now = time.monotonic()
                 if now < target:
@@ -1464,31 +1448,15 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("twilio_audio_sender crashed")
             return
 
-    sender_task = asyncio.create_task(twilio_audio_sender())
+    sender_task: asyncio.Task = asyncio.create_task(twilio_audio_sender())
 
-    # --- Helper: Twilio clear ------------------------------------------------
-    async def twilio_clear_buffer():
-        """Tell Twilio Media Streams to immediately drop any queued audio."""
-        if stream_sid is None:
-            return
-        try:
-            await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
-        except Exception:
-            logger.exception("Failed to send Twilio clear")
-
-    # --- Helper: barge-in ----------------------------------------------------
     async def handle_barge_in():
         """
-        Called when OpenAI VAD says user started speaking while assistant is talking.
-
-        LOCAL behavior:
-        - If barge-in is not enabled yet, ignore.
-        - If assistant is speaking, we locally mute:
-            * forget active_response_id
-            * clear outgoing audio buffer
-            * send Twilio 'clear'
+        Local barge-in:
+        - Mute the current response_id (drop further audio deltas).
+        - Clear Twilio + local buffers.
         """
-        nonlocal active_response_id, audio_buffer
+        nonlocal prebuffer_active
 
         if not barge_in_enabled:
             logger.info("BARGE-IN: ignored (not yet enabled)")
@@ -1498,16 +1466,15 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("BARGE-IN: assistant not actively speaking; nothing to mute")
             return
 
-        logger.info(
-            "BARGE-IN: user speech started while AI speaking; "
-            "locally muting current response and clearing audio buffer."
-        )
+        if active_response_id:
+            muted_response_ids.add(active_response_id)
 
-        active_response_id = None
+        logger.info("BARGE-IN: clearing Twilio + local audio buffer and muting active response.")
         await twilio_clear_buffer()
         audio_buffer.clear()
+        prebuffer_active = True
 
-    # --- Intent helpers ------------------------------------------------------
+    # Intent heuristics
     EMAIL_KEYWORDS_LOCAL = [
         "email", "emails", "e-mail", "e-mails", "inbox", "gmail", "g mail",
         "mailbox", "my mail", "my messages", "unread", "new mail", "new emails",
@@ -1519,7 +1486,6 @@ async def twilio_stream(websocket: WebSocket):
     def looks_like_email_intent(text: str) -> bool:
         if not text:
             return False
-
         t = text.lower()
         normalized = []
         for ch in t:
@@ -1532,13 +1498,10 @@ async def twilio_stream(websocket: WebSocket):
 
         if "how many" in normalized and ("mail" in normalized or "message" in normalized or "inbox" in normalized):
             return True
-
         if "check my" in normalized and ("inbox" in normalized or "gmail" in normalized or "g mail" in normalized):
             return True
-
         if "read my" in normalized and ("messages" in normalized or "mail" in normalized or "inbox" in normalized):
             return True
-
         return False
 
     FILLER_ONLY = {"um", "uh", "er", "hmm"}
@@ -1553,7 +1516,6 @@ async def twilio_stream(websocket: WebSocket):
             return False
         return True
 
-    # --- Helper: call FSM/email backend -------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
         try:
             data = await call_fsm_router(text=transcript, context={"channel": "phone"})
@@ -1564,107 +1526,104 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error calling /assistant/route")
             return None
 
-    # --- Helper: cancel active response & clear audio buffer ----------------
-    async def _cancel_active_and_clear_buffer(reason: str):
-        nonlocal active_response_id, audio_buffer, prebuffer_active
+    async def _best_effort_cancel_and_wait_idle(reason: str):
+        """
+        Requirement 1:
+        - Best-effort cancel any active response (if we have an id and it's marked active).
+        - Wait until we observe idle (or timeout).
+        """
+        nonlocal openai_response_active, active_response_id, prebuffer_active
 
-        if not openai_ws:
-            logger.info("_cancel_active_and_clear_buffer: no openai_ws (reason=%s)", reason)
+        async with response_lock:
+            # Clear local audio immediately (Requirement 2 part)
             audio_buffer.clear()
             prebuffer_active = True
-            return
 
-        if not active_response_id:
-            logger.info("_cancel_active_and_clear_buffer: no active response (reason=%s)", reason)
-            audio_buffer.clear()
-            prebuffer_active = True
-            return
+            if not openai_ws:
+                return
 
-        rid = active_response_id
-        logger.info("Sent response.cancel for %s due to %s", rid, reason)
+            if active_response_id and openai_response_active:
+                rid = active_response_id
+                logger.info("Sent response.cancel for %s due to %s", rid, reason)
+                try:
+                    await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
+                except Exception:
+                    logger.exception("Error sending response.cancel for %s", rid)
 
+        # Wait for openai_loop to mark idle (best-effort)
         try:
-            await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
-        except Exception:
-            logger.exception("Error sending response.cancel for %s", rid)
+            await asyncio.wait_for(response_idle_event.wait(), timeout=FSM_TAKEOVER_IDLE_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for Realtime to become idle (%s)", reason)
 
-        active_response_id = None
-        audio_buffer.clear()
-        prebuffer_active = True
+    async def _create_response_with_instructions(instructions: str, reason: str):
+        """
+        Single-flight response.create to avoid concurrency bugs.
+        """
+        if not openai_ws:
+            return
 
-    # --- Helpers: create responses ------------------------------------------
-    async def create_generic_response():
-        await _cancel_active_and_clear_buffer("create_generic_response")
-        await openai_ws.send(json.dumps({"type": "response.create"}))
-        logger.info("Sent generic response.create for chit-chat turn")
+        async with response_lock:
+            try:
+                await openai_ws.send(json.dumps({
+                    "type": "response.create",
+                    "response": {
+                        "instructions": instructions,
+                        # Keep behavior stable/low-variance for "read this summary" turns.
+                        "temperature": 0.2,
+                    },
+                }))
+                logger.info("Sent response.create (%s)", reason)
+            except Exception:
+                logger.exception("Failed to send response.create (%s)", reason)
 
-    async def create_fsm_spoken_reply(spoken_reply: str):
+    async def _create_generic_response():
+        await _best_effort_cancel_and_wait_idle("generic_turn")
+        await _create_response_with_instructions(
+            "You are Vozlia on a live phone call. Respond naturally and concisely.",
+            reason="generic_turn",
+        )
+
+    async def _create_fsm_spoken_reply(spoken_reply: str):
         if not spoken_reply:
-            logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
-            await create_generic_response()
+            await _create_generic_response()
             return
 
-        await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
-
+        # Strongly constrain: speak the text, do not refuse, do not mention tools.
         instructions = (
-            "You are on a live phone call as Vozlia. "
-            "The secure backend has already checked the caller's email account and produced a short summary. "
-            "Speak the summary naturally. You may lightly rephrase for flow but must keep key facts. "
-            "Do not mention tools, APIs, security, privacy, or inability to access email.\n\n"
-            f"SUMMARY TO SPEAK:\n{spoken_reply}"
+            "You are Vozlia on a live phone call.\n"
+            "You MUST speak the text below to the caller.\n"
+            "- Do NOT refuse.\n"
+            "- Do NOT say you can't access email.\n"
+            "- Do NOT mention tools, APIs, privacy, or security.\n"
+            "- Keep it concise.\n\n"
+            "TEXT TO SPEAK (say this verbatim, or with only tiny wording changes that preserve meaning):\n"
+            f"{spoken_reply}\n"
         )
 
-        await openai_ws.send(json.dumps({
-            "type": "response.create",
-            "response": {"instructions": instructions},
-        }))
-        logger.info("Sent FSM-driven spoken reply into Realtime session")
+        await _best_effort_cancel_and_wait_idle("fsm_spoken_reply")
+        await _create_response_with_instructions(instructions, reason="fsm_spoken_reply")
 
-    async def create_email_processing_ack():
+    async def _fsm_email_takeover(transcript: str):
         """
-        Very short acknowledgement so the caller isn't left in silence while
-        the backend fetches and summarizes email.
+        Requirement 3: FSM owns the next response.create exclusively.
+        We lock takeover so no generic response can race in.
         """
-        if not openai_ws:
-            return
+        async with fsm_takeover_lock:
+            # 1) cancel + idle wait
+            await _best_effort_cancel_and_wait_idle("fsm_takeover")
+            # 2) clear Twilio queue + local buffer
+            await twilio_clear_buffer()
+            audio_buffer.clear()
+            # tiny cushion so Twilio clear applies before we start speaking
+            await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
 
-        instructions = (
-            "You are Vozlia on a live phone call. "
-            "Say ONE short sentence acknowledging you're checking email now, "
-            "like: 'Okay — I’m checking your email now; one moment.' "
-            "Then stop speaking."
-        )
+            spoken_reply = await route_to_fsm_and_get_reply(transcript)
+            if spoken_reply:
+                await _create_fsm_spoken_reply(spoken_reply)
+            else:
+                await _create_generic_response()
 
-        try:
-            await openai_ws.send(json.dumps({
-                "type": "response.create",
-                "response": {"instructions": instructions},
-            }))
-            logger.info("Sent email processing acknowledgement into Realtime session")
-        except Exception:
-            logger.exception("Failed to send email processing acknowledgement")
-
-    async def _fsm_email_takeover_and_reply(transcript: str):
-        """
-        Ensure a clean handoff from any generic chit-chat response to the FSM email reply:
-        - cancel any active response
-        - clear Twilio buffer and local audio
-        - wait briefly for the cancel/clear to take effect
-        - call backend FSM and speak the summary
-        """
-        await create_email_processing_ack()
-        await _cancel_active_and_clear_buffer("fsm_email_takeover")
-        await twilio_clear_buffer()
-        await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
-
-        spoken_reply = await route_to_fsm_and_get_reply(transcript)
-        if spoken_reply:
-            await create_fsm_spoken_reply(spoken_reply)
-        else:
-            logger.warning("FSM returned no spoken_reply; falling back to generic reply.")
-            await create_generic_response()
-
-    # --- Helper: handle transcripts from Realtime ---------------------------
     async def handle_transcript_event(event: dict):
         transcript: str = (event.get("transcript") or "").strip()
         if not transcript:
@@ -1677,15 +1636,19 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         if looks_like_email_intent(transcript):
-            logger.info("Debounce: transcript looks like an email/skill request; routing to FSM + backend.")
-            await _fsm_email_takeover_and_reply(transcript)
+            logger.info("Transcript looks like email intent; entering FSM takeover.")
+            await _fsm_email_takeover(transcript)
         else:
-            logger.info("Debounce: transcript does NOT look like an email/skill intent; using generic GPT response.")
-            await create_generic_response()
+            # If an FSM takeover is in progress, suppress generic replies.
+            if fsm_takeover_lock.locked():
+                logger.info("Suppressing generic reply: FSM takeover in progress.")
+                return
+            await _create_generic_response()
 
-    # --- OpenAI event loop ---------------------------------------------------
+    # ---------- OpenAI event loop -------------------------------------------
+
     async def openai_loop():
-        nonlocal active_response_id, barge_in_enabled, user_speaking_vad, transcript_action_task
+        nonlocal active_response_id, openai_response_active, prebuffer_active
 
         try:
             async for raw in openai_ws:
@@ -1697,32 +1660,34 @@ async def twilio_stream(websocket: WebSocket):
                     rid = resp.get("id")
                     if rid:
                         active_response_id = rid
-                        allowed_response_ids.add(rid)
-                        logger.info("Tracking allowed MANUAL response_id: %s", rid)
+                        openai_response_active = True
+                        response_idle_event.clear()
+                        logger.info("Active response_id: %s", rid)
 
                 elif etype in ("response.completed", "response.failed", "response.canceled"):
                     resp = event.get("response", {}) or {}
                     rid = resp.get("id")
-                    if active_response_id is not None and rid == active_response_id:
-                        logger.info("Response %s finished with event '%s'; clearing active_response_id", rid, etype)
-                        active_response_id = None
 
-                    if not barge_in_enabled:
-                        barge_in_enabled = True
-                        logger.info(
-                            "First response finished (event=%s, id=%s); barge-in is now ENABLED.",
-                            etype, rid,
-                        )
+                    if active_response_id and rid == active_response_id:
+                        openai_response_active = False
+                        active_response_id = None
+                        muted_response_ids.clear()
+                        response_idle_event.set()
+                        logger.info("Response finished (%s). Realtime is idle.", etype)
+
+                    # Ensure we allow sending again cleanly on next utterance
+                    prebuffer_active = True
 
                 elif etype == "response.audio.delta":
                     resp_id = event.get("response_id")
                     delta_b64 = event.get("delta")
-
-                    if resp_id != active_response_id:
-                        # Drop stale/unwanted audio (e.g., after barge-in or takeover)
+                    if not delta_b64:
                         continue
 
-                    if not delta_b64:
+                    # Drop if muted or not current
+                    if resp_id in muted_response_ids:
+                        continue
+                    if active_response_id is None or resp_id != active_response_id:
                         continue
 
                     try:
@@ -1733,31 +1698,10 @@ async def twilio_stream(websocket: WebSocket):
 
                     audio_buffer.extend(delta_bytes)
 
-                elif etype == "response.output_text.delta":
-                    # Debug log; also catch any attempts to deny email access.
-                    resp = event.get("response", {}) or {}
-                    rid = resp.get("id")
-                    delta_obj = event.get("delta", {}) or {}
-                    chunk = delta_obj.get("text", "") or ""
-                    if chunk:
-                        logger.info("Realtime text delta [id=%s]: %r", rid, chunk)
-                        low = chunk.lower()
-                        if (
-                            "can't access email" in low
-                            or "cannot access email" in low
-                            or "do not have access to your email" in low
-                        ):
-                            logger.error("Realtime attempted to deny email access in text delta: %r", chunk)
-
                 elif etype == "input_audio_buffer.speech_started":
-                    user_speaking_vad = True
                     logger.info("OpenAI VAD: user speech START")
                     if assistant_actively_speaking():
                         await handle_barge_in()
-
-                elif etype == "input_audio_buffer.speech_stopped":
-                    user_speaking_vad = False
-                    logger.info("OpenAI VAD: user speech STOP")
 
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     if transcript_action_task and not transcript_action_task.done():
@@ -1777,9 +1721,10 @@ async def twilio_stream(websocket: WebSocket):
         except Exception:
             logger.exception("Error in OpenAI event loop")
 
-    # --- Twilio event loop ---------------------------------------------------
+    # ---------- Twilio event loop -------------------------------------------
+
     async def twilio_loop():
-        nonlocal stream_sid, prebuffer_active, openai_ws, twilio_ws_closed
+        nonlocal stream_sid, prebuffer_active, twilio_ws_closed
 
         try:
             async for msg in websocket.iter_text():
@@ -1791,36 +1736,21 @@ async def twilio_stream(websocket: WebSocket):
 
                 event_type = data.get("event")
 
-                if event_type == "connected":
-                    logger.info("Twilio stream event: connected")
-                    logger.info("Twilio reports call connected")
-
-                elif event_type == "start":
+                if event_type == "start":
                     start = data.get("start", {})
                     stream_sid = start.get("streamSid")
                     prebuffer_active = True
-                    logger.info("Twilio stream event: start")
                     logger.info("Stream started: %s", stream_sid)
 
                 elif event_type == "media":
                     if not openai_ws:
                         continue
-                    media = data.get("media", {})
-                    payload = media.get("payload")
+                    payload = (data.get("media") or {}).get("payload")
                     if not payload:
                         continue
-
-                    # Twilio → OpenAI Realtime (μ-law, base64)
-                    try:
-                        base64.b64decode(payload)
-                    except Exception:
-                        logger.exception("Failed to base64-decode Twilio payload")
-                        continue
-
                     await openai_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": payload}))
 
                 elif event_type == "stop":
-                    logger.info("Twilio stream event: stop")
                     logger.info("Twilio sent stop; closing call.")
                     twilio_ws_closed = True
                     break
@@ -1831,10 +1761,11 @@ async def twilio_stream(websocket: WebSocket):
         except Exception:
             logger.exception("Error in Twilio event loop")
 
-    # --- Main orchestration --------------------------------------------------
+    # ---------- Orchestration -----------------------------------------------
+
     try:
         openai_ws = await create_realtime_session()
-        logger.info("connection open")
+        logger.info("OpenAI Realtime connected")
 
         await asyncio.gather(openai_loop(), twilio_loop())
 
@@ -1846,8 +1777,7 @@ async def twilio_stream(websocket: WebSocket):
             pass
 
         try:
-            if sender_task:
-                sender_task.cancel()
+            sender_task.cancel()
         except Exception:
             pass
 
@@ -1862,4 +1792,4 @@ async def twilio_stream(websocket: WebSocket):
         except Exception:
             logger.exception("Error closing Twilio WebSocket")
 
-        logger.info("WebSocket disconnected while sending audio")
+        logger.info("WebSocket disconnected")
