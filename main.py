@@ -244,6 +244,38 @@ def get_current_user(db: Session = Depends(get_db)) -> User:
 
 
 # ---------- Email account endpoints ----------
+
+
+@app.post("/admin/email/accounts/df8a3b8a-ac8f-42dd-a27b-201bef8c3390/deactivate")
+def deactivate_email_account(
+    account_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    account = (
+        db.query(EmailAccount)
+        .filter(
+            EmailAccount.id == account_id,
+            EmailAccount.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Email account not found")
+
+    account.is_active = False
+    account.is_primary = False
+    db.commit()
+
+    return {
+        "status": "ok",
+        "account_id": account_id,
+        "email_address": account.email_address,
+        "is_active": account.is_active,
+    }
+
+
 @app.get("/email/accounts", response_model=List[EmailAccountRead])
 def list_email_accounts(
     db: Session = Depends(get_db),
