@@ -1569,8 +1569,8 @@ async def twilio_stream(websocket: WebSocket):
                     "type": "response.create",
                     "response": {
                         "instructions": instructions,
-                        # Keep behavior stable/low-variance for "read this summary" turns.
-                        "temperature": 0.2,
+                        #  Minimum allowed by Realtime API
+                        "temperature": 0.6,
                     },
                 }))
                 logger.info("Sent response.create (%s)", reason)
