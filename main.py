@@ -230,7 +230,7 @@ def google_auth_start(
         "scope": GOOGLE_GMAIL_SCOPE,
         "access_type": "offline",  # ask for refresh_token
         "include_granted_scopes": "true",
-        "prompt": "consent",       # force showing consent to reliably get refresh_token
+        "prompt": "consent",  # force showing consent to reliably get refresh_token
         "state": state,
     }
 
@@ -436,11 +436,11 @@ def _get_default_gmail_account_id(current_user: User, db: Session) -> str | None
             EmailAccount.user_id == current_user.id,
             EmailAccount.provider_type == "gmail",
             EmailAccount.oauth_provider == "google",
-            EmailAccount.is_active == True,  # noqa: E712
+            EmailAccount.is_active is True,
         )
     )
 
-    primary = q.filter(EmailAccount.is_primary == True).first()  # noqa: E712
+    primary = q.filter(EmailAccount.is_primary is True).first()
     if primary:
         return str(primary.id)
 
@@ -519,10 +519,7 @@ def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
 
 
 def _extract_headers(message_json: dict) -> dict:
-    headers_list = (
-        message_json.get("payload", {})
-        .get("headers", [])
-    )
+    headers_list = (message_json.get("payload", {}) or {}).get("headers", []) or []
     h = {hdr.get("name", "").lower(): hdr.get("value", "") for hdr in headers_list}
     return {
         "subject": h.get("subject"),
@@ -553,9 +550,7 @@ def _gmail_list_messages_core(
     account = _get_gmail_account_or_404(account_id, current_user, db)
     access_token = ensure_gmail_access_token(account, db)
 
-    params = {
-        "maxResults": max_results,
-    }
+    params = {"maxResults": max_results}
     if query:
         params["q"] = query
 
@@ -659,17 +654,9 @@ def gmail_stats(
     """
     Approximate count of messages received in the last N days.
     Uses Gmail search 'newer_than:{N}d'.
-
-    Examples:
-      - /email/accounts/{account_id}/stats?window_days=1   -> "today-ish"
-      - /email/accounts/{account_id}/stats?window_days=7   -> last week
-      - /email/accounts/{account_id}/stats?window_days=30  -> last month-ish
     """
     if window_days <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="window_days must be >= 1",
-        )
+        raise HTTPException(status_code=400, detail="window_days must be >= 1")
 
     account = _get_gmail_account_or_404(account_id, current_user, db)
     access_token = ensure_gmail_access_token(account, db)
@@ -687,10 +674,7 @@ def gmail_stats(
             logger.error(
                 f"Gmail stats list failed: {list_resp.status_code} {list_resp.text}"
             )
-            raise HTTPException(
-                status_code=502,
-                detail="Failed to compute Gmail stats",
-            )
+            raise HTTPException(status_code=502, detail="Failed to compute Gmail stats")
 
         data = list_resp.json()
         size_estimate = data.get("resultSizeEstimate", 0)
@@ -712,7 +696,7 @@ class AssistantRouteIn(BaseModel):
     """
     text: str
     account_id: str | None = None  # optional: explicit Gmail account
-    context: dict | None = None    # optional: extra metadata (channel, etc.)
+    context: dict | None = None  # optional: extra metadata (channel, etc.)
 
 
 class AssistantRouteOut(BaseModel):
@@ -737,15 +721,6 @@ def summarize_gmail_messages_for_assistant(
 ) -> dict:
     """
     Helper for Vozlia's voice logic.
-
-    Returns a dict:
-      {
-        "summary": "<short spoken-style summary>",
-        "messages": [... up to max_results messages ...],
-        "account_id": ...,
-        "email_address": ...,
-        "query": ...
-      }
     """
     # Clamp here too, in case it's called directly
     if max_results <= 0:
@@ -754,7 +729,6 @@ def summarize_gmail_messages_for_assistant(
         max_results = 50
 
     if not OPENAI_API_KEY or client is None:
-        # Fallback: just return a plain-text description using subjects
         data = _gmail_list_messages_core(
             account_id=account_id,
             max_results=max_results,
@@ -775,7 +749,6 @@ def summarize_gmail_messages_for_assistant(
         data["summary"] = summary
         return data
 
-    # Use OpenAI to create a tight, spoken-style summary.
     data = _gmail_list_messages_core(
         account_id=account_id,
         max_results=max_results,
@@ -788,9 +761,7 @@ def summarize_gmail_messages_for_assistant(
     if not messages:
         summary_text = "You have no recent emails matching that filter."
     else:
-        # Truncate for prompt safety
-        messages_for_prompt = messages[: max_results]
-
+        messages_for_prompt = messages[:max_results]
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -819,7 +790,6 @@ def summarize_gmail_messages_for_assistant(
             summary_text = resp.choices[0].message.content
         except Exception as e:
             logger.error(f"Error generating Gmail summary via OpenAI: {e}")
-            # Fallback to simple subject-based summary
             subjects = [m.get("subject") or "(no subject)" for m in messages]
             joined = "; ".join(subjects[:5])
             summary_text = (
@@ -847,7 +817,6 @@ def _run_fsm_and_backend(
     """
     fsm = VozliaFSM()
 
-    # You can pass extra context if your FSM needs it (channel, user id, etc.)
     fsm_context = context or {}
     fsm_context.setdefault("user_id", current_user.id)
     fsm_context.setdefault("channel", "phone")  # or "chat" for GPT-side usage
@@ -859,11 +828,9 @@ def _run_fsm_and_backend(
 
     gmail_data: dict | None = None
 
-    # --- Handle Gmail summary skill, if requested by FSM ---
     if backend_call and backend_call.get("type") == "gmail_summary":
         params = backend_call.get("params") or {}
 
-        # Priority: explicit account_id in params > request body > default Gmail account
         account_id_effective = (
             params.get("account_id")
             or account_id
@@ -871,7 +838,6 @@ def _run_fsm_and_backend(
         )
 
         if not account_id_effective:
-            # No Gmail account available – append a brief explanation.
             if spoken_reply:
                 spoken_reply = (
                     spoken_reply.rstrip(". ")
@@ -896,19 +862,12 @@ def _run_fsm_and_backend(
 
             gmail_summary = gmail_data.get("summary")
             if gmail_summary:
-                # Combine FSM reply + Gmail summary in a natural way
                 if spoken_reply:
                     spoken_reply = f"{spoken_reply.strip()} {gmail_summary.strip()}"
                 else:
                     spoken_reply = gmail_summary.strip()
 
-            # Make sure we expose which account_id was used
             gmail_data["used_account_id"] = account_id_effective
-
-    # TODO: In the future, add other backend_call types here:
-    #   - weather lookup
-    #   - nearby_location search
-    #   - task engine, calendar, etc.
 
     return AssistantRouteOut(
         spoken_reply=spoken_reply,
@@ -927,10 +886,6 @@ def gmail_summary(
 ):
     """
     High-level Gmail summary for this account, suitable for Vozlia to speak.
-
-    Example:
-      - /email/accounts/{account_id}/summary
-      - /email/accounts/{account_id}/summary?query=is:unread&max_results=10
     """
     data = summarize_gmail_messages_for_assistant(
         account_id=account_id,
@@ -939,9 +894,7 @@ def gmail_summary(
         max_results=max_results,
         query=query,
     )
-
-    # Optionally trim the messages list to keep response lighter
-    data["messages"] = data.get("messages", [])[: max_results]
+    data["messages"] = data.get("messages", [])[:max_results]
     return data
 
 
@@ -954,19 +907,6 @@ def assistant_route(
 ):
     """
     Unified router for Vozlia.
-
-    This is what:
-      - The phone agent (OpenAI Realtime) can call via tools, and
-      - Your future custom GPT can call as a tool,
-
-    whenever the assistant needs to:
-      - Interpret the caller's request (via FSM), and
-      - Optionally use backend skills (Gmail, etc.)
-
-    It returns:
-      - spoken_reply: what Vozlia should actually say
-      - fsm: raw FSM decision info
-      - gmail: optional Gmail summary block (if used)
     """
     result = _run_fsm_and_backend(
         text=payload.text,
@@ -992,9 +932,7 @@ async def call_fsm_router(
 ) -> dict:
     """
     Helper to call the unified /assistant/route endpoint from other parts of
-    the system (e.g., Twilio calls, future ChatGPT tools).
-
-    This keeps Twilio <-> Realtime code decoupled from the internal FSM wiring.
+    the system.
     """
     if not text:
         return {"spoken_reply": "", "fsm": {}, "gmail": None}
@@ -1013,7 +951,6 @@ async def call_fsm_router(
             return resp.json()
     except Exception as e:
         logger.exception("Error calling /assistant/route at %s: %s", url, e)
-        # Fallback: simple spoken error
         return {
             "spoken_reply": (
                 "I tried to check that information in the backend, "
@@ -1066,8 +1003,6 @@ if voice_env not in SUPPORTED_VOICES:
 
 VOICE_NAME = voice_env
 
-VOICE_NAME = voice_env
-
 SYSTEM_PROMPT = (
     "You are Vozlia, a warm, friendly, highly capable AI phone assistant using the "
     "Coral voice persona. Speak naturally, confidently, and in a professional tone, "
@@ -1091,19 +1026,9 @@ SYSTEM_PROMPT = (
     "  framed estimate or guidance.\n"
     "- Briefly signal that it is approximate, for example by saying things like "
     "  'roughly', 'typically', or 'around this time of year'. Avoid long disclaimers.\n"
-    "- Then give one simple, practical next step. For example:\n"
-    "    * Weather: 'In early December, Queens is usually around the 30s to 40s "
-    "      Fahrenheit, so you’ll probably want a warm jacket. For the exact temperature, "
-    "      a quick weather app check will give you the current reading.'\n"
-    "    * Nearby restaurants: 'If you open your maps app and search for "
-    "      \"restaurants near me\", sorting by rating will show you the best options "
-    "      close by.'\n"
-    "- Avoid saying 'I cannot access the internet', 'I don’t have real-time data', "
-    "  or directly telling them to 'look it up yourself'. Always add some concrete, "
-    "  useful guidance or an approximate answer first.\n\n"
+    "- Then give one simple, practical next step.\n\n"
 )
 
-# 🔹 Realtime-specific rules about Gmail / email access
 REALTIME_SYSTEM_PROMPT = SYSTEM_PROMPT + (
     "EMAIL & GMAIL ACCESS RULES\n"
     "- You DO have help with email and calendar via a secure backend brain.\n"
@@ -1121,20 +1046,15 @@ REALTIME_SYSTEM_PROMPT = SYSTEM_PROMPT + (
 
 
 # ---------- Audio framing for G.711 μ-law ----------
-SAMPLE_RATE = 8000        # Hz
-FRAME_MS = 20             # 20 ms per frame
+SAMPLE_RATE = 8000  # Hz
+FRAME_MS = 20  # 20 ms per frame
 BYTES_PER_FRAME = int(SAMPLE_RATE * FRAME_MS / 1000)  # 160 bytes
 
-# Real-time pacing: one 20ms frame every 20ms
 FRAME_INTERVAL = FRAME_MS / 1000.0  # 0.020 seconds
 
-# Prebuffer at start of each utterance to smooth jitter
-# 4 frames = 80 ms
 PREBUFFER_FRAMES = 4
 PREBUFFER_BYTES = PREBUFFER_FRAMES * BYTES_PER_FRAME
 
-# Limit how far ahead we've sent audio to Twilio (in seconds)
-# This directly bounds the maximum "tail" after barge-in.
 MAX_TWILIO_BACKLOG_SECONDS = 1.0
 
 
@@ -1207,13 +1127,7 @@ async def twilio_inbound(request: Request):
 # ---------- Helper: OpenAI Realtime session via websockets ----------
 async def create_realtime_session():
     """
-    Connect to OpenAI Realtime WebSocket using env vars and configure the session.
-
-    We:
-    - Use server-side VAD (turn_detection.type = server_vad).
-    - Do NOT manually call input_audio_buffer.commit; Realtime handles segmentation.
-    - Set create_response=False so VAD still emits transcripts, but we control when
-      to call response.create().
+    Connect to OpenAI Realtime WebSocket and configure the session.
     """
     logger.info("Connecting to OpenAI Realtime WebSocket via websockets...")
 
@@ -1249,7 +1163,6 @@ async def create_realtime_session():
     await openai_ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime")
 
-    # Initial greeting: rely on the system prompt to greet the caller.
     await openai_ws.send(json.dumps({"type": "response.create"}))
     logger.info("Sent initial greeting request to OpenAI Realtime")
 
@@ -1261,14 +1174,7 @@ async def create_realtime_session():
 async def twilio_stream(websocket: WebSocket):
     """
     Twilio Media Streams <-> OpenAI Realtime bridge (G.711 μ-law).
-
-    Fixes for the "can't read email after chit-chat" failure mode:
-    - Single-flight control for response.create / response.cancel (response_lock).
-    - Best-effort cancel + idle-wait before FSM takeover speaks (response_idle_event).
-    - Twilio clear + local buffer clear before FSM takeover (twilio_clear_buffer + audio_buffer.clear()).
-    - Exclusive FSM takeover lock so generic replies cannot "steal" the next response.create.
     """
-
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
@@ -1276,38 +1182,33 @@ async def twilio_stream(websocket: WebSocket):
     openai_ws: Optional[websockets.WebSocketClientProtocol] = None
     stream_sid: Optional[str] = None
 
-    # Lifecycle flag
     twilio_ws_closed: bool = False
 
-    # Outgoing assistant audio buffer (raw μ-law bytes)
     audio_buffer = bytearray()
     assistant_last_audio_time: float = 0.0
 
-    # Prebuffer state: hold back sending until enough audio is queued
     prebuffer_active: bool = True
 
-    # Response tracking
     active_response_id: Optional[str] = None
-    openai_response_active: bool = False  # True between response.created and response.completed/failed/canceled
+    openai_response_active: bool = False
     response_idle_event: asyncio.Event = asyncio.Event()
-    response_idle_event.set()  # starts idle
+    response_idle_event.set()
 
-    # If we barge-in, we mute the current response id (drop deltas) without relying on cancel timing.
     muted_response_ids: set[str] = set()
 
-    # After we first start sending assistant audio, allow barge-in
     barge_in_enabled: bool = False
 
-    # Prevent overlapping transcript actions
     transcript_action_task: Optional[asyncio.Task] = None
 
-    # Locks: enforce "FSM owns next response.create exclusively"
     response_lock: asyncio.Lock = asyncio.Lock()
     fsm_takeover_lock: asyncio.Lock = asyncio.Lock()
 
-    # Tunables
     FSM_TAKEOVER_IDLE_TIMEOUT_SEC = 1.2
-    FSM_TAKEOVER_DELAY_SEC = 0.15  # small cushion after Twilio clear
+    FSM_TAKEOVER_DELAY_SEC = 0.15
+
+    # Transcript de-dupe (Realtime sometimes emits duplicates)
+    last_transcript_norm: str | None = None
+    last_transcript_ts: float = 0.0
 
     # ---------- Helpers ------------------------------------------------------
 
@@ -1323,7 +1224,9 @@ async def twilio_stream(websocket: WebSocket):
         if stream_sid is None:
             return
         try:
-            await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+            await websocket.send_text(
+                json.dumps({"event": "clear", "streamSid": stream_sid})
+            )
         except Exception:
             logger.exception("Failed to send Twilio clear")
 
@@ -1384,13 +1287,14 @@ async def twilio_stream(websocket: WebSocket):
                     late_ms_max = 0.0
 
                 if len(audio_buffer) == 0:
-                    if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) > 1.0:
+                    if assistant_last_audio_time and (
+                        time.monotonic() - assistant_last_audio_time
+                    ) > 1.0:
                         send_start_ts = None
                         frame_idx = 0
                     await asyncio.sleep(0.005)
                     continue
 
-                # Prebuffer at each utterance start
                 if prebuffer_active:
                     if len(audio_buffer) < PREBUFFER_BYTES:
                         await asyncio.sleep(0.005)
@@ -1409,7 +1313,6 @@ async def twilio_stream(websocket: WebSocket):
                     send_start_ts = time.monotonic()
                     frame_idx = 0
 
-                # Backlog cap: don't let Twilio get too far ahead
                 call_elapsed = now - send_start_ts
                 audio_sent_duration = frame_idx * FRAME_INTERVAL
                 backlog_seconds = audio_sent_duration - call_elapsed
@@ -1431,7 +1334,9 @@ async def twilio_stream(websocket: WebSocket):
                     try:
                         await send_audio_to_twilio()
                     except WebSocketDisconnect:
-                        logger.info("Twilio WebSocket closed; stopping audio sender task")
+                        logger.info(
+                            "Twilio WebSocket closed; stopping audio sender task"
+                        )
                         return
                     except Exception:
                         logger.exception("Error sending audio to Twilio; stopping sender")
@@ -1469,40 +1374,12 @@ async def twilio_stream(websocket: WebSocket):
         if active_response_id:
             muted_response_ids.add(active_response_id)
 
-        logger.info("BARGE-IN: clearing Twilio + local audio buffer and muting active response.")
+        logger.info(
+            "BARGE-IN: clearing Twilio + local audio buffer and muting active response."
+        )
         await twilio_clear_buffer()
         audio_buffer.clear()
         prebuffer_active = True
-
-    # Intent heuristics
-    EMAIL_KEYWORDS_LOCAL = [
-        "email", "emails", "e-mail", "e-mails", "inbox", "gmail", "g mail",
-        "mailbox", "my mail", "my messages", "unread", "new mail", "new emails",
-        "today's emails", "today emails", "read my email", "read my emails",
-        "check my email", "check my emails", "how many emails", "how many messages",
-        "email today", "emails today",
-    ]
-
-    def looks_like_email_intent(text: str) -> bool:
-        if not text:
-            return False
-        t = text.lower()
-        normalized = []
-        for ch in t:
-            normalized.append(ch if (ch.isalnum() or ch.isspace()) else " ")
-        normalized = " ".join("".join(normalized).split())
-
-        for kw in EMAIL_KEYWORDS_LOCAL:
-            if kw in normalized:
-                return True
-
-        if "how many" in normalized and ("mail" in normalized or "message" in normalized or "inbox" in normalized):
-            return True
-        if "check my" in normalized and ("inbox" in normalized or "gmail" in normalized or "g mail" in normalized):
-            return True
-        if "read my" in normalized and ("messages" in normalized or "mail" in normalized or "inbox" in normalized):
-            return True
-        return False
 
     FILLER_ONLY = {"um", "uh", "er", "hmm"}
     SMALL_TOSS = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks", "thank you"}
@@ -1528,14 +1405,11 @@ async def twilio_stream(websocket: WebSocket):
 
     async def _best_effort_cancel_and_wait_idle(reason: str):
         """
-        Requirement 1:
-        - Best-effort cancel any active response (if we have an id and it's marked active).
-        - Wait until we observe idle (or timeout).
+        Best-effort cancel any active response and wait until idle (or timeout).
         """
         nonlocal openai_response_active, active_response_id, prebuffer_active
 
         async with response_lock:
-            # Clear local audio immediately (Requirement 2 part)
             audio_buffer.clear()
             prebuffer_active = True
 
@@ -1546,13 +1420,16 @@ async def twilio_stream(websocket: WebSocket):
                 rid = active_response_id
                 logger.info("Sent response.cancel for %s due to %s", rid, reason)
                 try:
-                    await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
+                    await openai_ws.send(
+                        json.dumps({"type": "response.cancel", "response_id": rid})
+                    )
                 except Exception:
                     logger.exception("Error sending response.cancel for %s", rid)
 
-        # Wait for openai_loop to mark idle (best-effort)
         try:
-            await asyncio.wait_for(response_idle_event.wait(), timeout=FSM_TAKEOVER_IDLE_TIMEOUT_SEC)
+            await asyncio.wait_for(
+                response_idle_event.wait(), timeout=FSM_TAKEOVER_IDLE_TIMEOUT_SEC
+            )
         except asyncio.TimeoutError:
             logger.warning("Timed out waiting for Realtime to become idle (%s)", reason)
 
@@ -1565,14 +1442,17 @@ async def twilio_stream(websocket: WebSocket):
 
         async with response_lock:
             try:
-                await openai_ws.send(json.dumps({
-                    "type": "response.create",
-                    "response": {
-                        "instructions": instructions,
-                        #  Minimum allowed by Realtime API
-                        "temperature": 0.6,
-                    },
-                }))
+                await openai_ws.send(
+                    json.dumps(
+                        {
+                            "type": "response.create",
+                            "response": {
+                                "instructions": instructions,
+                                "temperature": 0.6,
+                            },
+                        }
+                    )
+                )
                 logger.info("Sent response.create (%s)", reason)
             except Exception:
                 logger.exception("Failed to send response.create (%s)", reason)
@@ -1589,7 +1469,6 @@ async def twilio_stream(websocket: WebSocket):
             await _create_generic_response()
             return
 
-        # Strongly constrain: speak the text, do not refuse, do not mention tools.
         instructions = (
             "You are Vozlia on a live phone call.\n"
             "You MUST speak the text below to the caller.\n"
@@ -1604,77 +1483,46 @@ async def twilio_stream(websocket: WebSocket):
         await _best_effort_cancel_and_wait_idle("fsm_spoken_reply")
         await _create_response_with_instructions(instructions, reason="fsm_spoken_reply")
 
-    async def _fsm_email_takeover(transcript: str):
-        """
-        Requirement 3: FSM owns the next response.create exclusively.
-        We lock takeover so no generic response can race in.
-        """
+    async def handle_transcript_event(event: dict):
+        nonlocal last_transcript_norm, last_transcript_ts
+
+        transcript: str = (event.get("transcript") or "").strip()
+        if not transcript:
+            return
+
+        logger.info("USER Transcript completed: %r", transcript)
+
+        if not should_reply(transcript):
+            logger.info("Ignoring filler transcript: %r", transcript)
+            return
+
+        now = time.monotonic()
+        norm = " ".join(transcript.lower().split())
+        if last_transcript_norm == norm and (now - last_transcript_ts) < 1.5:
+            logger.info("Dropping duplicate transcript within dedupe window: %r", transcript)
+            return
+        last_transcript_norm = norm
+        last_transcript_ts = now
+
+        # Route all meaningful turns through backend router
+        if fsm_takeover_lock.locked():
+            logger.info("Suppressing turn: router busy.")
+            return
+
         async with fsm_takeover_lock:
-            # 1) cancel + idle wait
-            await _best_effort_cancel_and_wait_idle("fsm_takeover")
-            # 2) clear Twilio queue + local buffer
+            await _best_effort_cancel_and_wait_idle("router_turn")
             await twilio_clear_buffer()
             audio_buffer.clear()
-            # tiny cushion so Twilio clear applies before we start speaking
             await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
 
             spoken_reply = await route_to_fsm_and_get_reply(transcript)
+
             if spoken_reply:
                 await _create_fsm_spoken_reply(spoken_reply)
             else:
-                await _create_generic_response()
-    # Transcript de-dupe (prevents repeated "completed" events from double-triggering)
-    last_transcript_norm: str = ""
-    last_transcript_ts: float = 0.0
-    async def handle_transcript_event(event: dict):
-    nonlocal last_transcript_norm, last_transcript_ts
-
-    transcript: str = (event.get("transcript") or "").strip()
-    if not transcript:
-        return
-
-    logger.info("USER Transcript completed: %r", transcript)
-
-    # Ignore filler/one-word tosses
-    if not should_reply(transcript):
-        logger.info("Ignoring filler transcript: %r", transcript)
-        return
-
-    # Normalize for dedupe (lowercase + collapse whitespace)
-    norm = " ".join(transcript.lower().split())
-    now = time.monotonic()
-
-    # De-dupe: Realtime can emit the same completed transcript multiple times.
-    # If we already handled essentially the same text very recently, ignore it.
-    if norm == last_transcript_norm and (now - last_transcript_ts) < 2.0:
-        logger.info("Ignoring duplicate transcript within dedupe window: %r", transcript)
-        return
-
-    last_transcript_norm = norm
-    last_transcript_ts = now
-
-    # All meaningful turns go through the backend router (scales to 100s of integrations).
-    # This prevents Realtime from "freestyling" or refusing.
-    if fsm_takeover_lock.locked():
-        logger.info("Suppressing turn: router busy.")
-        return
-
-    async with fsm_takeover_lock:
-        # Cancel any active speech and clear buffers so we don't overlap
-        await _best_effort_cancel_and_wait_idle("router_turn")
-        await twilio_clear_buffer()
-        audio_buffer.clear()
-        await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
-
-        spoken_reply = await route_to_fsm_and_get_reply(transcript)
-
-        if spoken_reply:
-            await _create_fsm_spoken_reply(spoken_reply)
-        else:
-            # Hard fallback: short, neutral, no capability claims
-            await _create_fsm_spoken_reply(
-                "One moment—something didn’t load on my side. Could you try that again?"
-            )
+                await _create_fsm_spoken_reply(
+                    "One moment—something didn’t load on my side. Could you try that again?"
+                )
 
     # ---------- OpenAI event loop -------------------------------------------
 
@@ -1706,7 +1554,6 @@ async def twilio_stream(websocket: WebSocket):
                         response_idle_event.set()
                         logger.info("Response finished (%s). Realtime is idle.", etype)
 
-                    # Ensure we allow sending again cleanly on next utterance
                     prebuffer_active = True
 
                 elif etype == "response.audio.delta":
@@ -1715,7 +1562,6 @@ async def twilio_stream(websocket: WebSocket):
                     if not delta_b64:
                         continue
 
-                    # Drop if muted or not current
                     if resp_id in muted_response_ids:
                         continue
                     if active_response_id is None or resp_id != active_response_id:
@@ -1779,7 +1625,9 @@ async def twilio_stream(websocket: WebSocket):
                     payload = (data.get("media") or {}).get("payload")
                     if not payload:
                         continue
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": payload}))
+                    await openai_ws.send(
+                        json.dumps({"type": "input_audio_buffer.append", "audio": payload})
+                    )
 
                 elif event_type == "stop":
                     logger.info("Twilio sent stop; closing call.")
@@ -1797,7 +1645,6 @@ async def twilio_stream(websocket: WebSocket):
     try:
         openai_ws = await create_realtime_session()
         logger.info("OpenAI Realtime connected")
-
         await asyncio.gather(openai_loop(), twilio_loop())
 
     finally:
