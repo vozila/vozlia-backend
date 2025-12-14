@@ -1623,57 +1623,58 @@ async def twilio_stream(websocket: WebSocket):
                 await _create_fsm_spoken_reply(spoken_reply)
             else:
                 await _create_generic_response()
-
+    # Transcript de-dupe (prevents repeated "completed" events from double-triggering)
+    last_transcript_norm: str = ""
+    last_transcript_ts: float = 0.0
     async def handle_transcript_event(event: dict):
-        transcript: str = (event.get("transcript") or "").strip()
-        if not transcript:
-            return
+    nonlocal last_transcript_norm, last_transcript_ts
 
-        logger.info("USER Transcript completed: %r", transcript)
+    transcript: str = (event.get("transcript") or "").strip()
+    if not transcript:
+        return
 
-        if not should_reply(transcript):
-            logger.info("Ignoring filler transcript: %r", transcript)
-            return
+    logger.info("USER Transcript completed: %r", transcript)
 
-        # All meaningful turns go through the backend router (scales to 100s of integrations).
-        # This prevents Realtime from "freestyling" or refusing.
-        if fsm_takeover_lock.locked():
-            logger.info("Suppressing turn: router busy.")
-            return
+    # Ignore filler/one-word tosses
+    if not should_reply(transcript):
+        logger.info("Ignoring filler transcript: %r", transcript)
+        return
 
-        async with fsm_takeover_lock:
-            # Cancel any active speech and clear buffers so we don't overlap
-            await _best_effort_cancel_and_wait_idle("router_turn")
-            await twilio_clear_buffer()
-            audio_buffer.clear()
-            await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
+    # Normalize for dedupe (lowercase + collapse whitespace)
+    norm = " ".join(transcript.lower().split())
+    now = time.monotonic()
 
-            spoken_reply = await route_to_fsm_and_get_reply(transcript)
+    # De-dupe: Realtime can emit the same completed transcript multiple times.
+    # If we already handled essentially the same text very recently, ignore it.
+    if norm == last_transcript_norm and (now - last_transcript_ts) < 2.0:
+        logger.info("Ignoring duplicate transcript within dedupe window: %r", transcript)
+        return
 
-            if spoken_reply:
-                await _create_fsm_spoken_reply(spoken_reply)
-            else:
-                # Hard fallback: short, neutral, no capability claims
-                await _create_fsm_spoken_reply(
-                    "One moment—something didn’t load on my side. Could you try that again?"
-                )
+    last_transcript_norm = norm
+    last_transcript_ts = now
 
+    # All meaningful turns go through the backend router (scales to 100s of integrations).
+    # This prevents Realtime from "freestyling" or refusing.
+    if fsm_takeover_lock.locked():
+        logger.info("Suppressing turn: router busy.")
+        return
 
-        logger.info("USER Transcript completed: %r", transcript)
+    async with fsm_takeover_lock:
+        # Cancel any active speech and clear buffers so we don't overlap
+        await _best_effort_cancel_and_wait_idle("router_turn")
+        await twilio_clear_buffer()
+        audio_buffer.clear()
+        await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
 
-        if not should_reply(transcript):
-            logger.info("Ignoring filler transcript: %r", transcript)
-            return
+        spoken_reply = await route_to_fsm_and_get_reply(transcript)
 
-        if looks_like_email_intent(transcript):
-            logger.info("Transcript looks like email intent; entering FSM takeover.")
-            await _fsm_email_takeover(transcript)
+        if spoken_reply:
+            await _create_fsm_spoken_reply(spoken_reply)
         else:
-            # If an FSM takeover is in progress, suppress generic replies.
-            if fsm_takeover_lock.locked():
-                logger.info("Suppressing generic reply: FSM takeover in progress.")
-                return
-            await _create_generic_response()
+            # Hard fallback: short, neutral, no capability claims
+            await _create_fsm_spoken_reply(
+                "One moment—something didn’t load on my side. Could you try that again?"
+            )
 
     # ---------- OpenAI event loop -------------------------------------------
 
