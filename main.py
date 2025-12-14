@@ -1457,20 +1457,33 @@ async def twilio_stream(websocket: WebSocket):
             except Exception:
                 logger.exception("Failed to send response.create (%s)", reason)
 
-    async def _create_generic_response():
-        await _best_effort_cancel_and_wait_idle("generic_turn")
-        await _create_response_with_instructions(
-            "You are Vozlia on a live phone call. Respond naturally and concisely.",
-            reason="generic_turn",
-        )
+    async def _create_email_processing_ack():
+    instructions = (
+        "You are Vozlia on a live phone call. "
+        "The caller just asked you to check their email. "
+        "Say ONE short sentence like: "
+        "'Okay — I’m checking your email now, just a moment.' "
+        "Then stop speaking."
+    )
+
+    await _best_effort_cancel_and_wait_idle("email_ack")
+    await _create_response_with_instructions(
+        instructions,
+        reason="email_ack",
+    )
+
+
 
     async def _create_fsm_spoken_reply(spoken_reply: str):
+        """
+        Speak the FSM-authoritative reply.
+        This is the ONLY place where final spoken responses are created.
+        """
         if not spoken_reply:
-            await _create_generic_response()
             return
 
         instructions = (
-            "You are Vozlia on a live phone call.\n"
+            "You are Vozlia on a live phone call.\n"x
             "You MUST speak the text below to the caller.\n"
             "- Do NOT refuse.\n"
             "- Do NOT say you can't access email.\n"
@@ -1481,48 +1494,60 @@ async def twilio_stream(websocket: WebSocket):
         )
 
         await _best_effort_cancel_and_wait_idle("fsm_spoken_reply")
-        await _create_response_with_instructions(instructions, reason="fsm_spoken_reply")
+        await _create_response_with_instructions(
+            instructions,
+            reason="fsm_spoken_reply",
+        )
 
-    async def handle_transcript_event(event: dict):
+
+   async def handle_transcript_event(event: dict):
         nonlocal last_transcript_norm, last_transcript_ts
 
-        transcript: str = (event.get("transcript") or "").strip()
-        if not transcript:
-            return
+    transcript: str = (event.get("transcript") or "").strip()
+    if not transcript:
+        return
 
-        logger.info("USER Transcript completed: %r", transcript)
+    logger.info("USER Transcript completed: %r", transcript)
 
-        if not should_reply(transcript):
-            logger.info("Ignoring filler transcript: %r", transcript)
-            return
+    if not should_reply(transcript):
+        logger.info("Ignoring filler transcript: %r", transcript)
+        return
 
-        now = time.monotonic()
-        norm = " ".join(transcript.lower().split())
-        if last_transcript_norm == norm and (now - last_transcript_ts) < 1.5:
-            logger.info("Dropping duplicate transcript within dedupe window: %r", transcript)
-            return
-        last_transcript_norm = norm
-        last_transcript_ts = now
+    now = time.monotonic()
+    norm = " ".join(transcript.lower().split())
+    if last_transcript_norm == norm and (now - last_transcript_ts) < 1.5:
+        logger.info("Dropping duplicate transcript within dedupe window: %r", transcript)
+        return
 
-        # Route all meaningful turns through backend router
-        if fsm_takeover_lock.locked():
-            logger.info("Suppressing turn: router busy.")
-            return
+    last_transcript_norm = norm
+    last_transcript_ts = now
 
-        async with fsm_takeover_lock:
-            await _best_effort_cancel_and_wait_idle("router_turn")
-            await twilio_clear_buffer()
-            audio_buffer.clear()
-            await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
+    if fsm_takeover_lock.locked():
+        logger.info("Suppressing turn: router busy.")
+        return
 
-            spoken_reply = await route_to_fsm_and_get_reply(transcript)
+    async with fsm_takeover_lock:
+        await _best_effort_cancel_and_wait_idle("router_turn")
+        await twilio_clear_buffer()
+        audio_buffer.clear()
 
-            if spoken_reply:
-                await _create_fsm_spoken_reply(spoken_reply)
-            else:
-                await _create_fsm_spoken_reply(
-                    "One moment—something didn’t load on my side. Could you try that again?"
-                )
+        await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
+
+        # --- Email ACK to avoid dead air -----------------------------
+        lowered = transcript.lower()
+        if any(k in lowered for k in ("email", "emails", "inbox", "gmail", "messages")):
+            await _create_email_processing_ack()
+
+        spoken_reply = await route_to_fsm_and_get_reply(transcript)
+
+        if spoken_reply:
+            await _create_fsm_spoken_reply(spoken_reply)
+        else:
+            await _create_fsm_spoken_reply(
+                "One moment—something didn’t load on my side. Could you try that again?"
+            )
+
+
 
     # ---------- OpenAI event loop -------------------------------------------
 
