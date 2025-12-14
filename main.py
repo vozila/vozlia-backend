@@ -68,47 +68,141 @@ def decrypt_str(value: str | None) -> str | None:
     return f.decrypt(value.encode()).decode()
 
 
-# ---------- FSM debug endpoint (text-only) ----------
+# ---------- FSM debug endpoint (rich, text-only) ----------
 @app.post("/fsm/debug")
 async def fsm_debug(request: Request):
     """
-    Simple text-only endpoint to exercise the VozliaFSM.
+    Rich text-only endpoint to exercise VozliaFSM with structured output.
 
-    Body example:
-      { "text": "Do I have any unread emails?" }
+    Request body (minimal):
+      { "text": "Check my email" }
 
-    Returns whatever the FSM decides:
+    Optional fields:
       {
-        "intent": "...",
-        "state": "...",
-        "backend_call": { ... },
-        "spoken_reply": "...",
-        "raw": { ... }   # optional extra info
+        "text": "...",
+        "context": { ... },
+        "account_id": "optional",
+        "channel": "debug|phone|chat",
+        "user_id": "optional",
+        "include_raw": true,
+        "include_request": true,
+        "truncate": 400
       }
     """
-    body = await request.json()
-    text = (body.get("text") or "").strip()
+    # --- Parse JSON safely ---
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be valid JSON")
 
+    text = (body.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text' in request body")
 
-    # New FSM instance per request for now (stateless behavior)
+    # --- Optional knobs ---
+    include_raw = bool(body.get("include_raw", True))
+    include_request = bool(body.get("include_request", False))
+    truncate = int(body.get("truncate", 400) or 400)
+    if truncate < 0:
+        truncate = 0
+    if truncate > 4000:
+        truncate = 4000  # safety cap
+
+    # --- Construct context (debug-friendly, non-breaking) ---
+    ctx = body.get("context") if isinstance(body.get("context"), dict) else {}
+    channel = body.get("channel") or ctx.get("channel") or "debug"
+    ctx.setdefault("channel", channel)
+
+    # allow passing user_id/account_id in either top-level or context
+    if body.get("user_id") is not None:
+        ctx.setdefault("user_id", body.get("user_id"))
+    if body.get("account_id") is not None:
+        ctx.setdefault("account_id", body.get("account_id"))
+
+    # --- Run FSM ---
     fsm = VozliaFSM()
+    t0 = time.monotonic()
 
     try:
-        fsm_result = fsm.handle_utterance(text)
+        # If your FSM doesn't accept `context=...`, we fall back gracefully.
+        try:
+            fsm_result = fsm.handle_utterance(text, context=ctx)
+        except TypeError:
+            fsm_result = fsm.handle_utterance(text)
     except Exception as e:
-        logger.exception("Error running VozliaFSM")
-        raise HTTPException(
-            status_code=500,
-            detail=f"FSM error: {e}",
-        )
+        logger.exception("FSM debug exception: text=%r ctx=%s", text, ctx)
+        raise HTTPException(status_code=500, detail=f"FSM error: {e}")
 
-    # You can normalize the shape here if needed:
-    return {
-        "input": text,
-        "fsm_result": fsm_result,
+    dt_ms = (time.monotonic() - t0) * 1000.0
+
+    # --- Normalize expected fields (won't crash if missing) ---
+    intent = fsm_result.get("intent")
+    state = fsm_result.get("state") or fsm_result.get("next_state")  # tolerate naming
+    backend_call = fsm_result.get("backend_call")
+    spoken_reply = fsm_result.get("spoken_reply") or fsm_result.get("reply") or ""
+
+    # Optional deeper debug fields if your FSM provides them
+    confidence = fsm_result.get("confidence") or fsm_result.get("intent_confidence")
+    reasons = fsm_result.get("reasons") or fsm_result.get("debug_reasons")
+    trace = fsm_result.get("trace") or fsm_result.get("debug_trace")
+    raw = fsm_result.get("raw")  # you mentioned you might include this
+
+    # --- Log a compact line + a little detail ---
+    logger.info(
+        "FSM debug: dt_ms=%.1f channel=%s text=%r intent=%r state=%r backend_call=%r spoken_reply=%r",
+        dt_ms,
+        channel,
+        text,
+        intent,
+        state,
+        backend_call,
+        (spoken_reply or "")[:200],
+    )
+
+    # --- Build response payload ---
+    out = {
+        "ok": True,
+        "dt_ms": round(dt_ms, 2),
+        "input": {
+            "text": text,
+            "channel": channel,
+            "context": ctx,
+        },
+        "decision": {
+            "intent": intent,
+            "confidence": confidence,
+            "state": state,
+            "backend_call": backend_call,
+            "spoken_reply": (spoken_reply[:truncate] if truncate else spoken_reply),
+            "reasons": reasons,
+            "trace": trace,
+        },
+        "fsm_result_keys": sorted(list(fsm_result.keys())) if isinstance(fsm_result, dict) else [],
     }
+
+    # include full raw result if desired (can be large)
+    if include_raw:
+        out["fsm_result"] = fsm_result
+
+    # include any nested "raw" (if your FSM uses it)
+    if raw is not None:
+        out["raw"] = raw
+
+    # include request metadata if desired
+    if include_request:
+        out["request"] = {
+            "method": request.method,
+            "url": str(request.url),
+            "headers": {
+                # keep it safe-ish; you can expand if you want
+                "user-agent": request.headers.get("user-agent"),
+                "x-forwarded-for": request.headers.get("x-forwarded-for"),
+                "x-request-id": request.headers.get("x-request-id"),
+            },
+            "client": str(request.client) if request.client else None,
+        }
+
+    return out
 
 
 # ---------- Google / Gmail OAuth config ----------
@@ -957,14 +1051,19 @@ VOZLIA_BACKEND_BASE_URL = os.getenv(
 )
 
 
+# ---------- FSM router helper for external callers (Twilio, ChatGPT tools, etc.) ----------
+VOZLIA_BACKEND_BASE_URL = os.getenv(
+    "VOZLIA_BACKEND_BASE_URL",
+    "https://vozlia-backend.onrender.com",
+)
+
 async def call_fsm_router(
     text: str,
     context: Optional[dict] = None,
     account_id: Optional[str] = None,
 ) -> dict:
     """
-    Helper to call the unified /assistant/route endpoint from other parts of
-    the system.
+    Calls /assistant/route with timeouts that can handle Gmail + summarization.
     """
     if not text:
         return {"spoken_reply": "", "fsm": {}, "gmail": None}
@@ -976,21 +1075,46 @@ async def call_fsm_router(
     if account_id is not None:
         payload["account_id"] = account_id
 
+    # IMPORTANT: give /assistant/route enough time to do Gmail + summarization
+    timeout = httpx.Timeout(
+        connect=5.0,   # TCP connect
+        read=30.0,     # server processing + response body
+        write=10.0,    # request body send
+        pool=5.0,      # pool acquire
+    )
+
+    t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client_http:
+        async with httpx.AsyncClient(timeout=timeout) as client_http:
             resp = await client_http.post(url, json=payload)
+            dt_ms = (time.monotonic() - t0) * 1000.0
+
+            logger.info(
+                "call_fsm_router ok dt_ms=%.1f status=%s bytes=%s",
+                dt_ms,
+                resp.status_code,
+                resp.headers.get("content-length"),
+            )
+
             resp.raise_for_status()
             return resp.json()
+
+    except httpx.TimeoutException as e:
+        dt_ms = (time.monotonic() - t0) * 1000.0
+        logger.exception("call_fsm_router TIMEOUT dt_ms=%.1f url=%s err=%r", dt_ms, url, e)
+
     except Exception as e:
-        logger.exception("Error calling /assistant/route at %s: %s", url, e)
-        return {
-            "spoken_reply": (
-                "I tried to check that information in the backend, "
-                "but something went wrong. Please try again in a moment."
-            ),
-            "fsm": {"error": str(e)},
-            "gmail": None,
-        }
+        dt_ms = (time.monotonic() - t0) * 1000.0
+        logger.exception("call_fsm_router ERROR dt_ms=%.1f url=%s err=%r", dt_ms, url, e)
+
+    return {
+        "spoken_reply": (
+            "I tried to check that information in the backend, "
+            "but something went wrong. Please try again in a moment."
+        ),
+        "fsm": {"error": "call_fsm_router_failed"},
+        "gmail": None,
+    }
 
 
 # ---------- OpenAI config ----------
@@ -1408,7 +1532,6 @@ async def twilio_stream(websocket: WebSocket):
         except Exception:
             logger.exception("Error calling /assistant/route")
             return None
-
     async def _best_effort_cancel_and_wait_idle(reason: str):
         nonlocal openai_response_active, active_response_id, prebuffer_active
 
@@ -1423,16 +1546,25 @@ async def twilio_stream(websocket: WebSocket):
                 rid = active_response_id
                 clog("response.cancel attempt rid=%s reason=%s", rid, reason)
                 try:
-                    await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
+                    await openai_ws.send(
+                        json.dumps({"type": "response.cancel", "response_id": rid})
+                    )
                 except Exception:
                     logger.exception("Error sending response.cancel rid=%s", rid)
 
         try:
-            await asyncio.wait_for(response_idle_event.wait(), timeout=FSM_TAKEOVER_IDLE_TIMEOUT_SEC)
+            await asyncio.wait_for(
+                response_idle_event.wait(),
+                timeout=FSM_TAKEOVER_IDLE_TIMEOUT_SEC,
+            )
         except asyncio.TimeoutError:
             clog("Timed out waiting for Realtime idle (reason=%s)", reason)
 
     async def _create_response_with_instructions(instructions: str, reason: str):
+        # If call is already over, never create new OpenAI responses.
+        if twilio_ws_closed:
+            clog("response.create SKIP (call closed) reason=%s", reason)
+            return
         if not openai_ws:
             return
 
@@ -1446,10 +1578,17 @@ async def twilio_stream(websocket: WebSocket):
 
         async with response_lock:
             try:
-                await openai_ws.send(json.dumps({
-                    "type": "response.create",
-                    "response": {"instructions": instructions, "temperature": 0.6},
-                }))
+                await openai_ws.send(
+                    json.dumps(
+                        {
+                            "type": "response.create",
+                            "response": {
+                                "instructions": instructions,
+                                "temperature": 0.6,
+                            },
+                        }
+                    )
+                )
                 clog("response.create sent reason=%s", reason)
             except Exception:
                 logger.exception("Failed to send response.create reason=%s", reason)
@@ -1464,6 +1603,25 @@ async def twilio_stream(websocket: WebSocket):
         )
         await _best_effort_cancel_and_wait_idle("email_ack")
         await _create_response_with_instructions(instructions, reason="email_ack")
+
+    async def _create_fsm_spoken_reply(spoken_reply: str):
+        if not spoken_reply:
+            return
+
+        instructions = (
+            "You are Vozlia on a live phone call.\n"
+            "You MUST speak the text below to the caller.\n"
+            "- Do NOT refuse.\n"
+            "- Do NOT say you can't access email.\n"
+            "- Do NOT mention tools, APIs, privacy, or security.\n"
+            "- Keep it concise.\n\n"
+            "TEXT TO SPEAK:\n"
+            f"{spoken_reply}\n"
+        )
+
+        await _best_effort_cancel_and_wait_idle("fsm_spoken_reply")
+        await _create_response_with_instructions(instructions, reason="fsm_spoken_reply")
+
 
     async def _create_fsm_spoken_reply(spoken_reply: str):
         if not spoken_reply:
