@@ -1307,6 +1307,16 @@ async def twilio_stream(websocket: WebSocket):
     active_response_id: Optional[str] = None  # The single "currently active" response
     allowed_response_ids: set[str] = set()    # (kept for future use, mostly logging)
 
+    # --- FSM takeover (email-after-chitchat) -------------------------------
+    # When the user asks to read email while the assistant is (or was just) speaking,
+    # we need to ensure:
+    #   1) No active OpenAI response exists
+    #   2) Twilio sender buffer is cleared
+    #   3) FSM owns the next response.create exclusively
+    FSM_TAKEOVER_DELAY_SEC: float = float(os.getenv("FSM_TAKEOVER_DELAY_SEC", "0.35"))
+    FSM_TAKEOVER_MAX_WAIT_SEC: float = float(os.getenv("FSM_TAKEOVER_MAX_WAIT_SEC", "1.50"))
+    fsm_takeover_lock = asyncio.Lock()
+
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
         """
@@ -1682,6 +1692,12 @@ async def twilio_stream(websocket: WebSocket):
         We explicitly cancel any active response first to keep Realtime happy
         and avoid 'conversation_already_has_active_response' errors.
         """
+        # If an email takeover is in progress, do not generate a generic reply.
+        # The FSM must exclusively own the next response.create.
+        if fsm_takeover_lock.locked():
+            logger.info("create_generic_response: suppressed (fsm_takeover_lock active)")
+            return
+
         await _cancel_active_and_clear_buffer("create_generic_response")
 
         await openai_ws.send(json.dumps({"type": "response.create"}))
@@ -1758,6 +1774,43 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Failed to send email processing acknowledgement")
 
 
+
+# --- Helper: wait for OpenAI to be idle --------------------------------
+async def _wait_for_openai_idle(max_wait_sec: float) -> bool:
+    """Wait until we believe the assistant has no active response AND no queued audio."""
+    deadline = time.monotonic() + max_wait_sec
+    while time.monotonic() < deadline:
+        if (active_response_id is None) and (len(audio_buffer) == 0) and (not assistant_actively_speaking()):
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+# --- Helper: exclusive FSM takeover for email intent --------------------
+async def _email_fsm_takeover(transcript: str):
+    """Ensure the next response.create is owned by the FSM email flow."""
+    async with fsm_takeover_lock:
+        # Hard stop anything currently speaking (or just spoken)
+        await _cancel_active_and_clear_buffer("email_fsm_takeover")
+        await twilio_clear_buffer()
+
+        # Give Realtime a brief moment to converge its internal 'active response' state.
+        await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
+
+        # Wait (bounded) for us to observe a clean idle state.
+        await _wait_for_openai_idle(FSM_TAKEOVER_MAX_WAIT_SEC)
+
+        # Optional: super-short acknowledgement if we're currently idle.
+        if (active_response_id is None) and (not assistant_actively_speaking()):
+            await create_email_processing_ack()
+            await asyncio.sleep(0.05)
+
+        spoken_reply = await route_to_fsm_and_get_reply(transcript)
+        if spoken_reply:
+            await create_fsm_spoken_reply(spoken_reply)
+        else:
+            logger.warning("FSM returned no spoken_reply; falling back to generic reply.")
+            await create_generic_response()
+
     # --- Helper: handle transcripts from Realtime ---------------------------
     async def handle_transcript_event(event: dict):
         """
@@ -1777,14 +1830,9 @@ async def twilio_stream(websocket: WebSocket):
         if looks_like_email_intent(transcript):
             logger.info(
                 "Debounce: transcript looks like an email/skill request; "
-                "routing to FSM + backend."
+                "routing to FSM + backend with exclusive takeover."
             )
-            spoken_reply = await route_to_fsm_and_get_reply(transcript)
-            if spoken_reply:
-                await create_fsm_spoken_reply(spoken_reply)
-            else:
-                logger.warning("FSM returned no spoken_reply; falling back to generic reply.")
-                await create_generic_response()
+            await _email_fsm_takeover(transcript)
         else:
             logger.info(
                 "Debounce: transcript does NOT look like an email/skill intent; "
