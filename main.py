@@ -1635,6 +1635,36 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("Ignoring filler transcript: %r", transcript)
             return
 
+        # All meaningful turns go through the backend router (scales to 100s of integrations).
+        # This prevents Realtime from "freestyling" or refusing.
+        if fsm_takeover_lock.locked():
+            logger.info("Suppressing turn: router busy.")
+            return
+
+        async with fsm_takeover_lock:
+            # Cancel any active speech and clear buffers so we don't overlap
+            await _best_effort_cancel_and_wait_idle("router_turn")
+            await twilio_clear_buffer()
+            audio_buffer.clear()
+            await asyncio.sleep(FSM_TAKEOVER_DELAY_SEC)
+
+            spoken_reply = await route_to_fsm_and_get_reply(transcript)
+
+            if spoken_reply:
+                await _create_fsm_spoken_reply(spoken_reply)
+            else:
+                # Hard fallback: short, neutral, no capability claims
+                await _create_fsm_spoken_reply(
+                    "One moment—something didn’t load on my side. Could you try that again?"
+                )
+
+
+        logger.info("USER Transcript completed: %r", transcript)
+
+        if not should_reply(transcript):
+            logger.info("Ignoring filler transcript: %r", transcript)
+            return
+
         if looks_like_email_intent(transcript):
             logger.info("Transcript looks like email intent; entering FSM takeover.")
             await _fsm_email_takeover(transcript)
