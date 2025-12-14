@@ -1381,8 +1381,11 @@ async def twilio_stream(websocket: WebSocket):
             return
         try:
             await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+            clog("Twilio CLEAR sent")
         except Exception:
+            clog("Twilio CLEAR FAILED")
             logger.exception("Failed to send Twilio clear")
+
 
     async def send_audio_to_twilio():
         nonlocal assistant_last_audio_time
@@ -1748,6 +1751,33 @@ async def twilio_stream(websocket: WebSocket):
                         clog("OpenAI cancel race (expected)")
                     else:
                         clog("OpenAI error event=%s", event)
+                                elif etype in ("response.text.delta", "response.output_text.delta"):
+                    # Text that the realtime model is generating (often mirrors what becomes speech)
+                    delta = event.get("delta") or ""
+                    if delta:
+                        clog("OpenAI TEXT delta: %r", delta[:200])
+
+                elif etype in ("response.text.done", "response.output_text.done"):
+                    text = event.get("text") or ""
+                    if text:
+                        clog("OpenAI TEXT done: %r", text[:400])
+
+                elif etype in (
+                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
+                ):
+                    # This is the model's transcript of what it is speaking.
+                    delta = event.get("delta") or ""
+                    if delta:
+                        clog("OpenAI SPOKEN transcript delta: %r", delta[:200])
+
+                elif etype in (
+                    "response.audio_transcript.done",
+                    "response.output_audio_transcript.done",
+                ):
+                    text = event.get("transcript") or event.get("text") or ""
+                    if text:
+                        clog("OpenAI SPOKEN transcript done: %r", text[:400])
 
         except websockets.ConnectionClosed:
             clog("OpenAI Realtime WebSocket closed")
