@@ -7,8 +7,18 @@ import time
 from typing import List, Optional
 from datetime import datetime, timedelta
 
+
+# ===============================
+# ROUTER/FSM
+# ===============================
+
 from vozlia_fsm import VozliaFSM  # and Intent if you exposed it
 from pydantic import BaseModel
+
+
+# ===============================
+# INTEGRATIONS
+# ===============================
 
 import httpx  # <-- for Google OAuth + Gmail API
 
@@ -35,8 +45,16 @@ from models import User, EmailAccount
 from schemas import EmailAccountCreate, EmailAccountRead
 from deps import get_db
 
+from core.logging import logger
+from core import config as cfg
+
 
 # ---------- Logging ----------
+
+# ===============================
+# LOGGING
+# ===============================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vozlia")
 logger.setLevel(logging.INFO)
@@ -47,6 +65,11 @@ app = FastAPI()
 
 # ---------- Crypto helpers (for passwords & OAuth tokens) ----------
 def get_fernet() -> Fernet:
+
+# ===============================
+# CONFIG
+# ===============================
+
     key = os.getenv("ENCRYPTION_KEY")
     if not key:
         raise RuntimeError("ENCRYPTION_KEY is not configured")
@@ -112,14 +135,13 @@ async def fsm_debug(request: Request):
 
 
 # ---------- Google / Gmail OAuth config ----------
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
-
-# For now: read-only Gmail scope (you can expand later)
-GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
+# (extracted to core/config.py)
+GOOGLE_CLIENT_ID = cfg.GOOGLE_CLIENT_ID
+GOOGLE_CLIENT_SECRET = cfg.GOOGLE_CLIENT_SECRET
+GOOGLE_REDIRECT_URI = cfg.GOOGLE_REDIRECT_URI
+GOOGLE_GMAIL_SCOPE = cfg.GOOGLE_GMAIL_SCOPE
+GOOGLE_TOKEN_URL = cfg.GOOGLE_TOKEN_URL
+GMAIL_API_BASE = cfg.GMAIL_API_BASE
 
 
 # Create tables on startup (simple MVP, later use Alembic)
@@ -946,6 +968,11 @@ def gmail_summary(
 
 
 # ---------- Assistant router endpoint (for phone + ChatGPT) ----------
+
+# ===============================
+# FLOW B HANDLER
+# ===============================
+
 @app.post("/assistant/route", response_model=AssistantRouteOut)
 def assistant_route(
     payload: AssistantRouteIn,
@@ -979,10 +1006,8 @@ def assistant_route(
 
 
 # ---------- FSM router helper for external callers (Twilio, ChatGPT tools, etc.) ----------
-VOZLIA_BACKEND_BASE_URL = os.getenv(
-    "VOZLIA_BACKEND_BASE_URL",
-    "https://vozlia-backend.onrender.com",
-)
+# (extracted to core/config.py)
+VOZLIA_BACKEND_BASE_URL = cfg.VOZLIA_BACKEND_BASE_URL
 
 
 async def call_fsm_router(
@@ -1025,17 +1050,12 @@ async def call_fsm_router(
 
 
 # ---------- OpenAI config ----------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY is not set. GPT / Realtime calls will fail.")
+# (env-backed config extracted to core/config.py)
+OPENAI_API_KEY = cfg.OPENAI_API_KEY
+OPENAI_REALTIME_MODEL = cfg.OPENAI_REALTIME_MODEL
+OPENAI_REALTIME_URL = cfg.OPENAI_REALTIME_URL
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-OPENAI_REALTIME_MODEL = os.getenv(
-    "OPENAI_REALTIME_MODEL",
-    "gpt-4o-mini-realtime-preview-2024-12-17",
-)
-OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
 OPENAI_REALTIME_HEADERS = {
     "Authorization": f"Bearer {OPENAI_API_KEY}" if OPENAI_API_KEY else "",
@@ -1055,7 +1075,7 @@ SUPPORTED_VOICES = {
     "cedar",
 }
 
-voice_env = os.getenv("OPENAI_REALTIME_VOICE", "coral")
+voice_env = cfg.OPENAI_REALTIME_VOICE
 if voice_env not in SUPPORTED_VOICES:
     logger.warning(
         f"Unsupported voice '{voice_env}' for Realtime. "
@@ -1177,6 +1197,11 @@ async def debug_gpt(text: str = "Hello Vozlia"):
 
 
 # ---------- Twilio inbound → TwiML ----------
+
+# ===============================
+# TWILIO ENDPOINTS
+# ===============================
+
 @app.post("/twilio/inbound")
 async def twilio_inbound(request: Request):
     form = await request.form()
@@ -2003,4 +2028,11 @@ async def twilio_stream(websocket: WebSocket):
 
         logger.info("WebSocket disconnected while sending audio")
 
+
+
+
+# ===============================
+# OBS
+# ===============================
+# NOTE: Observability is intentionally gated behind env flags. Keep it out of latency-sensitive paths.
 
