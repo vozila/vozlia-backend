@@ -1,11 +1,5 @@
-# Known Good Baseline (Flow B Realtime)
+current endpoints that work (/twilio/inbound, /twilio/stream, /auth/google/*, etc.)
 
-Status: ✅ Twilio + Realtime working end-to-end.
+current call behavior summary (what works, what doesn’t)
 
-Evidence:
-- /twilio/inbound returns TwiML and Twilio connects to /twilio/stream
-- Realtime connects and sends session.update + greeting
-- VAD + transcripts working
-- FSM email intent triggers Gmail summary and returns spoken_reply
-
-Rollback point: this commit
+the exact Render start command and envs you rely on
