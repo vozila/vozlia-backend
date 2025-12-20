@@ -6,23 +6,6 @@ import base64
 import time
 from typing import List, Optional
 from datetime import datetime, timedelta
-from core.obs import maybe_record_event
-
-
-
-# ===============================
-# ROUTER/FSM
-# ===============================
-
-from vozlia_fsm import VozliaFSM  # and Intent if you exposed it
-from pydantic import BaseModel
-
-
-# ===============================
-# INTEGRATIONS
-# ===============================
-
-import httpx  # <-- for Google OAuth + Gmail API
 
 from fastapi import (
     FastAPI,
@@ -34,54 +17,51 @@ from fastapi import (
 )
 from fastapi.responses import PlainTextResponse, Response, JSONResponse, RedirectResponse
 
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from twilio.twiml.voice_response import VoiceResponse, Connect
+import httpx  # <-- for Google OAuth + Gmail API
 from openai import OpenAI
 import websockets
 
 from cryptography.fernet import Fernet  # centralized crypto
+
+from core.obs import maybe_record_event
+from core.logging import logger
+from core import config as cfg
+
+from vozlia_fsm import VozliaFSM  # Flow B FSM
+from vozlia_twilio.inbound import router as twilio_inbound_router
 
 from db import Base, engine
 from models import User, EmailAccount
 from schemas import EmailAccountCreate, EmailAccountRead
 from deps import get_db
 
-from core.logging import logger
-from core import config as cfg
-from vozlia_twilio.inbound import router as twilio_inbound_router
-
-
-
-
-
-# ---------- Logging ----------
 
 # ===============================
 # LOGGING
 # ===============================
+# NOTE: Logging is centralized in core/logging.py.
+# Do NOT call logging.basicConfig() here or re-create the logger.
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("vozlia")
-logger.setLevel(logging.INFO)
 
 # ---------- FastAPI app ----------
 app = FastAPI()
 
+# Register routers AFTER app is defined
 app.include_router(twilio_inbound_router)
 
+
 # ---------- Crypto helpers (for passwords & OAuth tokens) ----------
+
 def get_fernet() -> Fernet:
-
-# ===============================
-# CONFIG
-# ===============================
-
     key = os.getenv("ENCRYPTION_KEY")
     if not key:
         raise RuntimeError("ENCRYPTION_KEY is not configured")
     # ENCRYPTION_KEY should be something like Fernet.generate_key().decode()
-    return Fernet(key.encode() if not key.startswith("gAAAA") else key)
+    return Fernet(key.encode())
+
 
 
 def encrypt_str(value: str | None) -> str | None:
@@ -1091,7 +1071,7 @@ if voice_env not in SUPPORTED_VOICES:
     )
     voice_env = "coral"
 
-VOICE_NAME = voice_env
+
 
 VOICE_NAME = voice_env
 
@@ -1208,6 +1188,45 @@ async def debug_gpt(text: str = "Hello Vozlia"):
 # ===============================
 # TWILIO ENDPOINTS
 # ===============================
+
+async def create_realtime_session():
+    """
+    Connect to OpenAI Realtime WS and send session.update + an initial greeting.
+    """
+    logger.info(f"Connecting to OpenAI Realtime at {OPENAI_REALTIME_URL}")
+
+    ws = await websockets.connect(
+        OPENAI_REALTIME_URL,
+        extra_headers=OPENAI_REALTIME_HEADERS,
+        max_size=16 * 1024 * 1024,
+    )
+
+    session_update = {
+        "type": "session.update",
+        "session": {
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500,
+            },
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_ulaw",
+            "voice": VOICE_NAME,
+            "instructions": REALTIME_SYSTEM_PROMPT,
+            "input_audio_transcription": {
+                "model": "whisper-1",
+            },
+        },
+    }
+
+    await ws.send(json.dumps(session_update))
+    logger.info("Sent session.update to OpenAI Realtime")
+
+    await ws.send(json.dumps({"type": "response.create"}))
+    logger.info("Sent initial greeting request to OpenAI Realtime")
+
+    return ws
 
 
 
