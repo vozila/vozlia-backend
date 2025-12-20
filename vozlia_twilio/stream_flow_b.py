@@ -7,11 +7,14 @@ import os
 import time
 from typing import Optional
 
-
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 
 from core.logging import logger
+
+# Debug toggles (env-driven)
+REALTIME_LOG_TEXT = os.getenv("REALTIME_LOG_TEXT", "0") == "1"
+REALTIME_LOG_ALL_EVENTS = os.getenv("REALTIME_LOG_ALL_EVENTS", "0") == "1"
 
 
 def _main():
@@ -273,18 +276,6 @@ async def twilio_stream(websocket: WebSocket):
 
     # ✅ Include normalized variants like "e mails"
     EMAIL_KEYWORDS_LOCAL = [
-        "email", "emails", "e-mail", "e-mails",
-        "e mail", "e mails",
-        "inbox", "gmail", "g mail", "mailbox",
-        "my mail", "my messages",
-        "unread", "new mail", "new emails",
-        "today's emails", "today emails",
-        "read my email", "read my emails",
-        "check my email", "check my emails",
-        "how many emails", "how many messages",
-        "email today", "emails today",
-        "summary of my email", "summary of my emails",
-        "summary of my e mail", "summary of my e mails",
         "email",
         "emails",
         "e-mail",
@@ -316,18 +307,17 @@ async def twilio_stream(websocket: WebSocket):
         "summary of my e mails",
     ]
 
-
     def looks_like_email_intent(text: str) -> bool:
         if not text:
             return False
         t = text.lower()
-        normalized = []
+        normalized_chars = []
         for ch in t:
             if ch.isalnum() or ch.isspace():
-                normalized.append(ch)
+                normalized_chars.append(ch)
             else:
-                normalized.append(" ")
-        normalized = " ".join("".join(normalized).split())
+                normalized_chars.append(" ")
+        normalized = " ".join("".join(normalized_chars).split())
 
         for kw in EMAIL_KEYWORDS_LOCAL:
             if kw in normalized:
@@ -432,10 +422,14 @@ async def twilio_stream(websocket: WebSocket):
             "- Just give the summary, as if you personally checked it.\n"
         )
 
-        await openai_ws.send(json.dumps({
-            "type": "response.create",
-            "response": {"instructions": instructions},
-        }))
+        await openai_ws.send(
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {"instructions": instructions},
+                }
+            )
+        )
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
     async def create_email_processing_ack():
@@ -453,10 +447,14 @@ async def twilio_stream(websocket: WebSocket):
 
         try:
             pending_response_create = True
-            await openai_ws.send(json.dumps({
-                "type": "response.create",
-                "response": {"instructions": instructions},
-            }))
+            await openai_ws.send(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "response": {"instructions": instructions},
+                    }
+                )
+            )
             logger.info("Sent email processing acknowledgement into Realtime session")
         except Exception:
             logger.exception("Failed to send email processing acknowledgement")
@@ -486,6 +484,32 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("Debounce: transcript does NOT look like an email/skill intent; using generic GPT response.")
             await create_generic_response()
 
+    def _log_realtime_text_delta(event: dict):
+        """
+        Best-effort extraction of text delta across a few possible event shapes.
+        Kept sync + lightweight (logging only).
+        """
+        # Common shape: {"type":"response.output_text.delta","delta":{"text":"..."}}
+        delta = event.get("delta")
+        if isinstance(delta, dict):
+            txt = delta.get("text")
+            if isinstance(txt, str) and txt.strip():
+                logger.info("Realtime text delta: %r", txt)
+                return
+
+        # Alternate: {"type":"response.text.delta","text":"..."}
+        txt2 = event.get("text")
+        if isinstance(txt2, str) and txt2.strip():
+            logger.info("Realtime text delta: %r", txt2)
+            return
+
+        # Some builds nest under "response" or "output"
+        resp = event.get("response") or {}
+        if isinstance(resp, dict):
+            out = resp.get("output_text") or resp.get("text")
+            if isinstance(out, str) and out.strip():
+                logger.info("Realtime text delta: %r", out)
+
     async def openai_loop():
         nonlocal active_response_id, barge_in_enabled, user_speaking_vad, transcript_action_task, pending_response_create
 
@@ -493,6 +517,10 @@ async def twilio_stream(websocket: WebSocket):
             async for raw in openai_ws:
                 event = json.loads(raw)
                 etype = event.get("type")
+
+                # Optional: log event type surface area (VERY chatty; keep env-gated)
+                if REALTIME_LOG_ALL_EVENTS:
+                    logger.info("Realtime event: type=%s keys=%s", etype, list(event.keys()))
 
                 if etype == "response.created":
                     resp = event.get("response", {}) or {}
@@ -514,6 +542,15 @@ async def twilio_stream(websocket: WebSocket):
                         barge_in_enabled = True
                         logger.info("First response finished (event=%s, id=%s); barge-in is now ENABLED.", etype, rid)
 
+                # ✅ Restored: Realtime text stream logging (env-gated)
+                elif etype in ("response.output_text.delta", "response.text.delta", "response.output_text"):
+                    if REALTIME_LOG_TEXT:
+                        _log_realtime_text_delta(event)
+
+                elif etype in ("response.output_text.done", "response.text.done"):
+                    if REALTIME_LOG_TEXT:
+                        logger.info("Realtime text done")
+
                 elif etype == "response.audio.delta":
                     resp_id = event.get("response_id")
                     delta_b64 = event.get("delta")
@@ -528,10 +565,7 @@ async def twilio_stream(websocket: WebSocket):
                         pending_response_create = False
 
                     if resp_id != active_response_id:
-                        logger.info(
-                            "Dropping unsolicited audio for response_id=%s (active=%s)",
-                            resp_id, active_response_id
-                        )
+                        logger.info("Dropping unsolicited audio for response_id=%s (active=%s)", resp_id, active_response_id)
                         continue
 
                     if not delta_b64:
@@ -611,10 +645,14 @@ async def twilio_stream(websocket: WebSocket):
                         logger.exception("Failed to base64-decode Twilio payload")
                         continue
 
-                    await openai_ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": payload,
-                    }))
+                    await openai_ws.send(
+                        json.dumps(
+                            {
+                                "type": "input_audio_buffer.append",
+                                "audio": payload,
+                            }
+                        )
+                    )
 
                 elif event_type == "stop":
                     logger.info("Twilio stream event: stop")
