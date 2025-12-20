@@ -443,11 +443,6 @@ async def twilio_stream(websocket: WebSocket):
     # --- Transcript handling -------------------------------------------------
     async def handle_transcript_event(event: dict):
         transcript: str = event.get("transcript", "").strip()
-        if is_tool_intent(transcript):
-            spoken_reply = await route_to_fsm_and_get_reply(transcript)
-            if spoken_reply:
-                await create_fsm_spoken_reply(spoken_reply)
-            return
         if not transcript:
             return
 
@@ -457,18 +452,12 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("Ignoring filler transcript: %r", transcript)
             return
 
-        if looks_like_email_intent(transcript):
-            logger.info("Email intent detected; routing to FSM + backend.")
+        spoken_reply = await route_to_fsm_and_get_reply(transcript)
 
-            spoken_reply = await route_to_fsm_and_get_reply(transcript)
-            if spoken_reply:
-                await create_fsm_spoken_reply(spoken_reply)
-            else:
-                await create_generic_response()
+        if spoken_reply:
+            await create_fsm_spoken_reply(spoken_reply)
         else:
-            logger.info("Chit-chat intent; using generic response.")
             await create_generic_response()
-
     # --- Logging helpers -----------------------------------------------------
     def _log_realtime_audio_transcript_delta(event: dict):
         delta = event.get("delta")
