@@ -256,7 +256,7 @@ async def twilio_stream(websocket: WebSocket):
         Cancel the active OpenAI response on barge-in and clear Twilio audio.
         No `nonlocal` usage → safe against indentation mistakes.
         """
-
+        nonlocal active_response_id, prebuffer_active
         if not barge_in_enabled:
             logger.info("BARGE-IN: ignored (not yet enabled)")
             return
@@ -286,9 +286,10 @@ async def twilio_stream(websocket: WebSocket):
 
         # Reset playback state
         prebuffer_active = True
+        active_response_id = None
 
         # Drop tracking AFTER cancel attempt
-        globals()["active_response_id"] = None
+        #globals()["active_response_id"] = None
 
     # --- Intent helpers ------------------------------------------------------
     EMAIL_KEYWORDS_LOCAL = [
