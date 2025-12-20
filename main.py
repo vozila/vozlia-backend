@@ -25,7 +25,8 @@ from openai import OpenAI
 import websockets
 
 from cryptography.fernet import Fernet  # centralized crypto
-from vozlia_twilio.stream_flow_b import twilio_stream
+from vozlia_twilio.stream import twilio_stream
+
 from core.obs import maybe_record_event
 from core.logging import logger
 from core import config as cfg
