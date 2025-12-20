@@ -6,6 +6,8 @@ import base64
 import time
 from typing import List, Optional
 from datetime import datetime, timedelta
+from core.obs import maybe_record_event
+
 
 
 # ===============================
