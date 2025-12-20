@@ -113,7 +113,7 @@ async def twilio_stream(websocket: WebSocket):
     allowed_response_ids: set[str] = set()
 
     # ✅ Latch: a response.create was sent, but we may not have received response.created yet.
-    pending_response_create: bool = False
+  
 
     def assistant_actively_speaking() -> bool:
         if audio_buffer:
@@ -432,32 +432,6 @@ async def twilio_stream(websocket: WebSocket):
         )
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
-    async def create_email_processing_ack():
-        nonlocal pending_response_create
-        if not openai_ws:
-            return
-
-        instructions = (
-            "You are Vozlia on a live phone call. "
-            "The caller just asked you to check their email. "
-            "Say ONE short sentence acknowledging you're checking now, like "
-            "'Okay — I’m checking your email now; one moment.' "
-            "Then stop speaking and wait."
-        )
-
-        try:
-            pending_response_create = True
-            await openai_ws.send(
-                json.dumps(
-                    {
-                        "type": "response.create",
-                        "response": {"instructions": instructions},
-                    }
-                )
-            )
-            logger.info("Sent email processing acknowledgement into Realtime session")
-        except Exception:
-            logger.exception("Failed to send email processing acknowledgement")
 
     async def handle_transcript_event(event: dict):
         transcript: str = event.get("transcript", "").strip()
@@ -471,15 +445,12 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         if looks_like_email_intent(transcript):
-            logger.info("Debounce: transcript looks like an email/skill request; routing to FSM + backend.")
-            await create_email_processing_ack()
-
             spoken_reply = await route_to_fsm_and_get_reply(transcript)
             if spoken_reply:
                 await create_fsm_spoken_reply(spoken_reply)
             else:
-                logger.warning("FSM returned no spoken_reply; falling back to generic reply.")
                 await create_generic_response()
+
         else:
             logger.info("Debounce: transcript does NOT look like an email/skill intent; using generic GPT response.")
             await create_generic_response()
@@ -577,13 +548,7 @@ async def twilio_stream(websocket: WebSocket):
                     delta_b64 = event.get("delta")
 
                     # ✅ Adopt the response_id if audio arrives before response.created
-                    if active_response_id is None and pending_response_create and resp_id:
-                        logger.info(
-                            "Adopting response_id=%s from audio.delta (response.created not seen yet)",
-                            resp_id,
-                        )
-                        active_response_id = resp_id
-                        pending_response_create = False
+
 
                     if resp_id != active_response_id:
                         logger.info("Dropping unsolicited audio for response_id=%s (active=%s)", resp_id, active_response_id)
