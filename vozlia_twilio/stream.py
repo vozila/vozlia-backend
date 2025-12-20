@@ -17,6 +17,9 @@ from core.logging import logger
 REALTIME_LOG_TEXT = os.getenv("REALTIME_LOG_TEXT", "0") == "1"
 REALTIME_LOG_ALL_EVENTS = os.getenv("REALTIME_LOG_ALL_EVENTS", "0") == "1"
 
+# Feature flag: only call backend router for skill intents (email for now)
+SKILL_GATED_ROUTING = os.getenv("SKILL_GATED_ROUTING", "0") == "1"
+
 
 def _main():
     """
@@ -361,6 +364,51 @@ async def twilio_stream(websocket: WebSocket):
             return False
         return True
 
+    def _normalize_text(s: str) -> str:
+        t = (s or "").lower()
+        normalized_chars = []
+        for ch in t:
+            if ch.isalnum() or ch.isspace():
+                normalized_chars.append(ch)
+            else:
+                normalized_chars.append(" ")
+        return " ".join("".join(normalized_chars).split())
+
+    FILLER_ONLY = {"um", "uh", "er", "hmm"}
+    SMALL_TOSS_SINGLE = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks"}
+    SMALL_TOSS_PHRASES = {
+        "thank you",
+        "thanks so much",
+        "ok thanks",
+        "okay thanks",
+        "all good",
+        "no thanks",
+        "no thank you",
+        "thats all",
+        "that s all",
+    }
+
+    def should_reply(text: str) -> bool:
+        n = _normalize_text(text)
+        if not n:
+            return False
+
+        if n in FILLER_ONLY:
+            return False
+
+        if n in SMALL_TOSS_SINGLE:
+            return False
+
+        if n in SMALL_TOSS_PHRASES:
+            return False
+
+        # If it's very short and NOT a skill request, ignore it.
+        words = n.split()
+        if len(words) <= 2 and not looks_like_email_intent(n):
+            return False
+
+        return True
+
     # --- FSM router ----------------------------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
         try:
@@ -453,12 +501,24 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("Ignoring filler transcript: %r", transcript)
             return
 
+
+        # If skill-gated routing is enabled, only call the backend brain when
+        # the utterance looks like an email request.
+        if SKILL_GATED_ROUTING and not looks_like_email_intent(transcript):
+            logger.info(
+                "Skill-gated routing: bypassing /assistant/route for non-email utterance: %r",
+                transcript,
+            )
+            await create_generic_response()
+            return
+
         spoken_reply = await route_to_fsm_and_get_reply(transcript)
 
         if spoken_reply:
             await create_fsm_spoken_reply(spoken_reply)
         else:
             await create_generic_response()
+
     # --- Logging helpers -----------------------------------------------------
     def _log_realtime_audio_transcript_delta(event: dict):
         delta = event.get("delta")
