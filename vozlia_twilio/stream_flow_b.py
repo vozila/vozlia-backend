@@ -484,6 +484,15 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("Debounce: transcript does NOT look like an email/skill intent; using generic GPT response.")
             await create_generic_response()
 
+    def _log_realtime_audio_transcript_delta(event: dict):
+        """
+        Logs assistant speech text as produced by Realtime audio transcripts.
+        This is the canonical text stream for audio-first sessions.
+        """
+        delta = event.get("delta")
+        if isinstance(delta, str) and delta.strip():
+            logger.info("Realtime assistant said (delta): %r", delta)
+
     def _log_realtime_text_delta(event: dict):
         """
         Best-effort extraction of text delta across a few possible event shapes.
@@ -543,6 +552,18 @@ async def twilio_stream(websocket: WebSocket):
                         logger.info("First response finished (event=%s, id=%s); barge-in is now ENABLED.", etype, rid)
 
                 # ✅ Restored: Realtime text stream logging (env-gated)
+                elif etype == "response.audio_transcript.delta":
+                    if REALTIME_LOG_TEXT:
+                        _log_realtime_audio_transcript_delta(event)
+
+                elif etype == "response.audio_transcript.done":
+                    if REALTIME_LOG_TEXT:
+                        transcript = event.get("transcript")
+                        if transcript:
+                            logger.info("Realtime assistant said (final): %r", transcript)
+
+                
+                
                 elif etype in ("response.output_text.delta", "response.text.delta", "response.output_text"):
                     if REALTIME_LOG_TEXT:
                         _log_realtime_text_delta(event)
