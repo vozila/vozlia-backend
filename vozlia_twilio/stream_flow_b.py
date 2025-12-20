@@ -46,12 +46,12 @@ async def create_realtime_session():
         "session": {
             "turn_detection": {
                 "type": "server_vad",
-                "threshold": float(os.getenv("REALTIME_VAD_THRESHOLD", "0.4")),
-                "silence_duration_ms": int(os.getenv("REALTIME_VAD_SILENCE_MS", "1200")),
-                "prefix_padding_ms": int(os.getenv("REALTIME_VAD_PREFIX_MS", "200")),
+                "threshold": 0.5,
+                "silence_duration_ms": 600,
+                "prefix_padding_ms": 200,
                 "create_response": False,
                 "interrupt_response": True,
-            },
+            }
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": m.VOICE_NAME,
