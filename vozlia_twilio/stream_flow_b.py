@@ -438,33 +438,16 @@ async def twilio_stream(websocket: WebSocket):
         )
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
-    async def create_email_processing_ack():
-        """
-        Optional: quick ack before slow backend call.
-        (This exists in your refactor notes; keeping it to avoid caller silence.)
-        """
-        if not openai_ws:
-            return
-
-        instructions = (
-            "You are Vozlia on a live phone call. "
-            "The caller just asked you to check their email. "
-            "Say ONE short sentence acknowledging you're checking now, like "
-            "'Okay — I’m checking your email now; one moment.' "
-            "Then stop speaking and wait."
-        )
-        try:
-            await _cancel_active_and_clear_buffer("create_email_processing_ack")
-            await openai_ws.send(
-                json.dumps({"type": "response.create", "response": {"instructions": instructions}})
-            )
-            logger.info("Sent email processing acknowledgement into Realtime session")
-        except Exception:
-            logger.exception("Failed to send email processing acknowledgement")
+ 
 
     # --- Transcript handling -------------------------------------------------
     async def handle_transcript_event(event: dict):
         transcript: str = event.get("transcript", "").strip()
+        if is_tool_intent(transcript):
+            spoken_reply = await route_to_fsm_and_get_reply(transcript)
+            if spoken_reply:
+                await create_fsm_spoken_reply(spoken_reply)
+            return
         if not transcript:
             return
 
@@ -476,7 +459,6 @@ async def twilio_stream(websocket: WebSocket):
 
         if looks_like_email_intent(transcript):
             logger.info("Email intent detected; routing to FSM + backend.")
-            await create_email_processing_ack()
 
             spoken_reply = await route_to_fsm_and_get_reply(transcript)
             if spoken_reply:
