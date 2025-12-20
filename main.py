@@ -49,6 +49,9 @@ from deps import get_db
 
 from core.logging import logger
 from core import config as cfg
+from twilio.inbound import router as twilio_inbound_router
+app.include_router(twilio_inbound_router)
+
 
 
 # ---------- Logging ----------
@@ -1204,83 +1207,7 @@ async def debug_gpt(text: str = "Hello Vozlia"):
 # TWILIO ENDPOINTS
 # ===============================
 
-@app.post("/twilio/inbound")
-async def twilio_inbound(request: Request):
-    form = await request.form()
-    from_number = form.get("From")
-    to_number = form.get("To")
-    call_sid = form.get("CallSid")
 
-    logger.info(
-        f"Incoming call: From={from_number}, To={to_number}, CallSid={call_sid}"
-    )
-
-    resp = VoiceResponse()
-    connect = Connect()
-
-    stream_url = os.getenv(
-        "TWILIO_STREAM_URL",
-        "wss://vozlia-backend.onrender.com/twilio/stream",
-    )
-    connect.stream(url=stream_url)
-    resp.append(connect)
-
-    xml = str(resp)
-    logger.debug(f"Generated TwiML:\n{xml}")
-
-    return Response(content=xml, media_type="application/xml")
-
-
-# ---------- Helper: OpenAI Realtime session via websockets ----------
-async def create_realtime_session():
-    """
-    Connect to OpenAI Realtime WebSocket using env vars and configure the session.
-
-    We:
-    - Use server-side VAD (turn_detection.type = server_vad).
-    - Do NOT manually call input_audio_buffer.commit; Realtime handles segmentation.
-    - Set create_response=False so VAD still emits transcripts, but we control when
-      to call response.create().
-    """
-    logger.info("Connecting to OpenAI Realtime WebSocket via websockets...")
-
-    openai_ws = await websockets.connect(
-        OPENAI_REALTIME_URL,
-        extra_headers=OPENAI_REALTIME_HEADERS,
-        ping_interval=None,
-        ping_timeout=None,
-        max_size=None,
-    )
-
-    session_update = {
-        "type": "session.update",
-        "session": {
-            "instructions": REALTIME_SYSTEM_PROMPT,
-            "voice": VOICE_NAME,
-            "modalities": ["text", "audio"],
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "silence_duration_ms": 500,
-                "create_response": False,
-                "interrupt_response": True,
-            },
-            "input_audio_transcription": {
-                "model": "gpt-4o-mini-transcribe"
-            },
-        },
-    }
-
-    await openai_ws.send(json.dumps(session_update))
-    logger.info("Sent session.update to OpenAI Realtime")
-
-    # Initial greeting: rely on the system prompt to greet the caller.
-    await openai_ws.send(json.dumps({"type": "response.create"}))
-    logger.info("Sent initial greeting request to OpenAI Realtime")
-
-    return openai_ws
 
 
 # ---------- Twilio media stream ↔ OpenAI Realtime ----------
