@@ -27,6 +27,45 @@ def _main():
     return main
 
 
+async def handle_barge_in():
+        """
+        On barge-in, cancel the active OpenAI response (server-side) AND clear Twilio audio.
+        This keeps response sequencing stable and prevents lingering server audio generation.
+        """
+        nonlocal active_response_id, audio_buffer, prebuffer_active
+
+        if not barge_in_enabled:
+            logger.info("BARGE-IN: ignored (not yet enabled)")
+            return
+
+        if not assistant_actively_speaking():
+            logger.info("BARGE-IN: assistant not actively speaking; nothing to mute")
+            return
+
+        logger.info(
+            "BARGE-IN: user speech started while AI speaking; canceling active response and clearing audio buffer."
+        )
+
+        # Cancel server-side generation if we know the active response id
+        if openai_ws is not None and active_response_id:
+            rid = active_response_id
+            try:
+                await openai_ws.send(
+                    json.dumps({"type": "response.cancel", "response_id": rid})
+                )
+                logger.info("BARGE-IN: Sent response.cancel for %s", rid)
+            except Exception:
+                logger.exception("BARGE-IN: Failed sending response.cancel for %s", rid)
+
+        # Always clear local/Twilio audio immediately
+        await twilio_clear_buffer()
+        audio_buffer.clear()
+        prebuffer_active = True
+
+        # Only after cancel attempt + clear do we drop the id locally
+        active_response_id = None
+
+
 async def create_realtime_session():
     """
     Connect to OpenAI Realtime WS and send session.update + an initial greeting.
