@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import time
 from typing import Optional
+
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
