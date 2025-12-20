@@ -41,9 +41,11 @@ async def create_realtime_session():
         "session": {
             "turn_detection": {
                 "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 500,
+                "threshold": float(os.getenv("REALTIME_VAD_THRESHOLD", "0.4")),
+                "silence_duration_ms": int(os.getenv("REALTIME_VAD_SILENCE_MS", "1200")),
+                "prefix_padding_ms": int(os.getenv("REALTIME_VAD_PREFIX_MS", "200")),
+                "create_response": False,
+                "interrupt_response": True,
             },
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
@@ -68,7 +70,11 @@ async def twilio_stream(websocket: WebSocket):
     """
     Handles Twilio <-> OpenAI Realtime audio for a single phone call.
 
-    Copied from main.py (behavior unchanged), but lives in vozlia_twilio/stream_flow_b.py.
+    Changes vs previous version:
+    - Fixes email intent detection for normalized "e-mails" -> "e mails"
+    - Adds a pending-response latch so we don't drop early audio deltas
+      when response.audio.delta arrives before response.created.
+    - Uses existing create_email_processing_ack() before slow email backend calls.
     """
     m = _main()
 
@@ -86,27 +92,24 @@ async def twilio_stream(websocket: WebSocket):
     barge_in_enabled: bool = False
 
     # Lifecycle flag: becomes True when Twilio sends stop or disconnects.
-    # Used to stop background sender tasks cleanly.
     twilio_ws_closed: bool = False
 
     # Only run one transcript action at a time (avoid overlapping Gmail fetches).
     transcript_action_task: Optional[asyncio.Task] = None
 
-    # Server VAD-based user speech flag (from OpenAI events)
     user_speaking_vad: bool = False
 
-    # Outgoing assistant audio buffer (raw μ-law bytes)
     audio_buffer = bytearray()
     assistant_last_audio_time: float = 0.0
 
-    # Prebuffer state: we hold back sending until we have enough audio
     prebuffer_active: bool = True
 
-    # Response tracking
-    active_response_id: Optional[str] = None  # The single "currently active" response
-    allowed_response_ids: set[str] = set()    # (kept for future use, mostly logging)
+    active_response_id: Optional[str] = None
+    allowed_response_ids: set[str] = set()
 
-    # --- Simple helper: is assistant currently speaking? ---------------------
+    # ✅ Latch: a response.create was sent, but we may not have received response.created yet.
+    pending_response_create: bool = False
+
     def assistant_actively_speaking() -> bool:
         if audio_buffer:
             return True
@@ -115,7 +118,6 @@ async def twilio_stream(websocket: WebSocket):
                 return True
         return False
 
-    # --- Helper: send μ-law audio TO Twilio ---------------------------------
     async def send_audio_to_twilio():
         nonlocal audio_buffer, assistant_last_audio_time
 
@@ -136,7 +138,6 @@ async def twilio_stream(websocket: WebSocket):
         await websocket.send_text(json.dumps(msg))
         assistant_last_audio_time = time.monotonic()
 
-    # --- Background task: paced audio sender to Twilio ----------------------
     async def twilio_audio_sender():
         nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled
 
@@ -238,7 +239,6 @@ async def twilio_stream(websocket: WebSocket):
 
     sender_task = asyncio.create_task(twilio_audio_sender())
 
-    # --- Helper: barge-in ----------------------------------------------------
     async def twilio_clear_buffer():
         if stream_sid is None:
             return
@@ -248,7 +248,7 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Failed to send Twilio clear")
 
     async def handle_barge_in():
-        nonlocal active_response_id, audio_buffer
+        nonlocal active_response_id, audio_buffer, pending_response_create, prebuffer_active
 
         if not barge_in_enabled:
             logger.info("BARGE-IN: ignored (not yet enabled)")
@@ -264,15 +264,25 @@ async def twilio_stream(websocket: WebSocket):
         )
 
         active_response_id = None
+        pending_response_create = False
+        prebuffer_active = True
         await twilio_clear_buffer()
         audio_buffer.clear()
 
-    # --- Intent helpers ------------------------------------------------------
+    # ✅ Include normalized variants like "e mails"
     EMAIL_KEYWORDS_LOCAL = [
-        "email", "emails", "e-mail", "e-mails", "inbox", "gmail", "g mail", "mailbox",
-        "my mail", "my messages", "unread", "new mail", "new emails", "today's emails",
-        "today emails", "read my email", "read my emails", "check my email",
-        "check my emails", "how many emails", "how many messages", "email today", "emails today",
+        "email", "emails", "e-mail", "e-mails",
+        "e mail", "e mails",
+        "inbox", "gmail", "g mail", "mailbox",
+        "my mail", "my messages",
+        "unread", "new mail", "new emails",
+        "today's emails", "today emails",
+        "read my email", "read my emails",
+        "check my email", "check my emails",
+        "how many emails", "how many messages",
+        "email today", "emails today",
+        "summary of my email", "summary of my emails",
+        "summary of my e mail", "summary of my e mails",
     ]
 
     def looks_like_email_intent(text: str) -> bool:
@@ -314,7 +324,6 @@ async def twilio_stream(websocket: WebSocket):
             return False
         return True
 
-    # --- Helper: call FSM/email backend -------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
         try:
             data = await m.call_fsm_router(
@@ -328,9 +337,10 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error calling /assistant/route")
             return None
 
-    # --- Helper: cancel active response & clear audio buffer ----------------
     async def _cancel_active_and_clear_buffer(reason: str):
-        nonlocal active_response_id, audio_buffer, prebuffer_active
+        nonlocal active_response_id, audio_buffer, prebuffer_active, pending_response_create
+
+        pending_response_create = False
 
         if not openai_ws:
             logger.info("_cancel_active_and_clear_buffer: no openai_ws (reason=%s)", reason)
@@ -356,19 +366,23 @@ async def twilio_stream(websocket: WebSocket):
         audio_buffer.clear()
         prebuffer_active = True
 
-    # --- Helpers: create responses ------------------------------------------
     async def create_generic_response():
+        nonlocal pending_response_create
         await _cancel_active_and_clear_buffer("create_generic_response")
+        pending_response_create = True
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
     async def create_fsm_spoken_reply(spoken_reply: str):
+        nonlocal pending_response_create
+
         if not spoken_reply:
             logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
             await create_generic_response()
             return
 
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
+        pending_response_create = True
 
         instructions = (
             "You are on a live phone call as Vozlia.\n"
@@ -393,6 +407,7 @@ async def twilio_stream(websocket: WebSocket):
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
     async def create_email_processing_ack():
+        nonlocal pending_response_create
         if not openai_ws:
             return
 
@@ -405,6 +420,7 @@ async def twilio_stream(websocket: WebSocket):
         )
 
         try:
+            pending_response_create = True
             await openai_ws.send(json.dumps({
                 "type": "response.create",
                 "response": {"instructions": instructions},
@@ -413,7 +429,6 @@ async def twilio_stream(websocket: WebSocket):
         except Exception:
             logger.exception("Failed to send email processing acknowledgement")
 
-    # --- Helper: handle transcripts from Realtime ---------------------------
     async def handle_transcript_event(event: dict):
         transcript: str = event.get("transcript", "").strip()
         if not transcript:
@@ -427,6 +442,8 @@ async def twilio_stream(websocket: WebSocket):
 
         if looks_like_email_intent(transcript):
             logger.info("Debounce: transcript looks like an email/skill request; routing to FSM + backend.")
+            await create_email_processing_ack()
+
             spoken_reply = await route_to_fsm_and_get_reply(transcript)
             if spoken_reply:
                 await create_fsm_spoken_reply(spoken_reply)
@@ -437,9 +454,8 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("Debounce: transcript does NOT look like an email/skill intent; using generic GPT response.")
             await create_generic_response()
 
-    # --- OpenAI event loop ---------------------------------------------------
     async def openai_loop():
-        nonlocal active_response_id, barge_in_enabled, user_speaking_vad, prebuffer_active, transcript_action_task
+        nonlocal active_response_id, barge_in_enabled, user_speaking_vad, transcript_action_task, pending_response_create
 
         try:
             async for raw in openai_ws:
@@ -451,6 +467,7 @@ async def twilio_stream(websocket: WebSocket):
                     rid = resp.get("id")
                     if rid:
                         active_response_id = rid
+                        pending_response_create = False
                         allowed_response_ids.add(rid)
                         logger.info("Tracking allowed MANUAL response_id: %s", rid)
 
@@ -469,8 +486,20 @@ async def twilio_stream(websocket: WebSocket):
                     resp_id = event.get("response_id")
                     delta_b64 = event.get("delta")
 
+                    # ✅ Adopt the response_id if audio arrives before response.created
+                    if active_response_id is None and pending_response_create and resp_id:
+                        logger.info(
+                            "Adopting response_id=%s from audio.delta (response.created not seen yet)",
+                            resp_id,
+                        )
+                        active_response_id = resp_id
+                        pending_response_create = False
+
                     if resp_id != active_response_id:
-                        logger.info("Dropping unsolicited audio for response_id=%s (active=%s)", resp_id, active_response_id)
+                        logger.info(
+                            "Dropping unsolicited audio for response_id=%s (active=%s)",
+                            resp_id, active_response_id
+                        )
                         continue
 
                     if not delta_b64:
@@ -512,9 +541,8 @@ async def twilio_stream(websocket: WebSocket):
         except Exception:
             logger.exception("Error in OpenAI event loop")
 
-    # --- Twilio event loop ---------------------------------------------------
     async def twilio_loop():
-        nonlocal stream_sid, prebuffer_active, openai_ws, twilio_ws_closed
+        nonlocal stream_sid, prebuffer_active, twilio_ws_closed
 
         try:
             async for msg in websocket.iter_text():
@@ -568,7 +596,6 @@ async def twilio_stream(websocket: WebSocket):
         except Exception:
             logger.exception("Error in Twilio event loop")
 
-    # --- Main orchestration --------------------------------------------------
     try:
         openai_ws = await create_realtime_session()
         logger.info("connection open")
