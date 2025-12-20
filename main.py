@@ -49,7 +49,8 @@ from deps import get_db
 
 from core.logging import logger
 from core import config as cfg
-from twilio.inbound import router as twilio_inbound_router
+from vozlia_twilio.inbound import router as twilio_inbound_router
+
 app.include_router(twilio_inbound_router)
 
 
