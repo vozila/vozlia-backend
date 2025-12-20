@@ -1,11 +1,11 @@
-# Known Good Baseline (Flow B)
+# Known Good Baseline (Flow B Realtime)
 
-Date: 2025-12-19
-Status: Render deploy boots successfully
+Status: ✅ Twilio + Realtime working end-to-end.
 
-Includes:
-- vozlia_fsm.py restored
-- Flow B MVP working
-- main boot OK
+Evidence:
+- /twilio/inbound returns TwiML and Twilio connects to /twilio/stream
+- Realtime connects and sends session.update + greeting
+- VAD + transcripts working
+- FSM email intent triggers Gmail summary and returns spoken_reply
 
 Rollback point: this commit
