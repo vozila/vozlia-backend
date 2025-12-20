@@ -51,7 +51,7 @@ async def create_realtime_session():
                 "prefix_padding_ms": 200,
                 "create_response": False,
                 "interrupt_response": True,
-            }
+            },
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": m.VOICE_NAME,
