@@ -51,7 +51,7 @@ from core.logging import logger
 from core import config as cfg
 from vozlia_twilio.inbound import router as twilio_inbound_router
 
-app.include_router(twilio_inbound_router)
+
 
 
 
@@ -68,6 +68,7 @@ logger.setLevel(logging.INFO)
 # ---------- FastAPI app ----------
 app = FastAPI()
 
+app.include_router(twilio_inbound_router)
 
 # ---------- Crypto helpers (for passwords & OAuth tokens) ----------
 def get_fernet() -> Fernet:
