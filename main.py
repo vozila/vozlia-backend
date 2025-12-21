@@ -1,20 +1,40 @@
 # main.py
+from __future__ import annotations
+
+import importlib
 from fastapi import FastAPI
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 
 from core.logging import logger
 from db import Base, engine
 
 from api.routers.health import router as health_router
-from api.routers.twilio import router as twilio_router
-try:
-    from api.routers.oauth_google import router as oauth_google_router
-except ModuleNotFoundError:
-    oauth_google_router = None
-from api.routers.email_accounts import router as email_accounts_router
-from api.routers.gmail_api import router as gmail_router
 from api.routers.assistant import router as assistant_router
+from api.routers.gmail_api import router as gmail_api_router
+from api.routers.twilio import router as twilio_router
+
+from vozlia_twilio.inbound import router as twilio_inbound_router
+from vozlia_twilio.stream import twilio_stream
+
+
+def _maybe_include_router(app: FastAPI, module_path: str) -> None:
+    """
+    Optional router loader.
+    - If module exists and has `router`, we include it.
+    - If not, we log and continue (deploy never fails).
+    """
+    try:
+        mod = importlib.import_module(module_path)
+    except ModuleNotFoundError:
+        logger.warning("Optional router missing: %s (skipping)", module_path)
+        return
+
+    router = getattr(mod, "router", None)
+    if router is None:
+        logger.warning("Module %s has no `router` attr (skipping)", module_path)
+        return
+
+    app.include_router(router)
+    logger.info("Included optional router: %s", module_path)
 
 
 def create_app() -> FastAPI:
@@ -25,31 +45,21 @@ def create_app() -> FastAPI:
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables ensured (create_all).")
 
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request, exc: RequestValidationError):
-        try:
-            body = await request.body()
-        except Exception:
-            body = b"<unreadable>"
-        logger.error(
-            "422 VALIDATION ERROR path=%s errors=%s body=%r",
-            request.url.path,
-            exc.errors(),
-            body[:2000],
-        )
-        return JSONResponse(status_code=422, content={"detail": exc.errors()})
-
-    # Routers
+    # Required routers that exist in your repo
     app.include_router(health_router)
     app.include_router(twilio_router)
-    app.include_router(oauth_google_router)
-    app.include_router(email_accounts_router)
-    app.include_router(gmail_router)
+    app.include_router(twilio_inbound_router)
+    app.include_router(gmail_api_router)
     app.include_router(assistant_router)
-    from api.routers.twilio import mount_twilio_ws
-    ...
-    app.include_router(twilio_router)
-    mount_twilio_ws(app)
+
+    # Twilio Media Streams WS
+    app.add_api_websocket_route("/twilio/stream", twilio_stream)
+
+    # Optional routers (won't break deploy if missing)
+    _maybe_include_router(app, "api.routers.email_accounts")
+    _maybe_include_router(app, "api.routers.oauth_google")
+    # If you decide to keep oauth router under src/, use this instead:
+    # _maybe_include_router(app, "src.api.routers.oauth_google")
 
     return app
 
