@@ -36,6 +36,7 @@ async def call_fsm_router(
 
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client_http:
+            logger.info("FSM_ROUTER POST url=%s payload=%s", url, payload)
             resp = await client_http.post(url, json=payload)
             if resp.status_code >= 400:
                 logger.error("Router call failed: status=%s body=%s", resp.status_code, resp.text)
