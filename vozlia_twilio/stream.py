@@ -20,6 +20,59 @@ REALTIME_LOG_ALL_EVENTS = os.getenv("REALTIME_LOG_ALL_EVENTS", "0") == "1"
 # Feature flag: only call backend router for skill intents (email for now)
 SKILL_GATED_ROUTING = os.getenv("SKILL_GATED_ROUTING", "0") == "1"
 
+def _normalize_text(s: str) -> str:
+    t = (s or "").lower()
+    out = []
+    for ch in t:
+        out.append(ch if (ch.isalnum() or ch.isspace()) else " ")
+    return " ".join("".join(out).split())
+
+
+def get_style_for_feature(feature: str) -> str:
+    # feature: "email", "chitchat", "calendar", etc.
+    key = f"VOZLIA_STYLE_{feature.upper()}"
+    s = (os.getenv(key, "") or "").strip().lower()
+    if s in {"warm", "concise"}:
+        return s
+
+    default = (os.getenv("VOZLIA_DEFAULT_STYLE", "warm") or "warm").strip().lower()
+    return default if default in {"warm", "concise"} else "warm"
+
+
+HARD_IGNORE = {"um", "uh", "er", "hmm", "mm", "mmm", "uh huh", "mhm"}
+
+ACKS = {"awesome", "great", "okay", "ok", "thanks", "thank you", "right", "cool"}
+
+CONTINUE_TRIGGERS = {"continue", "go on", "keep going", "tell me more", "what else", "and"}
+
+
+def should_reply(text: str, style: str, *, is_skill_intent: bool) -> bool:
+    n = _normalize_text(text)
+    if not n:
+        return False
+
+    if n in HARD_IGNORE:
+        return False
+
+    # Never ignore continuation commands
+    if n in CONTINUE_TRIGGERS:
+        return True
+
+    if style == "concise":
+        # In concise mode, ignore acknowledgements unless configured otherwise
+        concise_acks = os.getenv("VOZLIA_CONCISE_ACKS", "0") == "1"
+        if (n in ACKS) and (not concise_acks):
+            return False
+
+        # Also ignore super-short non-skill utterances
+        if len(n.split()) <= 2 and not is_skill_intent:
+            return False
+
+        return True
+
+    # Warm: respond to almost everything
+    return True
+
 
 def _main():
     """
