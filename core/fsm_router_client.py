@@ -20,35 +20,23 @@ async def call_fsm_router(
 
     Kept behavior-aligned with the version that previously lived in main.py.
     """
+
+    # --- Compatibility shim ---
+    # Some callers accidentally pass {"text": "...", "context": {...}} as the `text` arg.
+    # Unwrap it so /assistant/route receives the shape it expects.
+    if isinstance(text, dict):
+        logger.error("FSM_ROUTER: received dict for `text` (legacy shape). Unwrapping. text=%r", text)
+        if context is None:
+            context = text.get("context")
+        if account_id is None:
+            account_id = text.get("account_id")
+        text = text.get("text") or ""
+
+    if not isinstance(text, str):
+        logger.error("FSM_ROUTER: `text` is not a string after unwrap: %r", text)
+        text = str(text or "")
+
+    text = text.strip()
     if not text:
         return {"spoken_reply": "", "fsm": {}, "gmail": None}
 
-    base = (cfg.VOZLIA_BACKEND_BASE_URL or "").rstrip("/")
-    url = base + "/assistant/route"
-
-    payload: dict = {"text": text}
-    if context is not None:
-        payload["context"] = context
-    if account_id is not None:
-        payload["account_id"] = account_id
-
-    timeout_s = float(os.getenv("FSM_ROUTER_TIMEOUT_S", "10.0"))
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client_http:
-            logger.info("FSM_ROUTER POST url=%s payload=%s", url, payload)
-            resp = await client_http.post(url, json=payload)
-            if resp.status_code >= 400:
-                logger.error("Router call failed: status=%s body=%s", resp.status_code, resp.text)
-            resp.raise_for_status()
-            return resp.json()
-    except Exception as e:
-        logger.exception("Error calling /assistant/route at %s: %s", url, e)
-        return {
-            "spoken_reply": (
-                "I tried to check that information in the backend, "
-                "but something went wrong. Please try again in a moment."
-            ),
-            "fsm": {"error": str(e)},
-            "gmail": None,
-        }
