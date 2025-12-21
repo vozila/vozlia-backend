@@ -43,6 +43,10 @@ def create_app() -> FastAPI:
     app.include_router(email_accounts_router)
     app.include_router(gmail_router)
     app.include_router(assistant_router)
+    from api.routers.twilio import mount_twilio_ws
+    ...
+    app.include_router(twilio_router)
+    mount_twilio_ws(app)
 
     return app
 
