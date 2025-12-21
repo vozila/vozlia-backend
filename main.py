@@ -53,6 +53,57 @@ from deps import get_db
 # ---------- FastAPI app ----------
 app = FastAPI()
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
+from starlette.requests import Request as StarletteRequest
+
+class RouteDebugMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: ASGIApp):
+        super().__init__(app)
+
+    async def dispatch(self, request: StarletteRequest, call_next):
+        # Only log for the failing endpoint
+        if request.url.path != "/assistant/route":
+            return await call_next(request)
+
+        # Capture raw body (and re-inject so downstream can read it)
+        body_bytes = await request.body()
+
+        # Try parse json for easier reading (non-fatal)
+        parsed = None
+        try:
+            parsed = await request.json()
+        except Exception:
+            parsed = None
+
+        logger.error(
+            "ROUTE_DEBUG IN path=%s method=%s content_type=%s headers=%s body_bytes=%r json=%r",
+            request.url.path,
+            request.method,
+            request.headers.get("content-type"),
+            dict(request.headers),
+            body_bytes[:2000],
+            parsed,
+        )
+
+        async def receive():
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+        request = Request(request.scope, receive)
+
+        resp = await call_next(request)
+
+        # Log response status for correlation
+        logger.error(
+            "ROUTE_DEBUG OUT path=%s status=%s",
+            request.url.path,
+            resp.status_code,
+        )
+        return resp
+
+app.add_middleware(RouteDebugMiddleware)
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     try:
