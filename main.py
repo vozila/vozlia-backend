@@ -8,7 +8,10 @@ from db import Base, engine
 
 from api.routers.health import router as health_router
 from api.routers.twilio import router as twilio_router
-from api.routers.oauth_google import router as oauth_google_router
+try:
+    from api.routers.oauth_google import router as oauth_google_router
+except ModuleNotFoundError:
+    oauth_google_router = None
 from api.routers.email_accounts import router as email_accounts_router
 from api.routers.gmail_api import router as gmail_router
 from api.routers.assistant import router as assistant_router
