@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 # core/fsm_router_client.py
+from __future__ import annotations
 
 from typing import Optional
 import os
@@ -17,15 +16,17 @@ async def call_fsm_router(
     account_id: Optional[str] = None,
 ) -> dict:
     """
-    Calls the unified /assistant/route endpoint.
+    Calls POST /assistant/route on the Vozlia backend.
 
-    Kept behavior-aligned with the version that previously lived in main.py.
+    Expected request body:
+      {"text": "<string>", "context": {...}?, "account_id": "...?"}
     """
+    text = (text or "").strip()
     if not text:
         return {"spoken_reply": "", "fsm": {}, "gmail": None}
 
     base = (cfg.VOZLIA_BACKEND_BASE_URL or "").rstrip("/")
-    url = base + "/assistant/route"
+    url = f"{base}/assistant/route"
 
     payload: dict = {"text": text}
     if context is not None:
@@ -33,31 +34,28 @@ async def call_fsm_router(
     if account_id is not None:
         payload["account_id"] = account_id
 
-    timeout_s = float(os.getenv("FSM_ROUTER_TIMEOUT_S", "10.0"))
+    timeout_s = float(os.getenv("FSM_ROUTER_TIMEOUT_S", "15.0"))
+
+    # Optional debug logging (safe)
+    if os.getenv("FSM_ROUTER_LOG_PAYLOAD", "0") == "1":
+        logger.info("FSM_ROUTER POST url=%s payload=%s", url, payload)
 
     try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client_http:
-            resp = await client_http.post(url, json=payload)
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            resp = await client.post(url, json=payload)
 
-            # Helpful logging on non-2xx without breaking normal flow
             if resp.status_code >= 400:
                 logger.error(
-                    "Router call failed: status=%s body=%s",
+                    "FSM_ROUTER failed: status=%s body=%s",
                     resp.status_code,
-                    resp.text,
+                    resp.text[:2000],
                 )
 
             resp.raise_for_status()
-            data = resp.json()
-
-            if not isinstance(data, dict):
-                logger.error("Router returned non-dict JSON: %r", data)
-                return {"spoken_reply": "", "fsm": {"error": "non_dict_response"}, "gmail": None}
-
-            return data
+            return resp.json()
 
     except Exception as e:
-        logger.exception("Error calling /assistant/route at %s: %s", url, e)
+        logger.exception("FSM_ROUTER exception calling %s: %s", url, e)
         return {
             "spoken_reply": (
                 "I tried to check that information in the backend, "
