@@ -91,6 +91,13 @@ REALTIME_OUTPUT_AUDIO_FORMAT = os.getenv("REALTIME_OUTPUT_AUDIO_FORMAT", "g711_u
 # Voice name for the realtime session (you currently call this m.VOICE_NAME in code)
 VOICE_NAME = os.getenv("VOICE_NAME", OPENAI_REALTIME_VOICE or "coral")
 
+# System prompt for the realtime session (expected by vozlia_twilio/stream.py)
+REALTIME_SYSTEM_PROMPT = os.getenv(
+    "REALTIME_SYSTEM_PROMPT",
+    "You are Vozlia, a helpful real-time voice assistant. Be concise and natural.",
+)
+
+
 # VAD tuning (keep your current defaults)
 REALTIME_VAD_THRESHOLD = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.5"))
 REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "600"))
