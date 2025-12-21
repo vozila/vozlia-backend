@@ -14,8 +14,23 @@ from fastapi import WebSocket, WebSocketDisconnect
 from core.logging import logger
 
 # Debug toggles (env-driven)
-REALTIME_LOG_TEXT = os.getenv("REALTIME_LOG_TEXT", "0") == "1"
-REALTIME_LOG_ALL_EVENTS = os.getenv("REALTIME_LOG_ALL_EVENTS", "0") == "1"
+from config import (
+    REALTIME_LOG_TEXT,
+    REALTIME_LOG_ALL_EVENTS,
+    SKILL_GATED_ROUTING,
+    OPENAI_INTERRUPT_RESPONSE,
+    BYTES_PER_FRAME,
+    FRAME_INTERVAL,
+    PREBUFFER_BYTES,
+    MAX_TWILIO_BACKLOG_SECONDS,
+    VOICE_NAME,
+    REALTIME_INPUT_AUDIO_FORMAT,
+    REALTIME_OUTPUT_AUDIO_FORMAT,
+    REALTIME_VAD_THRESHOLD,
+    REALTIME_VAD_SILENCE_MS,
+    REALTIME_VAD_PREFIX_MS,
+)
+
 
 # Feature flag: only call backend router for skill intents (email for now)
 SKILL_GATED_ROUTING = os.getenv("SKILL_GATED_ROUTING", "0") == "1"
