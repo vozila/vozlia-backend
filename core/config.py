@@ -6,6 +6,7 @@ Behavior-neutral extraction from main_12-19-2025.py:
 """
 
 from __future__ import annotations
+from typing import Dict
 
 import os
 
@@ -31,6 +32,23 @@ VOZLIA_STYLE_DEFAULT = VOZLIA_DEFAULT_STYLE  # alias for clarity
 
 # When true: even gratitude gets a response in concise mode
 VOZLIA_CONCISE_ACKS = os.getenv("VOZLIA_CONCISE_ACKS", "0") == "1"
+
+# --- OpenAI Realtime WS headers (used by vozlia_twilio/stream.py) -----------
+
+
+
+def _build_openai_realtime_headers() -> Dict[str, str]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    headers: Dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        # required for Realtime beta endpoints
+        headers["OpenAI-Beta"] = "realtime=v1"
+    return headers
+
+# Exported constant expected by vozlia_twilio/stream.py
+OPENAI_REALTIME_HEADERS = _build_openai_realtime_headers()
+
 
 # ---------- FSM router helper base URL ----------
 VOZLIA_BACKEND_BASE_URL = os.getenv(
