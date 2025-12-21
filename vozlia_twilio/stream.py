@@ -400,26 +400,19 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- FSM router ----------------------------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
-        """
-        Calls /assistant/route via core.fsm_router_client.call_fsm_router
-        using the *correct* signature: (text: str, context: dict | None, account_id: str | None).
+        # Guard against the exact bug you just fixed
+        assert isinstance(transcript, str), (
+            f"route_to_fsm_and_get_reply expected str transcript, got {type(transcript)}"
+        )
 
-        Returns the spoken_reply string if present, otherwise None.
-        """
         try:
             data = await call_fsm_router(
-                text=transcript,
+                transcript,
                 context={"channel": "phone"},
             )
-
-            if not isinstance(data, dict):
-                logger.error("FSM router returned non-dict: %r", data)
-                return None
-
             spoken = data.get("spoken_reply")
             logger.info("FSM spoken_reply to send: %r", spoken)
-            return spoken if isinstance(spoken, str) and spoken.strip() else None
-
+            return spoken
         except Exception:
             logger.exception("Error calling /assistant/route")
             return None
