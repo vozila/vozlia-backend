@@ -13,17 +13,24 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from core.logging import logger
 
-# Debug toggles (env-driven)
+# Config / constants (env-driven)
 from config import (
+    # logging toggles
     REALTIME_LOG_TEXT,
     REALTIME_LOG_ALL_EVENTS,
+    # feature flags
     SKILL_GATED_ROUTING,
     OPENAI_INTERRUPT_RESPONSE,
+    # twilio audio constants
     BYTES_PER_FRAME,
     FRAME_INTERVAL,
     PREBUFFER_BYTES,
     MAX_TWILIO_BACKLOG_SECONDS,
+    # realtime session config
+    OPENAI_REALTIME_URL,
+    OPENAI_REALTIME_HEADERS,
     VOICE_NAME,
+    REALTIME_SYSTEM_PROMPT,
     REALTIME_INPUT_AUDIO_FORMAT,
     REALTIME_OUTPUT_AUDIO_FORMAT,
     REALTIME_VAD_THRESHOLD,
@@ -31,9 +38,10 @@ from config import (
     REALTIME_VAD_PREFIX_MS,
 )
 
+# Router client (Flow B)
+# NOTE: This must be implemented as an async function returning a dict (or adjust below accordingly).
+from services.fsm_router_client import call_fsm_router
 
-# Feature flag: only call backend router for skill intents (email for now)
-SKILL_GATED_ROUTING = os.getenv("SKILL_GATED_ROUTING", "0") == "1"
 
 def _normalize_text(s: str) -> str:
     t = (s or "").lower()
@@ -55,9 +63,7 @@ def get_style_for_feature(feature: str) -> str:
 
 
 HARD_IGNORE = {"um", "uh", "er", "hmm", "mm", "mmm", "uh huh", "mhm"}
-
 ACKS = {"awesome", "great", "okay", "ok", "thanks", "thank you", "right", "cool"}
-
 CONTINUE_TRIGGERS = {"continue", "go on", "keep going", "tell me more", "what else"}
 
 
@@ -89,30 +95,16 @@ def should_reply(text: str, style: str, *, is_skill_intent: bool) -> bool:
     return True
 
 
-def _main():
-    """
-    Lazy access to main.py module-level globals (constants, prompts, helpers).
-    This avoids circular imports at import-time while keeping behavior identical.
-    """
-    import main  # uvicorn main:app => module name is 'main'
-    return main
-
-
-
-
-
 async def create_realtime_session():
     """
     Connect to OpenAI Realtime WS and send session.update + an initial greeting.
-    (Copied from main.py, behavior unchanged.)
+    Behavior unchanged; now config-driven (no main.py dependency).
     """
-    m = _main()
-
-    logger.info(f"Connecting to OpenAI Realtime at {m.OPENAI_REALTIME_URL}")
+    logger.info(f"Connecting to OpenAI Realtime at {OPENAI_REALTIME_URL}")
 
     ws = await websockets.connect(
-        m.OPENAI_REALTIME_URL,
-        extra_headers=m.OPENAI_REALTIME_HEADERS,
+        OPENAI_REALTIME_URL,
+        extra_headers=OPENAI_REALTIME_HEADERS,
         max_size=16 * 1024 * 1024,
         ping_interval=None,
         ping_timeout=None,
@@ -123,16 +115,16 @@ async def create_realtime_session():
         "session": {
             "turn_detection": {
                 "type": "server_vad",
-                "threshold": 0.5,
-                "silence_duration_ms": 600,
-                "prefix_padding_ms": 200,
+                "threshold": REALTIME_VAD_THRESHOLD,
+                "silence_duration_ms": REALTIME_VAD_SILENCE_MS,
+                "prefix_padding_ms": REALTIME_VAD_PREFIX_MS,
                 "create_response": False,
-                "interrupt_response": os.getenv("OPENAI_INTERRUPT_RESPONSE", "0") == "1",
+                "interrupt_response": OPENAI_INTERRUPT_RESPONSE,
             },
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "voice": m.VOICE_NAME,
-            "instructions": m.REALTIME_SYSTEM_PROMPT,
+            "input_audio_format": REALTIME_INPUT_AUDIO_FORMAT,
+            "output_audio_format": REALTIME_OUTPUT_AUDIO_FORMAT,
+            "voice": VOICE_NAME,
+            "instructions": REALTIME_SYSTEM_PROMPT,
             "input_audio_transcription": {
                 "model": "whisper-1",
             },
@@ -154,10 +146,8 @@ async def twilio_stream(websocket: WebSocket):
     - Track active_response_id ONLY from response.created
     - Cancel active response when creating a new one
     - Do NOT "adopt" response_id from response.audio.delta
-    - Removes pending_response_create entirely (fixes your deploy error)
+    - Removes pending_response_create entirely
     """
-    m = _main()
-
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
@@ -176,7 +166,6 @@ async def twilio_stream(websocket: WebSocket):
 
     # Response tracking (Pattern 1)
     active_response_id: Optional[str] = None
-    
 
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
@@ -192,11 +181,11 @@ async def twilio_stream(websocket: WebSocket):
 
         if stream_sid is None:
             return
-        if len(audio_buffer) < m.BYTES_PER_FRAME:
+        if len(audio_buffer) < BYTES_PER_FRAME:
             return
 
-        frame = bytes(audio_buffer[: m.BYTES_PER_FRAME])
-        del audio_buffer[: m.BYTES_PER_FRAME]
+        frame = bytes(audio_buffer[:BYTES_PER_FRAME])
+        del audio_buffer[:BYTES_PER_FRAME]
 
         payload = base64.b64encode(frame).decode("ascii")
         msg = {
@@ -254,7 +243,7 @@ async def twilio_stream(websocket: WebSocket):
 
                 # prebuffer at utterance start
                 if prebuffer_active:
-                    if len(audio_buffer) < m.PREBUFFER_BYTES:
+                    if len(audio_buffer) < PREBUFFER_BYTES:
                         await asyncio.sleep(0.005)
                         continue
 
@@ -273,14 +262,14 @@ async def twilio_stream(websocket: WebSocket):
 
                 # backlog cap
                 call_elapsed = now - send_start_ts
-                audio_sent_duration = frame_idx * m.FRAME_INTERVAL
+                audio_sent_duration = frame_idx * FRAME_INTERVAL
                 backlog_seconds = audio_sent_duration - call_elapsed
-                if backlog_seconds > m.MAX_TWILIO_BACKLOG_SECONDS:
+                if backlog_seconds > MAX_TWILIO_BACKLOG_SECONDS:
                     await asyncio.sleep(0.005)
                     continue
 
                 # deadline-based pacing
-                target = send_start_ts + frame_idx * m.FRAME_INTERVAL
+                target = send_start_ts + frame_idx * FRAME_INTERVAL
                 now = time.monotonic()
                 if now < target:
                     await asyncio.sleep(target - now)
@@ -290,7 +279,7 @@ async def twilio_stream(websocket: WebSocket):
                 if late_ms > late_ms_max:
                     late_ms_max = late_ms
 
-                if len(audio_buffer) >= m.BYTES_PER_FRAME:
+                if len(audio_buffer) >= BYTES_PER_FRAME:
                     try:
                         await send_audio_to_twilio()
                     except WebSocketDisconnect:
@@ -325,7 +314,6 @@ async def twilio_stream(websocket: WebSocket):
     async def handle_barge_in():
         """
         Cancel the active OpenAI response on barge-in and clear Twilio audio.
-        No `nonlocal` usage → safe against indentation mistakes.
         """
         nonlocal active_response_id, prebuffer_active
         if not barge_in_enabled:
@@ -344,9 +332,7 @@ async def twilio_stream(websocket: WebSocket):
         if openai_ws is not None and active_response_id is not None:
             rid = active_response_id
             try:
-                await openai_ws.send(
-                    json.dumps({"type": "response.cancel", "response_id": rid})
-                )
+                await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
                 logger.info("BARGE-IN: Sent response.cancel for %s", rid)
             except Exception:
                 logger.exception("BARGE-IN: Failed sending response.cancel for %s", rid)
@@ -358,9 +344,6 @@ async def twilio_stream(websocket: WebSocket):
         # Reset playback state
         prebuffer_active = True
         active_response_id = None
-
-        # Drop tracking AFTER cancel attempt
-        #globals()["active_response_id"] = None
 
     # --- Intent helpers ------------------------------------------------------
     EMAIL_KEYWORDS_LOCAL = [
@@ -400,7 +383,6 @@ async def twilio_stream(websocket: WebSocket):
             return False
         normalized = _normalize_text(text)
 
-
         for kw in EMAIL_KEYWORDS_LOCAL:
             if kw in normalized:
                 return True
@@ -414,13 +396,15 @@ async def twilio_stream(websocket: WebSocket):
 
         return False
 
-
     # --- FSM router ----------------------------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
         try:
-            data = await m.call_fsm_router(
-                text=transcript,
-                context={"channel": "phone"},
+            # Adjust payload shape to match your router expectations.
+            data = await call_fsm_router(
+                {
+                    "text": transcript,
+                    "context": {"channel": "phone"},
+                }
             )
             spoken = data.get("spoken_reply")
             logger.info("FSM spoken_reply to send: %r", spoken)
@@ -431,7 +415,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Cancel active response & clear audio buffer -------------------------
     async def _cancel_active_and_clear_buffer(reason: str):
-        nonlocal active_response_id, audio_buffer, prebuffer_active
+        nonlocal active_response_id, prebuffer_active
 
         if not openai_ws:
             logger.info("_cancel_active_and_clear_buffer: no openai_ws (reason=%s)", reason)
@@ -492,8 +476,6 @@ async def twilio_stream(websocket: WebSocket):
             )
         )
         logger.info("Sent FSM-driven spoken reply into Realtime session")
-
- 
 
     # --- Transcript handling -------------------------------------------------
     async def handle_transcript_event(event: dict):
