@@ -59,7 +59,7 @@ async def create_realtime_session():
                 "silence_duration_ms": 600,
                 "prefix_padding_ms": 200,
                 "create_response": False,
-                "interrupt_response": True,
+                "interrupt_response": os.getenv("OPENAI_INTERRUPT_RESPONSE", "0") == "1",
             },
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
@@ -352,18 +352,6 @@ async def twilio_stream(websocket: WebSocket):
 
         return False
 
-    FILLER_ONLY = {"um", "uh", "er", "hmm"}
-    SMALL_TOSS = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks", "thank you"}
-
-    def should_reply(text: str) -> bool:
-        t = text.strip().lower()
-        if not t:
-            return False
-        words = t.split()
-        if len(words) == 1 and (words[0] in FILLER_ONLY or words[0] in SMALL_TOSS):
-            return False
-        return True
-
     def _normalize_text(s: str) -> str:
         t = (s or "").lower()
         normalized_chars = []
@@ -375,7 +363,11 @@ async def twilio_stream(websocket: WebSocket):
         return " ".join("".join(normalized_chars).split())
 
     FILLER_ONLY = {"um", "uh", "er", "hmm"}
-    SMALL_TOSS_SINGLE = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks"}
+
+    # Single-word toss-offs we generally don't want to respond to
+    SMALL_TOSS_SINGLE = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks","right"}
+
+    # Multi-word toss-offs we generally don't want to respond to
     SMALL_TOSS_PHRASES = {
         "thank you",
         "thanks so much",
@@ -387,6 +379,44 @@ async def twilio_stream(websocket: WebSocket):
         "thats all",
         "that s all",
     }
+
+    # Control phrases that SHOULD prompt a response (esp after barge-in)
+    CONTINUE_PHRASES = {
+        "continue",
+        "go ahead",
+        "keep going",
+        "resume",
+        "carry on",
+        "what were you saying",
+        "sorry continue",
+        "please continue",
+    }
+
+    def should_reply(text: str) -> bool:
+        n = _normalize_text(text)
+        if not n:
+            return False
+
+        # Always allow "continue/resume" commands
+        if n in CONTINUE_PHRASES:
+            return True
+
+        if n in FILLER_ONLY:
+            return False
+
+        if n in SMALL_TOSS_SINGLE:
+            return False
+
+        if n in SMALL_TOSS_PHRASES:
+            return False
+
+        # If it's very short and NOT a skill request, ignore it.
+        words = n.split()
+        if len(words) <= 2 and not looks_like_email_intent(n):
+            return False
+
+        return True
+
 
     def should_reply(text: str) -> bool:
         n = _normalize_text(text)
