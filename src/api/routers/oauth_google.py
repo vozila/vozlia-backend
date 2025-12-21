@@ -7,7 +7,7 @@ from core.logging import logger
 from core import config as cfg
 from deps import get_db
 from models import User, EmailAccount
-from main import get_current_user  # if this causes circular imports, see Option 2 below
+from deps.current_user import get_current_user # if this causes circular imports, see Option 2 below
 
 router = APIRouter(prefix="/auth/google", tags=["oauth-google"])
 
