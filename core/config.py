@@ -54,3 +54,34 @@ OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_
 
 # Voice selection is validated in main (SUPPORTED_VOICES lives there)
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "coral")
+
+# ---------- Debug toggles ----------
+REALTIME_LOG_TEXT = os.getenv("REALTIME_LOG_TEXT", "0") == "1"
+REALTIME_LOG_ALL_EVENTS = os.getenv("REALTIME_LOG_ALL_EVENTS", "0") == "1"
+
+# ---------- Flow / routing flags ----------
+SKILL_GATED_ROUTING = os.getenv("SKILL_GATED_ROUTING", "0") == "1"
+
+# If true, allow OpenAI server to interrupt its own responses on VAD start
+OPENAI_INTERRUPT_RESPONSE = os.getenv("OPENAI_INTERRUPT_RESPONSE", "0") == "1"
+
+# ---------- Realtime session defaults ----------
+# Audio formats used by Twilio Media Streams in your code (G.711 μ-law)
+REALTIME_INPUT_AUDIO_FORMAT = os.getenv("REALTIME_INPUT_AUDIO_FORMAT", "g711_ulaw")
+REALTIME_OUTPUT_AUDIO_FORMAT = os.getenv("REALTIME_OUTPUT_AUDIO_FORMAT", "g711_ulaw")
+
+# Voice name for the realtime session (you currently call this m.VOICE_NAME in code)
+VOICE_NAME = os.getenv("VOICE_NAME", OPENAI_REALTIME_VOICE or "coral")
+
+# VAD tuning (keep your current defaults)
+REALTIME_VAD_THRESHOLD = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.5"))
+REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "600"))
+REALTIME_VAD_PREFIX_MS = int(os.getenv("REALTIME_VAD_PREFIX_MS", "200"))
+
+# ---------- Twilio audio pacing ----------
+# If you already define these elsewhere, centralize them here and import.
+BYTES_PER_FRAME = int(os.getenv("BYTES_PER_FRAME", "160"))          # 20ms @ 8kHz μ-law
+FRAME_INTERVAL = float(os.getenv("FRAME_INTERVAL", "0.02"))         # seconds per frame
+PREBUFFER_BYTES = int(os.getenv("PREBUFFER_BYTES", "8000"))         # ~1s prebuffer default
+MAX_TWILIO_BACKLOG_SECONDS = float(os.getenv("MAX_TWILIO_BACKLOG_SECONDS", "1.0"))
+
