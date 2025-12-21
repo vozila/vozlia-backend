@@ -40,7 +40,9 @@ from core.config import (
 
 # Router client (Flow B)
 # NOTE: This must be implemented as an async function returning a dict (or adjust below accordingly).
-from services.fsm_router_client import call_fsm_router
+#from services.fsm_router_client import call_fsm_router
+from core.fsm_router_client import call_fsm_router
+
 
 
 def _normalize_text(s: str) -> str:
