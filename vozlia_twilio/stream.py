@@ -400,20 +400,30 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- FSM router ----------------------------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
+        """
+        Calls /assistant/route via core.fsm_router_client.call_fsm_router
+        using the *correct* signature: (text: str, context: dict | None, account_id: str | None).
+
+        Returns the spoken_reply string if present, otherwise None.
+        """
         try:
-            # Adjust payload shape to match your router expectations.
             data = await call_fsm_router(
-                {
-                    "text": transcript,
-                    "context": {"channel": "phone"},
-                }
+                text=transcript,
+                context={"channel": "phone"},
             )
+
+            if not isinstance(data, dict):
+                logger.error("FSM router returned non-dict: %r", data)
+                return None
+
             spoken = data.get("spoken_reply")
             logger.info("FSM spoken_reply to send: %r", spoken)
-            return spoken
+            return spoken if isinstance(spoken, str) and spoken.strip() else None
+
         except Exception:
             logger.exception("Error calling /assistant/route")
             return None
+
 
     # --- Cancel active response & clear audio buffer -------------------------
     async def _cancel_active_and_clear_buffer(reason: str):
