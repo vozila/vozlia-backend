@@ -14,7 +14,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from core.logging import logger
 
 # Config / constants (env-driven)
-from config import (
+from core.config import (
     # logging toggles
     REALTIME_LOG_TEXT,
     REALTIME_LOG_ALL_EVENTS,
