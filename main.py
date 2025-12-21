@@ -6,6 +6,9 @@ import base64
 import time
 from typing import List, Optional
 from datetime import datetime, timedelta
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
 
 from fastapi import (
     FastAPI,
@@ -49,6 +52,20 @@ from deps import get_db
 
 # ---------- FastAPI app ----------
 app = FastAPI()
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    try:
+        body = await request.body()
+    except Exception:
+        body = b"<unreadable>"
+    logger.error(
+        "422 VALIDATION ERROR path=%s errors=%s body=%r",
+        request.url.path,
+        exc.errors(),
+        body[:2000],
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # Register routers AFTER app is defined
 app.include_router(twilio_inbound_router)
