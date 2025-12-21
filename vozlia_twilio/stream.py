@@ -552,7 +552,6 @@ async def twilio_stream(websocket: WebSocket):
                     rid = resp.get("id")
                     if rid:
                         active_response_id = rid
-                        allowed_response_ids.add(rid)
                         logger.info("Tracking allowed response_id: %s", rid)
 
                 elif etype in ("response.completed", "response.failed", "response.canceled"):
