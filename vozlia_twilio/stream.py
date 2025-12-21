@@ -43,7 +43,7 @@ HARD_IGNORE = {"um", "uh", "er", "hmm", "mm", "mmm", "uh huh", "mhm"}
 
 ACKS = {"awesome", "great", "okay", "ok", "thanks", "thank you", "right", "cool"}
 
-CONTINUE_TRIGGERS = {"continue", "go on", "keep going", "tell me more", "what else", "and"}
+CONTINUE_TRIGGERS = {"continue", "go on", "keep going", "tell me more", "what else"}
 
 
 def should_reply(text: str, style: str, *, is_skill_intent: bool) -> bool:
@@ -161,7 +161,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # Response tracking (Pattern 1)
     active_response_id: Optional[str] = None
-    allowed_response_ids: set[str] = set()
+    
 
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
@@ -383,14 +383,8 @@ async def twilio_stream(websocket: WebSocket):
     def looks_like_email_intent(text: str) -> bool:
         if not text:
             return False
-        t = text.lower()
-        normalized_chars = []
-        for ch in t:
-            if ch.isalnum() or ch.isspace():
-                normalized_chars.append(ch)
-            else:
-                normalized_chars.append(" ")
-        normalized = " ".join("".join(normalized_chars).split())
+        normalized = _normalize_text(text)
+
 
         for kw in EMAIL_KEYWORDS_LOCAL:
             if kw in normalized:
@@ -405,92 +399,6 @@ async def twilio_stream(websocket: WebSocket):
 
         return False
 
-    def _normalize_text(s: str) -> str:
-        t = (s or "").lower()
-        normalized_chars = []
-        for ch in t:
-            if ch.isalnum() or ch.isspace():
-                normalized_chars.append(ch)
-            else:
-                normalized_chars.append(" ")
-        return " ".join("".join(normalized_chars).split())
-
-    FILLER_ONLY = {"um", "uh", "er", "hmm"}
-
-    # Single-word toss-offs we generally don't want to respond to
-    SMALL_TOSS_SINGLE = {"awesome", "great", "okay", "ok", "hello", "hi", "thanks","right"}
-
-    # Multi-word toss-offs we generally don't want to respond to
-    SMALL_TOSS_PHRASES = {
-        "thank you",
-        "thanks so much",
-        "ok thanks",
-        "okay thanks",
-        "all good",
-        "no thanks",
-        "no thank you",
-        "thats all",
-        "that s all",
-    }
-
-    # Control phrases that SHOULD prompt a response (esp after barge-in)
-    CONTINUE_PHRASES = {
-        "continue",
-        "go ahead",
-        "keep going",
-        "resume",
-        "carry on",
-        "what were you saying",
-        "sorry continue",
-        "please continue",
-    }
-
-    def should_reply(text: str) -> bool:
-        n = _normalize_text(text)
-        if not n:
-            return False
-
-        # Always allow "continue/resume" commands
-        if n in CONTINUE_PHRASES:
-            return True
-
-        if n in FILLER_ONLY:
-            return False
-
-        if n in SMALL_TOSS_SINGLE:
-            return False
-
-        if n in SMALL_TOSS_PHRASES:
-            return False
-
-        # If it's very short and NOT a skill request, ignore it.
-        words = n.split()
-        if len(words) <= 2 and not looks_like_email_intent(n):
-            return False
-
-        return True
-
-
-    def should_reply(text: str) -> bool:
-        n = _normalize_text(text)
-        if not n:
-            return False
-
-        if n in FILLER_ONLY:
-            return False
-
-        if n in SMALL_TOSS_SINGLE:
-            return False
-
-        if n in SMALL_TOSS_PHRASES:
-            return False
-
-        # If it's very short and NOT a skill request, ignore it.
-        words = n.split()
-        if len(words) <= 2 and not looks_like_email_intent(n):
-            return False
-
-        return True
 
     # --- FSM router ----------------------------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
@@ -574,20 +482,22 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Transcript handling -------------------------------------------------
     async def handle_transcript_event(event: dict):
-        transcript: str = event.get("transcript", "").strip()
+        transcript: str = (event.get("transcript") or "").strip()
         if not transcript:
             return
 
         logger.info("USER Transcript completed: %r", transcript)
 
-        if not should_reply(transcript):
-            logger.info("Ignoring filler transcript: %r", transcript)
+        is_email = looks_like_email_intent(transcript)
+        feature = "email" if is_email else "chitchat"
+        style = get_style_for_feature(feature)
+
+        if not should_reply(transcript, style, is_skill_intent=is_email):
+            logger.info("Ignoring transcript (style=%s feature=%s): %r", style, feature, transcript)
             return
 
-
-        # If skill-gated routing is enabled, only call the backend brain when
-        # the utterance looks like an email request.
-        if SKILL_GATED_ROUTING and not looks_like_email_intent(transcript):
+        # Optional: skill-gated routing
+        if SKILL_GATED_ROUTING and not is_email:
             logger.info(
                 "Skill-gated routing: bypassing /assistant/route for non-email utterance: %r",
                 transcript,
