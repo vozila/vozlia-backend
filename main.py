@@ -18,7 +18,7 @@ from vozlia_twilio.stream import twilio_stream
 from admin_google_oauth import router as admin_router  # root-level admin router
 from skills.loader import load_skills_from_disk
 
-load_skills_from_disk()
+#load_skills_from_disk()
 
 
 
