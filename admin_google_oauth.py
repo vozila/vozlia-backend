@@ -11,7 +11,7 @@ from deps import get_db
 from models import User, EmailAccount
 from core.security import encrypt_str
 from admin_auth import set_admin_session, clear_admin_session, require_admin, admin_enabled
-
+from core.logging import logger
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -22,21 +22,40 @@ GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 GMAIL_CONNECT_STATE = "admin_gmail_connect"
 
 
+
+@router.get("/_debug/env")
+async def admin_debug_env():
+    # Do NOT return secrets. Only return presence + redirect URI for sanity.
+    payload = {
+        "ADMIN_ENABLED": admin_enabled(),
+        "GOOGLE_OAUTH_CLIENT_ID_set": bool(_env("GOOGLE_OAUTH_CLIENT_ID")),
+        "GOOGLE_OAUTH_CLIENT_SECRET_set": bool(_env("GOOGLE_OAUTH_CLIENT_SECRET")),
+        "GOOGLE_OAUTH_REDIRECT_URI": _env("GOOGLE_OAUTH_REDIRECT_URI"),
+        "SESSION_SECRET_set": bool(_env("SESSION_SECRET")),
+        "ADMIN_EMAIL": _env("ADMIN_EMAIL"),
+    }
+    logger.info("ADMIN_DEBUG_ENV %s", payload)
+    return payload
+
+
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
 
 def _oauth_config_ok() -> bool:
-    return all(
-        _env(k)
-        for k in (
-            "GOOGLE_OAUTH_CLIENT_ID",
-            "GOOGLE_OAUTH_CLIENT_SECRET",
-            "GOOGLE_OAUTH_REDIRECT_URI",
-            "SESSION_SECRET",
-            "ADMIN_EMAIL",
-        )
-    )
+    required = [
+        "GOOGLE_OAUTH_CLIENT_ID",
+        "GOOGLE_OAUTH_CLIENT_SECRET",
+        "GOOGLE_OAUTH_REDIRECT_URI",
+        "SESSION_SECRET",
+        "ADMIN_EMAIL",
+    ]
+    missing = [k for k in required if not _env(k)]
+    if missing:
+        from core.logging import logger
+        logger.error("Admin OAuth missing env vars: %s", missing)
+        return False
+    return True
 
 
 def _gmail_oauth_ok() -> bool:
