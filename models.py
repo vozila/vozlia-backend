@@ -25,6 +25,12 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     email = Column(String, unique=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    settings = relationship(
+        "UserSetting",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     # Relationships
     email_accounts = relationship("EmailAccount", back_populates="user")
@@ -35,6 +41,20 @@ class User(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+
+class UserSetting(Base):
+    __tablename__ = "user_settings"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    # e.g. "agent_greeting", "gmail_summary_enabled", "gmail_account_id"
+    key = Column(String, nullable=False)
+    value = Column(JSONB, nullable=False, default=dict)
+
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="settings")
 
 
 class EmailAccount(Base):
