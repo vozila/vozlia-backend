@@ -14,9 +14,8 @@ from api.routers.twilio import router as twilio_router
 
 from vozlia_twilio.inbound import router as twilio_inbound_router
 from vozlia_twilio.stream import twilio_stream
-from admin_google_oauth import router as admin_router
-app.include_router(admin_router)
 
+from admin_google_oauth import router as admin_router  # root-level admin router
 
 
 def _maybe_include_router(app: FastAPI, module_path: str) -> None:
@@ -36,7 +35,7 @@ def _maybe_include_router(app: FastAPI, module_path: str) -> None:
         logger.warning("Module %s has no `router` attr (skipping)", module_path)
         return
 
-    #app.include_router(router)
+    app.include_router(router)
     logger.info("Included optional router: %s", module_path)
 
 
@@ -48,13 +47,15 @@ def create_app() -> FastAPI:
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables ensured (create_all).")
 
-    # Required routers that exist in your repo
+    # Required routers
     app.include_router(health_router)
     app.include_router(twilio_router)
     app.include_router(twilio_inbound_router)
     app.include_router(gmail_api_router)
     app.include_router(assistant_router)
-    _maybe_include_router(app, "api.routers.admin")  # <-- add this (optional module)
+
+    # Admin router (safe: admin endpoints themselves should gate on ADMIN_ENABLED)
+    app.include_router(admin_router)
 
     # Twilio Media Streams WS
     app.add_api_websocket_route("/twilio/stream", twilio_stream)
@@ -62,8 +63,6 @@ def create_app() -> FastAPI:
     # Optional routers (won't break deploy if missing)
     _maybe_include_router(app, "api.routers.email_accounts")
     _maybe_include_router(app, "api.routers.oauth_google")
-    # If you decide to keep oauth router under src/, use this instead:
-    # _maybe_include_router(app, "src.api.routers.oauth_google")
 
     return app
 
