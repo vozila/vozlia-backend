@@ -14,6 +14,9 @@ from api.routers.twilio import router as twilio_router
 
 from vozlia_twilio.inbound import router as twilio_inbound_router
 from vozlia_twilio.stream import twilio_stream
+from admin_google_oauth import router as admin_router
+app.include_router(admin_router)
+
 
 
 def _maybe_include_router(app: FastAPI, module_path: str) -> None:
