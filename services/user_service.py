@@ -32,3 +32,7 @@ def get_or_create_primary_user(db: Session) -> User:
         db.refresh(user)
         logger.info("Created demo user with id=%s email=%s", user.id, user.email)
     return user
+# Backwards-compatible alias for older imports.
+# Keep this until we migrate all modules to get_or_create_primary_user().
+def get_or_create_demo_user(db):
+    return get_or_create_primary_user(db)
