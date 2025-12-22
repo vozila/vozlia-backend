@@ -1,15 +1,16 @@
 # services/user_service.py
 import os
 from sqlalchemy.orm import Session
+
 from core.logging import logger
 from models import User
 
 
 def get_or_create_primary_user(db: Session) -> User:
     """
-    Chooses the primary user deterministically.
-    If ADMIN_EMAIL is set, use that user (create if missing).
-    Otherwise fall back to first user / demo user behavior.
+    Deterministic primary user:
+    - If ADMIN_EMAIL is set, use that user (create if missing)
+    - Else fallback to first user / demo user behavior
     """
     admin_email = os.getenv("ADMIN_EMAIL")
 
@@ -23,7 +24,7 @@ def get_or_create_primary_user(db: Session) -> User:
             logger.info("Created primary user from ADMIN_EMAIL id=%s email=%s", user.id, user.email)
         return user
 
-    # Legacy MVP behavior
+    # Legacy fallback
     user = db.query(User).first()
     if not user:
         user = User(email="demo@vozlia.com")
@@ -32,7 +33,11 @@ def get_or_create_primary_user(db: Session) -> User:
         db.refresh(user)
         logger.info("Created demo user with id=%s email=%s", user.id, user.email)
     return user
-# Backwards-compatible alias for older imports.
-# Keep this until we migrate all modules to get_or_create_primary_user().
-def get_or_create_demo_user(db):
+
+
+def get_or_create_demo_user(db: Session) -> User:
+    """
+    Backwards-compatible function name.
+    Some routers still import this symbol. Do not remove yet.
+    """
     return get_or_create_primary_user(db)
