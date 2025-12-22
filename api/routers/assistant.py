@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from deps import get_db
-from services.user_service import get_or_create_demo_user
+from services.user_service import get_or_create_primary_user
 from services.assistant_service import run_assistant_route
 
 router = APIRouter()
@@ -21,5 +21,5 @@ class AssistantRouteOut(BaseModel):
 
 @router.post("/assistant/route", response_model=AssistantRouteOut)
 def assistant_route(payload: AssistantRouteIn, db: Session = Depends(get_db)):
-    current_user = get_or_create_demo_user(db)
+    current_user = get_or_create_primary_user(db)
     return run_assistant_route(payload.text, db, current_user, account_id=payload.account_id, context=payload.context)
