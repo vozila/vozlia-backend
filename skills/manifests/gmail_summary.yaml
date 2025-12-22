@@ -9,6 +9,12 @@ trigger:
     - email summary
     - summarize my email
     - check my email summary
+    - read my email
+    - check my email
+    - read my emails
+    - check my inbox
+    - what emails do I have
+
 
 api:
   type: internal
