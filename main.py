@@ -16,6 +16,10 @@ from vozlia_twilio.inbound import router as twilio_inbound_router
 from vozlia_twilio.stream import twilio_stream
 
 from admin_google_oauth import router as admin_router  # root-level admin router
+from skills.loader import load_skills_from_disk
+
+load_skills_from_disk()
+
 
 
 def _maybe_include_router(app: FastAPI, module_path: str) -> None:
@@ -45,7 +49,8 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def on_startup() -> None:
         Base.metadata.create_all(bind=engine)
-        logger.info("Database tables ensured (create_all).")
+        load_skills_from_disk()
+        logger.info("Database tables ensured and skills loaded.")
 
     # Required routers
     app.include_router(health_router)
