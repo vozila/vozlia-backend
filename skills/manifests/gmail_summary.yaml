@@ -1,0 +1,23 @@
+id: gmail_summary
+name: Gmail Email Summary
+
+greeting: >
+  I can summarize your recent emails. Would you like me to check now?
+
+trigger:
+  phrases:
+    - email summary
+    - summarize my email
+    - check my email summary
+
+api:
+  type: internal
+  handler: gmail.get_summaries
+
+prompt:
+  system: |
+    You summarize emails clearly and concisely.
+    Only speak from provided summaries.
+
+response:
+  speak: "{{summary}}"
