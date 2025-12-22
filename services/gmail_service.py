@@ -1,6 +1,7 @@
 # services/gmail_service.py
 import json
 import httpx
+import os
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
@@ -38,6 +39,11 @@ def get_gmail_account_or_404(account_id: str, current_user: User, db: Session) -
 
 
 def get_default_gmail_account_id(current_user: User, db: Session) -> str | None:
+    import os
+    OAUTH_DEBUG_LOGS = os.getenv("OAUTH_DEBUG_LOGS", "0") == "1"
+    if OAUTH_DEBUG_LOGS:
+        logger.info("GMAIL_DEFAULT_ACCOUNT_LOOKUP user_id=%s email=%s", current_user.id, getattr(current_user, "email", None))
+
     q = (
         db.query(EmailAccount)
         .filter(
@@ -55,8 +61,12 @@ def get_default_gmail_account_id(current_user: User, db: Session) -> str | None:
 
 
 def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
+    import os  # safe even if also imported globally
+
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
         raise HTTPException(status_code=500, detail="Google OAuth not configured on server")
+
+    OAUTH_DEBUG_LOGS = os.getenv("OAUTH_DEBUG_LOGS", "0") == "1"
 
     access_token = decrypt_str(account.oauth_access_token)
     refresh_token = decrypt_str(account.oauth_refresh_token)
@@ -77,19 +87,35 @@ def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
 
     with httpx.Client(timeout=10.0) as client_http:
         resp = client_http.post(GOOGLE_TOKEN_URL, data=data)
+
         if resp.status_code != 200:
-            logger.error("Failed to refresh Gmail token: %s %s", resp.status_code, resp.text)
+            if OAUTH_DEBUG_LOGS:
+                logger.error(
+                    "GMAIL_REFRESH_FAILED status=%s body=%s account_id=%s user_id=%s email_address=%s expires_at=%s",
+                    resp.status_code,
+                    resp.text,
+                    getattr(account, "id", None),
+                    getattr(account, "user_id", None),
+                    getattr(account, "email_address", None),
+                    getattr(account, "oauth_expires_at", None),
+                )
+            else:
+                logger.error("Failed to refresh Gmail token: %s %s", resp.status_code, resp.text)
+
+            # ALWAYS raise on refresh failure
             raise HTTPException(status_code=502, detail="Failed to refresh Gmail access token with Google")
 
         token_data = resp.json()
         new_access_token = token_data.get("access_token")
         expires_in = token_data.get("expires_in")
+
         if not new_access_token:
             raise HTTPException(status_code=500, detail="Google did not return a new access token during refresh")
 
         account.oauth_access_token = encrypt_str(new_access_token)
         if expires_in:
             account.oauth_expires_at = now + timedelta(seconds=expires_in)
+
         db.commit()
         db.refresh(account)
         return new_access_token
