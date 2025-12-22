@@ -91,6 +91,12 @@ def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
             (GOOGLE_CLIENT_ID[-8:] if GOOGLE_CLIENT_ID else None),
             GOOGLE_TOKEN_URL,
         )
+        logger.info(
+            "GMAIL_REFRESH_CLIENT_CHECK client_id_suffix=%s secret_present=%s secret_len=%s",
+            (GOOGLE_CLIENT_ID[-12:] if GOOGLE_CLIENT_ID else None),
+            bool(GOOGLE_CLIENT_SECRET),
+            (len(GOOGLE_CLIENT_SECRET) if GOOGLE_CLIENT_SECRET else 0),
+        )
 
         resp = client_http.post(GOOGLE_TOKEN_URL, data=data)
 
