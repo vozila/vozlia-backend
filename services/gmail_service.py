@@ -86,6 +86,12 @@ def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
     }
 
     with httpx.Client(timeout=10.0) as client_http:
+        logger.info(
+            "GMAIL_REFRESH_USING_CLIENT client_id_suffix=%s token_url=%s",
+            (GOOGLE_CLIENT_ID[-8:] if GOOGLE_CLIENT_ID else None),
+            GOOGLE_TOKEN_URL,
+        )
+
         resp = client_http.post(GOOGLE_TOKEN_URL, data=data)
 
         if resp.status_code != 200:
