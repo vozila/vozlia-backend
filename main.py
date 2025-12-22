@@ -36,7 +36,7 @@ def _maybe_include_router(app: FastAPI, module_path: str) -> None:
         logger.warning("Module %s has no `router` attr (skipping)", module_path)
         return
 
-    app.include_router(router)
+    #app.include_router(router)
     logger.info("Included optional router: %s", module_path)
 
 
@@ -54,6 +54,7 @@ def create_app() -> FastAPI:
     app.include_router(twilio_inbound_router)
     app.include_router(gmail_api_router)
     app.include_router(assistant_router)
+    _maybe_include_router(app, "api.routers.admin")  # <-- add this (optional module)
 
     # Twilio Media Streams WS
     app.add_api_websocket_route("/twilio/stream", twilio_stream)
