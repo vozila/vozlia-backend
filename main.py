@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 from fastapi import FastAPI
+from fastapi import Response
 
 from core.logging import logger
 from db import Base, engine
@@ -73,3 +74,8 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+@app.head("/")
+def head_root() -> Response:
+    return Response(status_code=200)
