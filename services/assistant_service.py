@@ -1,5 +1,6 @@
 # services/assistant_service.py
 from skills.engine import skills_engine_enabled, match_skill_id, execute_skill
+from services.settings_service import get_agent_greeting
 import os
 from core.logging import logger
 from skills.registry import skill_registry
@@ -29,6 +30,8 @@ def run_assistant_route(
       4) Otherwise return FSM response
     """
     fsm = VozliaFSM()
+    # Portal-controlled greeting (admin-configurable)
+    fsm.greeting_text = get_agent_greeting(db, current_user)
 
     fsm_context = context or {}
     fsm_context.setdefault("user_id", current_user.id)
