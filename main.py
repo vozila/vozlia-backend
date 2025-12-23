@@ -18,7 +18,7 @@ from vozlia_twilio.stream import twilio_stream
 
 from admin_google_oauth import router as admin_router  # root-level admin router
 from skills.loader import load_skills_from_disk
-
+from api.routers.user_settings import router as user_settings_router
 #load_skills_from_disk()
 
 
@@ -46,7 +46,7 @@ def _maybe_include_router(app: FastAPI, module_path: str) -> None:
 
 def create_app() -> FastAPI:
     app = FastAPI()
-
+    app.include_router(user_settings_router)
     @app.on_event("startup")
     def on_startup() -> None:
         Base.metadata.create_all(bind=engine)
