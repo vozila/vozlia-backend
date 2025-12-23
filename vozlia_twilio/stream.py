@@ -7,6 +7,10 @@ import json
 import os
 import time
 from typing import Optional
+from db import SessionLocal
+from services.user_service import get_or_create_primary_user
+from services.settings_service import get_realtime_prompt_addendum
+
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
@@ -126,7 +130,7 @@ async def create_realtime_session():
             "input_audio_format": REALTIME_INPUT_AUDIO_FORMAT,
             "output_audio_format": REALTIME_OUTPUT_AUDIO_FORMAT,
             "voice": VOICE_NAME,
-            "instructions": REALTIME_SYSTEM_PROMPT,
+            "instructions": REALTIME_SYSTEM_PROMPT + "\n\n" + prompt_addendum,
             "input_audio_transcription": {
                 "model": "whisper-1",
             },
@@ -150,6 +154,13 @@ async def twilio_stream(websocket: WebSocket):
     - Do NOT "adopt" response_id from response.audio.delta
     - Removes pending_response_create entirely
     """
+    db = SessionLocal()
+        try:
+            user = get_or_create_primary_user(db)
+            prompt_addendum = get_realtime_prompt_addendum(db, user)
+        finally:
+            db.close()
+
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
