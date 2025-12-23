@@ -7,6 +7,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from services.settings_service import get_realtime_prompt_addendum
+
 
 from deps import get_db
 from services.user_service import get_or_create_primary_user
@@ -29,6 +31,17 @@ class MeSettingsOut(BaseModel):
     agent_greeting: str
     gmail_summary_enabled: bool
     gmail_account_id: Optional[str] = None
+    realtime_prompt_addendum: Optional[str] = None
+
+class UpdateRealtimePromptIn(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2000)
+
+@router.put("/settings/realtime-prompt", response_model=MeSettingsOut)
+def me_set_realtime_prompt(payload: UpdateRealtimePromptIn, db: Session = Depends(get_db)):
+    user = get_or_create_primary_user(db)
+    set_setting(db, user, "realtime_prompt_addendum", {"text": payload.text.strip()})
+    return me_get_settings(db)
+
 
 @router.get("/settings", response_model=MeSettingsOut)
 def me_get_settings(db: Session = Depends(get_db)):
