@@ -47,8 +47,17 @@ def run_assistant_route(
     # (1) Existing FSM backend call behavior (no change)
     # ----------------------------
     if backend_call and backend_call.get("type") == "gmail_summary":
+        # ✅ Skill toggle gate (portal-controlled)
+        if not gmail_summary_enabled(db, current_user):
+            return {
+                "spoken_reply": "Email summaries are currently turned off in your settings.",
+                "fsm": fsm_result,
+                "gmail": None,
+            }
+
         params = backend_call.get("params") or {}
         account_id_effective = params.get("account_id") or account_id or get_default_gmail_account_id(current_user, db)
+
 
         if not account_id_effective:
             spoken_reply = (
