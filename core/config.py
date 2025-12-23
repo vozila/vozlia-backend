@@ -94,7 +94,7 @@ VOICE_NAME = os.getenv("VOICE_NAME", OPENAI_REALTIME_VOICE or "coral")
 # System prompt for the realtime session (expected by vozlia_twilio/stream.py)
 REALTIME_SYSTEM_PROMPT = os.getenv(
     "REALTIME_SYSTEM_PROMPT",
-    "You are Vozlia, a helpful real-time voice assistant. Be concise and natural.",
+    "You are Vozlia, a helpful real-time voice assistant. Always introduce yourself. Be concise and natural.",
 )
 
 
