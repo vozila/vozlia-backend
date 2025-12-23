@@ -70,7 +70,7 @@ class VozliaFSM:
         "context": {...}
       }
     """
-
+    greeting_text: str | None = None
     # transitions Machine will attach itself and manage `state` attr
     machine: Machine = field(init=False, repr=False)
     state: str = field(init=False, default="idle")
@@ -316,6 +316,11 @@ class VozliaFSM:
         return backend_call, spoken_reply
 
     def _handle_greeting(self, cleaned: str) -> str:
+        # If the app sets a portal-controlled greeting, prefer it.
+        if getattr(self, "greeting_text", None):
+            gt = str(self.greeting_text).strip()
+            if gt:
+                return gt
         return (
             "Hi, this is Vozlia. I’m your AI assistant. "
             "What would you like help with today?"
