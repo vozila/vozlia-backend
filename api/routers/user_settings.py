@@ -7,7 +7,6 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from services.settings_service import get_realtime_prompt_addendum
 
 
 from deps import get_db
@@ -17,6 +16,7 @@ from services.settings_service import (
     gmail_summary_enabled,
     get_selected_gmail_account_id,
     set_setting,
+    get_realtime_prompt_addendum,
 )
 from models import EmailAccount
 
