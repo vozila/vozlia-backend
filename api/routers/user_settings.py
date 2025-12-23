@@ -1,5 +1,7 @@
 # api/routers/user_settings.py
 from __future__ import annotations
+from admin_auth import require_admin
+
 
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,7 +18,12 @@ from services.settings_service import (
 )
 from models import EmailAccount
 
-router = APIRouter(prefix="/me", tags=["me-settings"])
+router = APIRouter(
+    prefix="/me",
+    tags=["me-settings"],
+    dependencies=[Depends(require_admin)],
+)
+
 
 class MeSettingsOut(BaseModel):
     agent_greeting: str
