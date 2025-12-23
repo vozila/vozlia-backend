@@ -9,9 +9,24 @@ from models import User, UserSetting
 DEFAULTS = {
     "agent_greeting": {"text": "Hello! How can I assist you today?"},
     "gmail_summary_enabled": {"enabled": True},
-    # UUID string of an EmailAccount row for this user
-    "gmail_account_id": {"account_id": None},
+    "gmail_account_id": {"account_id": "d8c8cd99-c9bc-4e8c-a560-d220782665a1"},
+    "realtime_prompt_addendum": {
+        "text": (
+            "CALL OPENING RULE (FIRST UTTERANCE ONLY): "
+            "Greet the caller and introduce yourself as Vozlia in one short sentence. "
+            "Example: \"Hello, you're speaking with Vozlia — how can I help today?\" "
+            "Do not repeat the brand intro after the first utterance."
+        )
+    },
 }
+
+def get_realtime_prompt_addendum(db: Session, user: User) -> str:
+    v = get_setting(db, user, "realtime_prompt_addendum")
+    txt = (v or {}).get("text")
+    if isinstance(txt, str) and txt.strip():
+        return txt.strip()
+    return DEFAULTS["realtime_prompt_addendum"]["text"]
+
 
 def get_setting(db: Session, user: User, key: str) -> dict:
     row = (
