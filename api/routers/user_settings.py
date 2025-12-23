@@ -50,6 +50,7 @@ def me_get_settings(db: Session = Depends(get_db)):
         agent_greeting=get_agent_greeting(db, user),
         gmail_summary_enabled=gmail_summary_enabled(db, user),
         gmail_account_id=get_selected_gmail_account_id(db, user),
+        realtime_prompt_addendum=get_realtime_prompt_addendum(db, user),
     )
 
 class UpdateGreetingIn(BaseModel):
