@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
+from services.settings_service import get_selected_gmail_account_id
 
 from core.logging import logger
 from core import config as cfg
@@ -40,6 +41,23 @@ def get_gmail_account_or_404(account_id: str, current_user: User, db: Session) -
 
 def get_default_gmail_account_id(current_user: User, db: Session) -> str | None:
     import os
+    selected = get_selected_gmail_account_id(db, current_user)
+    if selected:
+        # verify it still exists & belongs to user & is gmail/google & active
+        row = (
+            db.query(EmailAccount)
+            .filter(
+                EmailAccount.id == selected,
+                EmailAccount.user_id == current_user.id,
+                EmailAccount.provider_type == "gmail",
+                EmailAccount.oauth_provider == "google",
+                EmailAccount.is_active == True,  # noqa
+            )
+            .first()
+        )
+        if row:
+            return str(row.id)
+
     OAUTH_DEBUG_LOGS = os.getenv("OAUTH_DEBUG_LOGS", "0") == "1"
     if OAUTH_DEBUG_LOGS:
         logger.info("GMAIL_DEFAULT_ACCOUNT_LOOKUP user_id=%s email=%s", current_user.id, getattr(current_user, "email", None))
