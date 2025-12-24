@@ -101,10 +101,9 @@ def should_reply(text: str, style: str, *, is_skill_intent: bool) -> bool:
     return True
 
 
-async def create_realtime_session():
+async def create_realtime_session(prompt_addendum: str):
     """
     Connect to OpenAI Realtime WS and send session.update + an initial greeting.
-    Behavior unchanged; now config-driven (no main.py dependency).
     """
     logger.info(f"Connecting to OpenAI Realtime at {OPENAI_REALTIME_URL}")
 
@@ -114,6 +113,11 @@ async def create_realtime_session():
         max_size=16 * 1024 * 1024,
         ping_interval=None,
         ping_timeout=None,
+    )
+
+    instructions = (
+        REALTIME_SYSTEM_PROMPT if not prompt_addendum
+        else REALTIME_SYSTEM_PROMPT + "\n\n" + prompt_addendum
     )
 
     session_update = {
@@ -130,10 +134,8 @@ async def create_realtime_session():
             "input_audio_format": REALTIME_INPUT_AUDIO_FORMAT,
             "output_audio_format": REALTIME_OUTPUT_AUDIO_FORMAT,
             "voice": VOICE_NAME,
-            "instructions": REALTIME_SYSTEM_PROMPT + "\n\n" + prompt_addendum,
-            "input_audio_transcription": {
-                "model": "whisper-1",
-            },
+            "instructions": instructions,
+            "input_audio_transcription": {"model": "whisper-1"},
         },
     }
 
@@ -146,23 +148,24 @@ async def create_realtime_session():
     return ws
 
 
+
 async def twilio_stream(websocket: WebSocket):
     """
     Pattern 1 (no response_id adoption):
-    - Track active_response_id ONLY from response.created
-    - Cancel active response when creating a new one
-    - Do NOT "adopt" response_id from response.audio.delta
-    - Removes pending_response_create entirely
+    ...
     """
+    # Load portal-controlled Realtime prompt addendum ONCE per call (not in hot path)
+    prompt_addendum = ""
     db = SessionLocal()
-        try:
-            user = get_or_create_primary_user(db)
-            prompt_addendum = get_realtime_prompt_addendum(db, user)
-        finally:
-            db.close()
+    try:
+        user = get_or_create_primary_user(db)
+        prompt_addendum = get_realtime_prompt_addendum(db, user)
+    finally:
+        db.close()
 
     await websocket.accept()
     logger.info("Twilio media stream connected")
+
 
     # --- Call + AI state -----------------------------------------------------
     openai_ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -701,10 +704,11 @@ async def twilio_stream(websocket: WebSocket):
             twilio_ws_closed = True
         except Exception:
             logger.exception("Error in Twilio event loop")
+            
 
     # --- Main orchestration --------------------------------------------------
     try:
-        openai_ws = await create_realtime_session()
+        openai_ws = await create_realtime_session(prompt_addendum)
         logger.info("connection open")
 
         await asyncio.gather(openai_loop(), twilio_loop())
