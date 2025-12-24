@@ -3,7 +3,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.logging import logger
-from core.config import settings
 
 # Routers that are known to exist
 from api.routers.health import router as health_router
@@ -68,4 +67,3 @@ if admin_router:
 @app.on_event("startup")
 async def startup():
     logger.info("Vozlia backend starting up")
-    logger.info("Environment: %s", settings.ENV)
