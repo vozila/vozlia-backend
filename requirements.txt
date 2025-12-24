@@ -11,3 +11,6 @@ cryptography
 email-validator
 transitions>=0.9.0
 itsdangerous>=2.2.0
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.0.0
