@@ -101,6 +101,28 @@ def should_reply(text: str, style: str, *, is_skill_intent: bool) -> bool:
     return True
 
 
+def _build_realtime_instructions(base: str, prompt_addendum: Optional[str]) -> str:
+    """
+    Build the Realtime `instructions` string for session.update.
+
+    Hardening rules:
+    - Only append once (this function is only called at session start).
+    - Ignore empty/whitespace addenda.
+    - Strip leading/trailing whitespace on addendum.
+    - Insert a clear delimiter so the "portal opening rule" stays scoped and readable.
+    """
+    add = (prompt_addendum or "").strip()
+    if not add:
+        return base
+
+    # Prevent accidental double-delimiter if the saved addendum already contains it.
+    delimiter = "--- PORTAL OPENING RULE ---"
+    if add.startswith(delimiter):
+        add = add[len(delimiter):].lstrip("\n ").strip()
+
+    return f"{base}\n\n{delimiter}\n{add}"
+
+
 async def create_realtime_session(prompt_addendum: str):
     """
     Connect to OpenAI Realtime WS and send session.update + an initial greeting.
@@ -115,10 +137,7 @@ async def create_realtime_session(prompt_addendum: str):
         ping_timeout=None,
     )
 
-    instructions = (
-        REALTIME_SYSTEM_PROMPT if not prompt_addendum
-        else REALTIME_SYSTEM_PROMPT + "\n\n" + prompt_addendum
-    )
+    instructions = _build_realtime_instructions(REALTIME_SYSTEM_PROMPT, prompt_addendum)
 
     session_update = {
         "type": "session.update",
