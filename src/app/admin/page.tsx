@@ -6,6 +6,18 @@ import { EmailAccount, MeSettings, VozliaAPI } from "@/lib/vozliaApi";
 
 type Toast = { type: "success" | "error"; message: string };
 
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "";
+
+/**
+ * Redirect user to backend OAuth login.
+ * We *try* to pass a `next=` return URL; if your backend ignores it, it will still work (just returns wherever backend defaults).
+ */
+function buildLoginUrl() {
+  const next = encodeURIComponent(`${window.location.origin}/admin`);
+  if (!API_BASE) return `/admin/login?next=${next}`; // fallback (won't work cross-domain, but avoids crashing)
+  return `${API_BASE}/admin/login?next=${next}`;
+}
+
 function ToastView({ toast, onClose }: { toast: Toast | null; onClose: () => void }) {
   if (!toast) return null;
   return (
@@ -66,6 +78,9 @@ export default function AdminSettingsPage() {
   const [settings, setSettings] = useState<MeSettings | null>(null);
   const [emailAccounts, setEmailAccounts] = useState<EmailAccount[]>([]);
 
+  // ✅ IMPORTANT: this was missing in your current file and causes runtime failure
+  const [unauthenticated, setUnauthenticated] = useState(false);
+
   // local edit state
   const [greetingDraft, setGreetingDraft] = useState("");
   const [realtimeDraft, setRealtimeDraft] = useState("");
@@ -75,7 +90,11 @@ export default function AdminSettingsPage() {
   const activeGmailAccounts = useMemo(() => {
     return emailAccounts
       .filter((a) => a.is_active)
-      .filter((a) => (a.provider_type || "").toLowerCase() === "gmail" || (a.oauth_provider || "").toLowerCase() === "google")
+      .filter(
+        (a) =>
+          (a.provider_type || "").toLowerCase() === "gmail" ||
+          (a.oauth_provider || "").toLowerCase() === "google"
+      )
       .sort((a, b) => a.email_address.localeCompare(b.email_address));
   }, [emailAccounts]);
 
@@ -86,6 +105,8 @@ export default function AdminSettingsPage() {
 
   async function loadAll() {
     setLoading(true);
+    setUnauthenticated(false);
+
     try {
       const [s, accts] = await Promise.all([VozliaAPI.getMeSettings(), VozliaAPI.listEmailAccounts()]);
       setSettings(s);
@@ -97,10 +118,12 @@ export default function AdminSettingsPage() {
       setGmailAccountDraft(s.gmail_account_id || "");
     } catch (e: any) {
       const status = e?.status;
+
       if (status === 401) {
+        setUnauthenticated(true);
         showToast({
           type: "error",
-          message: "Not authenticated (401). Make sure you are logged in and cookies are enabled for this site.",
+          message: "Not authenticated. Please log in with Google.",
         });
       } else {
         showToast({ type: "error", message: e?.message || "Failed to load settings." });
@@ -180,6 +203,8 @@ export default function AdminSettingsPage() {
     }
   }
 
+  const showControls = !loading && !unauthenticated;
+
   return (
     <div className="min-h-screen bg-gray-50">
       <ToastView toast={toast} onClose={() => setToast(null)} />
@@ -204,12 +229,39 @@ export default function AdminSettingsPage() {
           <div className="mt-8 rounded-2xl border bg-white p-6 shadow-sm">
             <div className="text-sm text-gray-600">Loading settings…</div>
           </div>
-        ) : (
+        ) : unauthenticated ? (
+          <div className="mt-8 rounded-2xl border bg-white p-6 shadow-sm">
+            <div className="text-lg font-semibold">Login required</div>
+            <div className="mt-2 text-sm text-gray-600">
+              You’re not authenticated for the API. Click below to log in with Google.
+            </div>
+
+            <div className="mt-4 flex flex-col gap-2">
+              <button
+                className="rounded-xl bg-black px-4 py-2 text-sm text-white"
+                onClick={() => {
+                  if (!API_BASE) {
+                    showToast({
+                      type: "error",
+                      message:
+                        "Missing NEXT_PUBLIC_API_BASE_URL on vozlia-admin. Set it to your backend URL (Render or api.vozlia.com).",
+                    });
+                    return;
+                  }
+                  window.location.href = buildLoginUrl();
+                }}
+              >
+                Login with Google
+              </button>
+
+              <div className="text-xs text-gray-500">
+                API base: <code>{API_BASE || "(not set)"}</code>
+              </div>
+            </div>
+          </div>
+        ) : showControls ? (
           <div className="mt-8 grid grid-cols-1 gap-6">
-            <Section
-              title="Agent greeting"
-              description="This is the default greeting the assistant uses (DB-backed)."
-            >
+            <Section title="Agent greeting" description="This is the default greeting the assistant uses (DB-backed).">
               <Label>Greeting</Label>
               <textarea
                 className="h-28 w-full rounded-xl border p-3 text-sm outline-none focus:ring-2 focus:ring-black/10"
@@ -218,9 +270,7 @@ export default function AdminSettingsPage() {
                 placeholder="Hi! Thanks for calling…"
               />
               <div className="mt-3 flex items-center justify-between gap-3">
-                <div className="text-xs text-gray-500">
-                  {greetingDirty ? "Unsaved changes" : "Saved"}
-                </div>
+                <div className="text-xs text-gray-500">{greetingDirty ? "Unsaved changes" : "Saved"}</div>
                 <button
                   className="rounded-xl bg-black px-4 py-2 text-sm text-white disabled:opacity-50"
                   onClick={saveGreeting}
@@ -243,9 +293,7 @@ export default function AdminSettingsPage() {
                 placeholder='Example: "Open by saying: Thanks for calling {Business}. How can I help today?"'
               />
               <div className="mt-3 flex items-center justify-between gap-3">
-                <div className="text-xs text-gray-500">
-                  {realtimeDirty ? "Unsaved changes" : "Saved"}
-                </div>
+                <div className="text-xs text-gray-500">{realtimeDirty ? "Unsaved changes" : "Saved"}</div>
                 <button
                   className="rounded-xl bg-black px-4 py-2 text-sm text-white disabled:opacity-50"
                   onClick={saveRealtimePrompt}
@@ -256,10 +304,7 @@ export default function AdminSettingsPage() {
               </div>
             </Section>
 
-            <Section
-              title="Email summaries"
-              description="Controls whether the assistant can summarize emails (DB-backed)."
-            >
+            <Section title="Email summaries" description="Controls whether the assistant can summarize emails (DB-backed).">
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <div className="text-sm font-medium text-gray-900">Enable email summaries</div>
@@ -280,9 +325,7 @@ export default function AdminSettingsPage() {
               </div>
 
               <div className="mt-3 flex items-center justify-between gap-3">
-                <div className="text-xs text-gray-500">
-                  {gmailEnabledDirty ? "Unsaved changes" : "Saved"}
-                </div>
+                <div className="text-xs text-gray-500">{gmailEnabledDirty ? "Unsaved changes" : "Saved"}</div>
                 <button
                   className="rounded-xl bg-black px-4 py-2 text-sm text-white disabled:opacity-50"
                   onClick={saveGmailEnabled}
@@ -320,9 +363,7 @@ export default function AdminSettingsPage() {
               )}
 
               <div className="mt-3 flex items-center justify-between gap-3">
-                <div className="text-xs text-gray-500">
-                  {gmailAccountDirty ? "Unsaved changes" : "Saved"}
-                </div>
+                <div className="text-xs text-gray-500">{gmailAccountDirty ? "Unsaved changes" : "Saved"}</div>
                 <button
                   className="rounded-xl bg-black px-4 py-2 text-sm text-white disabled:opacity-50"
                   onClick={saveGmailAccount}
@@ -336,12 +377,20 @@ export default function AdminSettingsPage() {
             <div className="rounded-2xl border bg-white p-5 text-sm text-gray-600 shadow-sm">
               <div className="font-medium text-gray-900">Notes</div>
               <ul className="mt-2 list-disc pl-5">
-                <li>All requests use cookies via <code>credentials: "include"</code>.</li>
-                <li>If you see 401s, confirm the backend SESSION_SECRET is set and CORS allows credentials for admin.vozlia.com.</li>
+                <li>
+                  All requests use cookies via <code>credentials: "include"</code>.
+                </li>
+                <li>
+                  If you see 401s after logging in, confirm backend cookies + CORS allow credentials for{" "}
+                  <code>admin.vozlia.com</code>.
+                </li>
+                <li>
+                  Login button redirects to: <code>{API_BASE || "(missing API base)"}/admin/login</code>
+                </li>
               </ul>
             </div>
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );
