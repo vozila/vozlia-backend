@@ -67,7 +67,7 @@ def create_app() -> FastAPI:
     app.add_api_websocket_route("/twilio/stream", twilio_stream)
 
     # Optional routers (won't break deploy if missing)
-    _maybe_include_router(app, "api.routers.email_accounts")
+    #_maybe_include_router(app, "api.routers.email_accounts")
     _maybe_include_router(app, "api.routers.oauth_google")
 
     return app
