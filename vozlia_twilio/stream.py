@@ -160,6 +160,13 @@ async def twilio_stream(websocket: WebSocket):
     try:
         user = get_or_create_primary_user(db)
         prompt_addendum = get_realtime_prompt_addendum(db, user)
+        logger.info(
+            "Realtime prompt addendum loaded (len=%d)",
+            len(prompt_addendum or "")
+        )
+    except Exception:
+        logger.exception("Failed to load realtime prompt addendum; proceeding without it")
+        prompt_addendum = ""
     finally:
         db.close()
 
