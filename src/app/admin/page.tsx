@@ -14,7 +14,6 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "";
  */
 function buildLoginUrl() {
   const next = encodeURIComponent(`${window.location.origin}/admin`);
-  if (!API_BASE) return `/admin/login?next=${next}`; // fallback (won't work cross-domain, but avoids crashing)
   return `${API_BASE}/admin/login?next=${next}`;
 }
 
