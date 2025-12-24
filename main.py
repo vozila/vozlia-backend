@@ -4,30 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core.logging import logger
 
-# Routers that are known to exist
-from api.routers.health import router as health_router
-from api.routers.me import router as me_router
-
-# Optional routers (safe to skip if missing)
-try:
-    from api.routers.email_accounts import router as email_accounts_router
-except Exception:
-    email_accounts_router = None
-    logger.warning("Optional router missing: api.routers.email_accounts (skipping)")
-
-try:
-    from api.routers.oauth_google import router as oauth_google_router
-except Exception:
-    oauth_google_router = None
-    logger.warning("Optional router missing: api.routers.oauth_google (skipping)")
-
-# Admin OAuth (root-level, existing)
-try:
-    from admin_google_oauth import router as admin_router
-except Exception:
-    admin_router = None
-    logger.warning("Admin OAuth router missing (skipping)")
-
+# -----------------------
+# FastAPI app
+# -----------------------
 app = FastAPI(title="Vozlia Backend")
 
 # -----------------------
@@ -46,11 +25,44 @@ app.add_middleware(
 )
 
 # -----------------------
-# Routers
+# Required routers
 # -----------------------
-app.include_router(health_router)
+try:
+    from api.routers.health import router as health_router
+    app.include_router(health_router)
+except Exception as e:
+    logger.exception("FATAL: health router missing")
+    raise
 
-app.include_router(me_router, prefix="/me")
+# -----------------------
+# Optional routers
+# -----------------------
+try:
+    from api.routers.me import router as me_router
+except Exception:
+    me_router = None
+    logger.warning("Optional router missing: api.routers.me (skipping)")
+
+try:
+    from api.routers.email_accounts import router as email_accounts_router
+except Exception:
+    email_accounts_router = None
+    logger.warning("Optional router missing: api.routers.email_accounts (skipping)")
+
+try:
+    from api.routers.oauth_google import router as oauth_google_router
+except Exception:
+    oauth_google_router = None
+    logger.warning("Optional router missing: api.routers.oauth_google (skipping)")
+
+try:
+    from admin_google_oauth import router as admin_router
+except Exception:
+    admin_router = None
+    logger.warning("Admin OAuth router missing (skipping)")
+
+if me_router:
+    app.include_router(me_router, prefix="/me")
 
 if email_accounts_router:
     app.include_router(email_accounts_router, prefix="/me")
