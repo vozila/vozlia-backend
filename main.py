@@ -1,81 +1,169 @@
-# main.py
-from __future__ import annotations
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-import importlib
-from fastapi import FastAPI
-from fastapi import Response
+from db import SessionLocal
+from admin_auth import require_admin
 
-from core.logging import logger
-from db import Base, engine
+# Settings services (already in your repo)
+from services.settings_service import (
+    get_me_settings,
+    update_agent_greeting,
+    update_realtime_prompt_addendum,
+    update_gmail_summary_enabled,
+)
 
+# Routers that already exist
 from api.routers.health import router as health_router
-from api.routers.assistant import router as assistant_router
-from api.routers.gmail_api import router as gmail_api_router
-from api.routers.twilio import router as twilio_router
-
-from vozlia_twilio.inbound import router as twilio_inbound_router
-from vozlia_twilio.stream import twilio_stream
-
-from admin_google_oauth import router as admin_router  # root-level admin router
-from skills.loader import load_skills_from_disk
 from api.routers.user_settings import router as user_settings_router
-#load_skills_from_disk()
+from admin_google_oauth import router as admin_oauth_router
+
+app = FastAPI()
+
+# --- CORS (safe default; admin UI is backend-served) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Routers ---
+app.include_router(health_router)
+app.include_router(user_settings_router)
+app.include_router(admin_oauth_router)
 
 
+# -------------------------------------------------------------------
+# Admin Portal (server-rendered HTML)
+# -------------------------------------------------------------------
 
-def _maybe_include_router(app: FastAPI, module_path: str) -> None:
+@app.get("/admin", response_class=HTMLResponse)
+def admin_portal(request: Request):
     """
-    Optional router loader.
-    - If module exists and has `router`, we include it.
-    - If not, we log and continue (deploy never fails).
+    Simple backend-served admin portal.
+    Auth required via existing admin OAuth.
     """
-    try:
-        mod = importlib.import_module(module_path)
-    except ModuleNotFoundError:
-        logger.warning("Optional router missing: %s (skipping)", module_path)
-        return
+    require_admin(request)
 
-    router = getattr(mod, "router", None)
-    if router is None:
-        logger.warning("Module %s has no `router` attr (skipping)", module_path)
-        return
+    db = SessionLocal()
+    settings = get_me_settings(db)
+    db.close()
 
-    app.include_router(router)
-    logger.info("Included optional router: %s", module_path)
+    return f"""
+<!doctype html>
+<html>
+  <head>
+    <title>Vozlia Admin</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {{
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+        background: #f6f7f9;
+        padding: 40px;
+      }}
+      .container {{
+        max-width: 820px;
+        margin: 0 auto;
+        background: #fff;
+        border-radius: 12px;
+        padding: 28px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+      }}
+      h1 {{
+        margin-top: 0;
+      }}
+      label {{
+        display: block;
+        margin-top: 22px;
+        font-weight: 600;
+      }}
+      textarea {{
+        width: 100%;
+        min-height: 120px;
+        margin-top: 8px;
+        padding: 12px;
+        font-size: 14px;
+        border-radius: 8px;
+        border: 1px solid #ccc;
+      }}
+      .row {{
+        margin-top: 18px;
+      }}
+      button {{
+        margin-top: 26px;
+        padding: 10px 18px;
+        font-size: 14px;
+        border-radius: 8px;
+        border: none;
+        cursor: pointer;
+        background: #111;
+        color: #fff;
+      }}
+      .hint {{
+        font-size: 12px;
+        color: #666;
+        margin-top: 4px;
+      }}
+      .checkbox {{
+        margin-top: 14px;
+      }}
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Vozlia Admin Portal</h1>
+
+      <form method="post" action="/admin/save">
+
+        <label>Agent Greeting</label>
+        <textarea name="agent_greeting">{settings.agent_greeting or ""}</textarea>
+        <div class="hint">Default greeting used by the assistant.</div>
+
+        <label>Realtime Opening Rule (Addendum)</label>
+        <textarea name="realtime_prompt_addendum">{settings.realtime_prompt_addendum or ""}</textarea>
+        <div class="hint">
+          Applied once at call start to steer the opening greeting (Flow A).
+        </div>
+
+        <div class="checkbox">
+          <label>
+            <input type="checkbox" name="gmail_summary_enabled"
+              {"checked" if settings.gmail_summary_enabled else ""} />
+            Enable Gmail summaries
+          </label>
+          <div class="hint">
+            If disabled, the assistant will not summarize emails.
+          </div>
+        </div>
+
+        <button type="submit">Save Settings</button>
+      </form>
+    </div>
+  </body>
+</html>
+    """
 
 
-def create_app() -> FastAPI:
-    app = FastAPI()
-    app.include_router(user_settings_router)
-    @app.on_event("startup")
-    def on_startup() -> None:
-        Base.metadata.create_all(bind=engine)
-        load_skills_from_disk()
-        logger.info("Database tables ensured and skills loaded.")
+@app.post("/admin/save")
+def admin_save(
+    request: Request,
+    agent_greeting: str = Form(""),
+    realtime_prompt_addendum: str = Form(""),
+    gmail_summary_enabled: str | None = Form(None),
+):
+    """
+    Persist admin settings and redirect back to portal.
+    """
+    require_admin(request)
 
-    # Required routers
-    app.include_router(health_router)
-    app.include_router(twilio_router)
-    app.include_router(twilio_inbound_router)
-    app.include_router(gmail_api_router)
-    app.include_router(assistant_router)
+    db = SessionLocal()
 
-    # Admin router (safe: admin endpoints themselves should gate on ADMIN_ENABLED)
-    app.include_router(admin_router)
+    update_agent_greeting(db, agent_greeting)
+    update_realtime_prompt_addendum(db, realtime_prompt_addendum)
+    update_gmail_summary_enabled(db, gmail_summary_enabled == "on")
 
-    # Twilio Media Streams WS
-    app.add_api_websocket_route("/twilio/stream", twilio_stream)
+    db.close()
 
-    # Optional routers (won't break deploy if missing)
-    #_maybe_include_router(app, "api.routers.email_accounts")
-    _maybe_include_router(app, "api.routers.oauth_google")
-
-    return app
-
-
-app = create_app()
-
-
-@app.head("/")
-def head_root() -> Response:
-    return Response(status_code=200)
+    return RedirectResponse("/admin", status_code=303)
