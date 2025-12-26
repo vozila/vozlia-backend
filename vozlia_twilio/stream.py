@@ -131,13 +131,23 @@ async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
     """
     logger.info(f"Connecting to OpenAI Realtime at {OPENAI_REALTIME_URL}")
 
-    ws = await websockets.connect(
-        OPENAI_REALTIME_URL,
-        extra_headers=OPENAI_REALTIME_HEADERS,
-        max_size=16 * 1024 * 1024,
-        ping_interval=None,
-        ping_timeout=None,
-    )
+    try:
+        ws = await websockets.connect(
+            OPENAI_REALTIME_URL,
+            extra_headers=OPENAI_REALTIME_HEADERS,
+            max_size=16 * 1024 * 1024,
+            ping_interval=None,
+            ping_timeout=None,
+        )
+    except TypeError:
+        # Newer websockets versions renamed extra_headers -> additional_headers
+        ws = await websockets.connect(
+            OPENAI_REALTIME_URL,
+            additional_headers=OPENAI_REALTIME_HEADERS,
+            max_size=16 * 1024 * 1024,
+            ping_interval=None,
+            ping_timeout=None,
+        )
 
     instructions = _build_realtime_instructions(REALTIME_SYSTEM_PROMPT, prompt_addendum)
 
@@ -192,7 +202,6 @@ async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
 async def twilio_stream(websocket: WebSocket):
     """
     Pattern 1 (no response_id adoption):
-    ...
     """
     # Load portal-controlled Realtime prompt addendum ONCE per call (not in hot path)
     prompt_addendum = ""
@@ -205,7 +214,6 @@ async def twilio_stream(websocket: WebSocket):
 
         logger.info("Realtime prompt addendum loaded (len=%d)", len(prompt_addendum or ""))
         logger.info("Agent greeting loaded (len=%d)", len(agent_greeting or ""))
-    
 
     except Exception:
         #logger.exception("Failed to load realtime prompt addendum; proceeding without it")
