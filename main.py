@@ -20,7 +20,7 @@ from admin_google_oauth import router as admin_router  # root-level admin router
 from skills.loader import load_skills_from_disk
 from api.routers.user_settings import router as user_settings_router
 from api.routers.admin_settings import router as admin_settings_router
-app.include_router(admin_settings_router)
+
 #load_skills_from_disk()
 
 
@@ -42,7 +42,7 @@ def _maybe_include_router(app: FastAPI, module_path: str) -> None:
         logger.warning("Module %s has no `router` attr (skipping)", module_path)
         return
 
-    app.include_router(router)
+  
     logger.info("Included optional router: %s", module_path)
 
 
@@ -61,6 +61,9 @@ def create_app() -> FastAPI:
     app.include_router(twilio_inbound_router)
     app.include_router(gmail_api_router)
     app.include_router(assistant_router)
+
+    app.include_router(admin_settings_router)
+    app.include_router(router)
 
     # Admin router (safe: admin endpoints themselves should gate on ADMIN_ENABLED)
     app.include_router(admin_router)
