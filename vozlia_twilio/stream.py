@@ -9,7 +9,9 @@ import time
 from typing import Optional
 from db import SessionLocal
 from services.user_service import get_or_create_primary_user
-from services.settings_service import get_realtime_prompt_addendum
+#from services.settings_service import get_realtime_prompt_addendum
+from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting
+
 
 
 import websockets
@@ -123,7 +125,7 @@ def _build_realtime_instructions(base: str, prompt_addendum: Optional[str]) -> s
     return f"{base}\n\n{delimiter}\n{add}"
 
 
-async def create_realtime_session(prompt_addendum: str):
+async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
     """
     Connect to OpenAI Realtime WS and send session.update + an initial greeting.
     """
@@ -161,8 +163,27 @@ async def create_realtime_session(prompt_addendum: str):
     await ws.send(json.dumps(session_update))
     logger.info("Sent session.update to OpenAI Realtime")
 
-    await ws.send(json.dumps({"type": "response.create"}))
+    opening = (agent_greeting or "").strip()
+
+    # Keep this behind a flag so you can disable instantly without rollback if needed
+    if os.getenv("FORCE_REALTIME_OPENING", "1") == "1" and opening:
+        evt = {
+            "type": "response.create",
+            "response": {
+                # per-response instructions override session instructions for this response :contentReference[oaicite:1]{index=1}
+                "instructions": (
+                    "CALL OPENING (FIRST UTTERANCE ONLY): "
+                    "Say EXACTLY this one sentence with no extra words before or after: "
+                    f"\"{opening}\""
+                ),
+            },
+        }
+    else:
+        evt = {"type": "response.create"}
+
+    await ws.send(json.dumps(evt))
     logger.info("Sent initial greeting request to OpenAI Realtime")
+
 
     return ws
 
@@ -175,14 +196,17 @@ async def twilio_stream(websocket: WebSocket):
     """
     # Load portal-controlled Realtime prompt addendum ONCE per call (not in hot path)
     prompt_addendum = ""
+    agent_greeting = ""
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
         prompt_addendum = get_realtime_prompt_addendum(db, user)
-        logger.info(
-            "Realtime prompt addendum loaded (len=%d)",
-            len(prompt_addendum or "")
-        )
+        agent_greeting = get_agent_greeting(db, user)
+
+        logger.info("Realtime prompt addendum loaded (len=%d)", len(prompt_addendum or ""))
+        logger.info("Agent greeting loaded (len=%d)", len(agent_greeting or ""))
+    ...
+
     except Exception:
         logger.exception("Failed to load realtime prompt addendum; proceeding without it")
         prompt_addendum = ""
@@ -734,7 +758,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Main orchestration --------------------------------------------------
     try:
-        openai_ws = await create_realtime_session(prompt_addendum)
+        openai_ws = await create_realtime_session(prompt_addendum, agent_greeting)
         logger.info("connection open")
 
         await asyncio.gather(openai_loop(), twilio_loop())
