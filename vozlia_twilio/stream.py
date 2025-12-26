@@ -208,8 +208,10 @@ async def twilio_stream(websocket: WebSocket):
     ...
 
     except Exception:
-        logger.exception("Failed to load realtime prompt addendum; proceeding without it")
+        #logger.exception("Failed to load realtime prompt addendum; proceeding without it")
+        logger.exception("Failed to load settings; proceeding with defaults")
         prompt_addendum = ""
+        agent_greeting = ""
     finally:
         db.close()
 
