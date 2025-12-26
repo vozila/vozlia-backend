@@ -72,3 +72,59 @@ def get_selected_gmail_account_id(db: Session, user: User) -> Optional[str]:
     if isinstance(account_id, str) and account_id.strip():
         return account_id.strip()
     return None
+
+
+# ---------------------------------------------------------------------------
+# Lightweight service wrapper for admin router compatibility.
+# The backend itself can continue using the function helpers above.
+# ---------------------------------------------------------------------------
+
+from db import SessionLocal
+from services.user_service import get_or_create_primary_user
+
+
+class SettingsService:
+    def get_current_settings(self) -> dict:
+        db = SessionLocal()
+        try:
+            user = get_or_create_primary_user(db)
+            return {
+                "agent_greeting": get_agent_greeting(db, user),
+                "gmail_summary_enabled": gmail_summary_enabled(db, user),
+                "gmail_account_id": (get_selected_gmail_account_id(db, user) or DEFAULTS["gmail_account_id"]["account_id"]),
+                "realtime_prompt_addendum": get_realtime_prompt_addendum(db, user),
+            }
+        finally:
+            db.close()
+
+    def update_settings(self, patch: dict) -> dict:
+        db = SessionLocal()
+        try:
+            user = get_or_create_primary_user(db)
+
+            if "agent_greeting" in patch:
+                set_setting(db, user, "agent_greeting", {"text": str(patch["agent_greeting"])})
+            if "gmail_summary_enabled" in patch:
+                set_setting(db, user, "gmail_summary_enabled", {"enabled": bool(patch["gmail_summary_enabled"])})
+            if "gmail_account_id" in patch:
+                # allow explicit selection
+                v = patch["gmail_account_id"]
+                if v is None:
+                    set_setting(db, user, "gmail_account_id", {"account_id": DEFAULTS["gmail_account_id"]["account_id"]})
+                else:
+                    set_setting(db, user, "gmail_account_id", {"account_id": str(v)})
+            if "realtime_prompt_addendum" in patch:
+                set_setting(db, user, "realtime_prompt_addendum", {"text": str(patch["realtime_prompt_addendum"])})
+
+            db.commit()
+            return {
+                "agent_greeting": get_agent_greeting(db, user),
+                "gmail_summary_enabled": gmail_summary_enabled(db, user),
+                "gmail_account_id": (get_selected_gmail_account_id(db, user) or DEFAULTS["gmail_account_id"]["account_id"]),
+                "realtime_prompt_addendum": get_realtime_prompt_addendum(db, user),
+            }
+        finally:
+            db.close()
+
+
+settings_service = SettingsService()
