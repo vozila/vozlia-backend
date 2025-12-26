@@ -205,7 +205,7 @@ async def twilio_stream(websocket: WebSocket):
 
         logger.info("Realtime prompt addendum loaded (len=%d)", len(prompt_addendum or ""))
         logger.info("Agent greeting loaded (len=%d)", len(agent_greeting or ""))
-    ...
+    
 
     except Exception:
         #logger.exception("Failed to load realtime prompt addendum; proceeding without it")
