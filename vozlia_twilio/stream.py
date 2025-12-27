@@ -9,6 +9,7 @@ import time
 from typing import Optional
 from db import SessionLocal
 from services.user_service import get_or_create_primary_user
+from services.session_store import session_store
 #from services.settings_service import get_realtime_prompt_addendum
 from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting
 
@@ -482,7 +483,7 @@ async def twilio_stream(websocket: WebSocket):
         try:
             data = await call_fsm_router(
                 transcript,
-                context={"channel": "phone"},
+                context={"channel": "phone", "streamSid": stream_sid},
             )
             spoken = data.get("spoken_reply")
             logger.info("FSM spoken_reply to send: %r", spoken)
@@ -573,7 +574,14 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         # Optional: skill-gated routing
-        if SKILL_GATED_ROUTING and not is_email:
+        # NOTE: if we're awaiting a Gmail inbox selection, do NOT bypass /assistant/route,
+        # even if the utterance doesn't look like an email intent (e.g., "1", "number one").
+        awaiting_inbox = False
+        if SKILL_GATED_ROUTING:
+            call_id = str(stream_sid or "").strip()
+            awaiting_inbox = bool(session_store.get(call_id).get("awaiting_gmail_inbox")) if call_id else False
+
+        if SKILL_GATED_ROUTING and not is_email and not awaiting_inbox:
             logger.info(
                 "Skill-gated routing: bypassing /assistant/route for non-email utterance: %r",
                 transcript,
