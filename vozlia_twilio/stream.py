@@ -571,7 +571,20 @@ async def twilio_stream(websocket: WebSocket):
             json.dumps(
                 {
                     "type": "response.create",
-                    "response": {"instructions": instructions},
+                    "response": {
+                        "instructions": instructions,
+                        "modalities": ["audio", "text"],
+                        "temperature": 0,
+                        "max_output_tokens": 80,
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": spoken_reply}
+                                ],
+                            }
+                        ],
+                    },
                 }
             )
         )
