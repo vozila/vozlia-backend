@@ -537,14 +537,11 @@ async def twilio_stream(websocket: WebSocket):
 
         instructions = (
             "You are on a live phone call as Vozlia.\n"
-            "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
-            "Here is the summary you must speak to the caller:\n"
-            f"\"{spoken_reply}\"\n\n"
-            "For THIS response only:\n"
-            "- Say this summary naturally.\n"
-            "- You MAY lightly rephrase for flow, but keep all important facts.\n"
-            "- DO NOT mention tools, security, privacy, or inability to access email.\n"
-            "- DO NOT apologize or refuse.\n"
+            "For THIS response only, you MUST say the following message to the caller EXACTLY, word for word.\n"
+            "- Do not add any extra words.\n"
+            "- Do not summarize, infer, or invent details.\n"
+            "- Do not mention tools or internal systems.\n\n"
+            f"Message to speak (verbatim): \"{spoken_reply}\"\n"
         )
 
         await openai_ws.send(
