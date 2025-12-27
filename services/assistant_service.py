@@ -38,51 +38,46 @@ def _list_enabled_active_gmail_accounts(db: Session, user: User) -> list[EmailAc
     accounts.sort(key=lambda a: (0 if a.is_primary else 1, (a.email_address or "").lower()))
     return accounts
 def _parse_inbox_choice(choice_text: str, accounts: list[EmailAccount]) -> EmailAccount | None:
-    """Robustly parse the caller's inbox selection.
+    """Parse inbox selection with STT tolerance.
 
     Accepts:
-      - Digits anywhere: '1', '1.', 'option 2', 'number 1'
-      - Words: 'first/one', 'second/two'
-      - Email local-part hints: 'agent', 'yasinc', 'yasinc74'
+      - '1', '1.', 'option 1', 'number one'
+      - 'first/one', 'second/two'
+      - local-part hints like 'agent' or 'yasinc'
     """
     raw = (choice_text or "").strip().lower()
     if not raw or not accounts:
         return None
 
-    # 1) Digit anywhere
-    m_digit = re.search(r"\b([1-9])\b", raw)
-    if m_digit:
-        n = int(m_digit.group(1))
+    # digit anywhere (handles '1.')
+    md = re.search(r"\b([1-9])\b", raw)
+    if md:
+        n = int(md.group(1))
         if 1 <= n <= len(accounts):
             return accounts[n - 1]
 
-    # 2) Ordinal words anywhere
-    word_map = {
-        "first": 1, "1st": 1, "one": 1,
-        "second": 2, "2nd": 2, "two": 2,
-        "third": 3, "3rd": 3, "three": 3,
-    }
-    for w, n in word_map.items():
+    # ordinal words anywhere
+    mapping = {"first": 1, "1st": 1, "one": 1, "second": 2, "2nd": 2, "two": 2, "third": 3, "3rd": 3, "three": 3}
+    for w, n in mapping.items():
         if re.search(rf"\b{re.escape(w)}\b", raw):
             if 1 <= n <= len(accounts):
                 return accounts[n - 1]
 
-    # 3) Fuzzy local-part match
     def norm(s: str) -> str:
         return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
     raw_norm = norm(raw)
-    for a in accounts:
-        email = (a.email_address or "").lower()
-        disp = (a.display_name or "").lower()
+    for acct in accounts:
+        email = (acct.email_address or "").lower()
+        disp = (acct.display_name or "").lower()
         local = email.split("@", 1)[0] if "@" in email else email
 
         if norm(local) and norm(local) in raw_norm:
-            return a
+            return acct
         if norm(disp) and norm(disp) in raw_norm:
-            return a
+            return acct
         if raw and raw in f"{email} {disp}":
-            return a
+            return acct
 
     return None
 def _build_inbox_prompt(accounts: list[EmailAccount]) -> str:
@@ -134,7 +129,7 @@ def run_assistant_route(
         chosen = _parse_inbox_choice(text, accounts)
         if not chosen:
             return {
-                "spoken_reply": (_build_inbox_prompt(accounts) + " If that didn't work, say just the number 1 or 2.") if accounts else "I don't see any active Gmail inboxes connected right now.",
+                "spoken_reply": _build_inbox_prompt(accounts) if accounts else "I don't see any active Gmail inboxes connected right now.",
                 "fsm": fsm_result,
                 "gmail": None,
             }
