@@ -74,6 +74,30 @@ def get_selected_gmail_account_id(db: Session, user: User) -> Optional[str]:
     return None
 
 
+
+def get_enabled_gmail_account_ids(db: Session, user: User) -> list[str]:
+    """Return allow-listed Gmail account IDs for the agent, if configured.
+
+    Storage formats supported:
+      - JSON array: ["uuid1","uuid2"]
+      - JSON object: {"account_ids": ["uuid1","uuid2"]}
+      - Empty / null means: no allowlist configured (treat as 'all active Gmail accounts').
+    """
+    v = get_setting(db, user, "gmail_enabled_account_ids")
+    ids: list[str] = []
+    if isinstance(v, list):
+        ids = [str(x).strip() for x in v if str(x).strip()]
+    elif isinstance(v, dict):
+        raw = v.get("account_ids") or v.get("ids") or []
+        if isinstance(raw, list):
+            ids = [str(x).strip() for x in raw if str(x).strip()]
+    seen = set()
+    out: list[str] = []
+    for x in ids:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
 # ---------------------------------------------------------------------------
 # Lightweight service wrapper for admin router compatibility.
 # The backend itself can continue using the function helpers above.
