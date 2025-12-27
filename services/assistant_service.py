@@ -186,11 +186,7 @@ def run_assistant_route(
                 query=gmail_query,
             )
             if gmail_data.get("summary"):
-                spoken_reply = (
-                    (spoken_reply.strip() + " " + gmail_data["summary"].strip()).strip()
-                    if spoken_reply
-                    else gmail_data["summary"].strip()
-                )
+                spoken_reply = gmail_data["summary"].strip()
             gmail_data["used_account_id"] = account_id_effective
 
         return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
