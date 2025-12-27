@@ -409,24 +409,7 @@ async def twilio_stream(websocket: WebSocket):
         if openai_ws is not None and active_response_id is not None:
             rid = active_response_id
             try:
-                # Prompt-style backend messages (menus/clarifications) must be spoken verbatim.
-        # Otherwise the model may invent filler like "please hold" or hallucinate email content.
-        is_prompt = bool(
-            spoken_reply.strip().endswith("?")
-            or ("please say" in spoken_reply.lower())
-            or ("which one" in spoken_reply.lower())
-        )
-        if is_prompt:
-            instructions = (
-                "You are on a live phone call as Vozlia.\n"
-                "Speak the following backend message EXACTLY as written.\n"
-                "Do not add, remove, or rephrase anything.\n\n"
-                f"\"{spoken_reply}\"\n"
-            )
-        else:
-            instructions = summary_instructions
-
-        await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
+                await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
                 logger.info("BARGE-IN: Sent response.cancel for %s", rid)
             except Exception:
                 logger.exception("BARGE-IN: Failed sending response.cancel for %s", rid)
@@ -552,17 +535,37 @@ async def twilio_stream(websocket: WebSocket):
 
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
 
-        summary_instructions = (
-            "You are on a live phone call as Vozlia.\n"
-            "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
-            "Here is the summary you must speak to the caller:\n"
-            f"\"{spoken_reply}\"\n\n"
-            "For THIS response only:\n"
-            "- Say this summary naturally.\n"
-            "- You MAY lightly rephrase for flow, but keep all important facts.\n"
-            "- DO NOT mention tools, security, privacy, or inability to access email.\n"
-            "- DO NOT apologize or refuse.\n"
+        lower = spoken_reply.strip().lower()
+        is_prompt = bool(
+            spoken_reply.strip().endswith("?")
+            or ("which one" in lower)
+            or ("please say" in lower)
+            or ("select" in lower and "inbox" in lower)
         )
+
+        if is_prompt:
+            # Prompt-style backend messages (menus/clarifications) must be spoken verbatim.
+            # Otherwise the model may invent filler ("please hold") or refuse.
+            instructions = (
+                "You are on a live phone call as Vozlia.\n"
+                "Speak the following message EXACTLY as written, word-for-word.\n"
+                "Do not add any extra words before or after it.\n\n"
+                f"Message:\n\"{spoken_reply}\""
+            )
+        else:
+            # Summary-style backend messages can be spoken naturally.
+            instructions = (
+                "You are on a live phone call as Vozlia.\n"
+                "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
+                "Here is the summary you must speak to the caller:\n"
+                f"\"{spoken_reply}\"\n\n"
+                "For THIS response only:\n"
+                "- Say this summary naturally.\n"
+                "- You MAY lightly rephrase for flow, but keep all important facts.\n"
+                "- DO NOT mention tools, security, privacy, or inability to access email.\n"
+                "- DO NOT apologize or refuse.\n"
+            )
+
 
         await openai_ws.send(
             json.dumps(
