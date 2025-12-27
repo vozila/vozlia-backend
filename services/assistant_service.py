@@ -38,25 +38,68 @@ def _list_enabled_active_gmail_accounts(db: Session, user: User) -> list[EmailAc
     return accounts
 
 
+def _normalize_choice_text(t: str) -> str:
+    # Keep only characters useful for fuzzy matching emails and handles STT artifacts.
+    # Example: "agent at vozlia dot com" -> "agentatvozliadotcom"
+    return re.sub(r"[^a-z0-9]+", "", (t or "").lower())
+
+
 def _parse_inbox_choice(choice_text: str, accounts: list[EmailAccount]) -> EmailAccount | None:
-    t = (choice_text or "").strip().lower()
-    if not t or not accounts:
+    """Parse the caller's inbox choice robustly.
+
+    Accepts:
+      - Numbers: "1", "2", "inbox 1", "option 2"
+      - Words: "one/first", "two/second", "three/third"
+      - Email-ish strings with STT artifacts: "agent at vozlia dot com", "agent@vozlia.com"
+      - Local-part hints: "agent", "yasinc", "yasinc74"
+    """
+    raw = (choice_text or "").strip().lower()
+    if not raw or not accounts:
         return None
-    if t.isdigit():
-        n = int(t)
+
+    # 1) Extract a digit choice anywhere in the utterance.
+    m_digit = re.search(r"\b([1-9])\b", raw)
+    if m_digit:
+        n = int(m_digit.group(1))
         if 1 <= n <= len(accounts):
             return accounts[n - 1]
-    mapping = {
+
+    # 2) Ordinal / word mapping anywhere in the utterance.
+    word_map = {
         "first": 1, "1st": 1, "one": 1,
         "second": 2, "2nd": 2, "two": 2,
         "third": 3, "3rd": 3, "three": 3,
     }
-    if t in mapping and 1 <= mapping[t] <= len(accounts):
-        return accounts[mapping[t] - 1]
+    for w, n in word_map.items():
+        if re.search(rf"\b{re.escape(w)}\b", raw):
+            if 1 <= n <= len(accounts):
+                return accounts[n - 1]
+
+    # 3) Fuzzy match against email address / display name.
+    raw_norm = _normalize_choice_text(raw)
+
     for a in accounts:
-        hay = f"{a.email_address or ''} {a.display_name or ''}".lower()
-        if t in hay:
+        email = (a.email_address or "").lower()
+        disp = (a.display_name or "").lower()
+
+        # direct substring match (cheap)
+        hay_raw = f"{email} {disp}"
+        if raw and raw in hay_raw:
             return a
+
+        # local-part match (most robust for STT errors)
+        local = email.split("@", 1)[0] if "@" in email else email
+        local_norm = _normalize_choice_text(local)
+
+        if local_norm and local_norm in raw_norm:
+            return a
+
+        # also match display-name tokens
+        disp_norm = _normalize_choice_text(disp)
+        if disp_norm and disp_norm in raw_norm:
+            return a
+
+    # 4) If ambiguous, return None so we re-prompt.
     return None
 
 
@@ -65,7 +108,12 @@ def _build_inbox_prompt(accounts: list[EmailAccount]) -> str:
     for i, a in enumerate(accounts, start=1):
         label = a.display_name or a.email_address or str(a.id)
         parts.append(f"{i}) {label}")
-    return "I see multiple inboxes connected. " + " ".join(parts) + " Which one should I check?"
+    # Strongly prefer numeric choice to avoid STT distortions.
+    return (
+        "I see multiple inboxes connected. " + " ".join(parts)
+        + " Please say 1 or 2 to choose the inbox."
+    )
+
 
 
 def run_assistant_route(
