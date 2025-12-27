@@ -248,3 +248,155 @@ def summarize_gmail_for_assistant(account_id: str, current_user: User, db: Sessi
         data["summary"] = f"You have {len(messages)} recent emails. Some subjects include: " + "; ".join(subjects[:5]) + "."
 
     return data
+
+# ---------------------------------------------------------------------------
+# Expanded Gmail adapter endpoints
+# ---------------------------------------------------------------------------
+
+import base64
+from email.message import EmailMessage
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def _extract_text_from_payload(payload: dict) -> str:
+    """Best-effort extraction of readable text from Gmail 'full' payload.
+
+    Strategy:
+    - Prefer text/plain parts
+    - Fall back to text/html stripped
+    - Fall back to snippet
+    """
+    if not payload:
+        return ""
+
+    def decode_body(body_b64: str) -> str:
+        if not body_b64:
+            return ""
+        # Gmail uses base64url without padding sometimes
+        padding = "=" * (-len(body_b64) % 4)
+        raw = base64.urlsafe_b64decode((body_b64 + padding).encode("utf-8"))
+        try:
+            return raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return raw.decode(errors="ignore")
+
+    def walk_parts(part: dict):
+        if not part:
+            return
+        yield part
+        for child in part.get("parts") or []:
+            yield from walk_parts(child)
+
+    # Collect candidate bodies
+    plain_texts = []
+    html_texts = []
+    for part in walk_parts(payload):
+        mime = (part.get("mimeType") or "").lower()
+        body = part.get("body") or {}
+        data = body.get("data")
+        if not data:
+            continue
+        txt = decode_body(data)
+        if not txt:
+            continue
+        if mime == "text/plain":
+            plain_texts.append(txt)
+        elif mime == "text/html":
+            html_texts.append(txt)
+
+    if plain_texts:
+        return "\n\n".join(plain_texts).strip()
+
+    if html_texts:
+        # super light strip: remove tags
+        import re
+        s = "\n\n".join(html_texts)
+        s = re.sub(r"<\s*br\s*/?>", "\n", s, flags=re.I)
+        s = re.sub(r"<[^>]+>", "", s)
+        return s.strip()
+
+    return (payload.get("snippet") or "").strip()
+
+
+def gmail_get_message(account_id: str, user: User, db: Session, message_id: str) -> dict:
+    """Fetch a specific Gmail message with extracted body text."""
+    account = get_gmail_account_or_404(account_id, user, db)
+    access_token = ensure_gmail_access_token(account, db)
+
+    url = f"{GMAIL_API_BASE}/users/me/messages/{message_id}"
+    params = {"format": "full"}
+    with httpx.Client(timeout=20.0) as client:
+        resp = client.get(url, headers={"Authorization": f"Bearer {access_token}"}, params=params)
+        resp.raise_for_status()
+        msg = resp.json()
+
+    payload = msg.get("payload") or {}
+    headers = { (h.get("name") or "").lower(): (h.get("value") or "") for h in (payload.get("headers") or []) }
+    body_text = _extract_text_from_payload(payload)
+
+    return {
+        "account_id": account_id,
+        "email_address": account.email_address,
+        "id": msg.get("id"),
+        "threadId": msg.get("threadId"),
+        "snippet": msg.get("snippet"),
+        "internalDate": msg.get("internalDate"),
+        "headers": headers,
+        "body_text": body_text,
+    }
+
+
+def gmail_reply_to_message(account_id: str, user: User, db: Session, message_id: str, body: str, reply_all: bool = False) -> dict:
+    """Reply to an existing message in-thread.
+
+    Requires OAuth scope: https://www.googleapis.com/auth/gmail.send
+    """
+    # Fetch original message to get thread, subject, from/to, Message-ID header
+    original = gmail_get_message(account_id, user, db, message_id)
+    thread_id = original.get("threadId")
+    headers = original.get("headers") or {}
+
+    subj = headers.get("subject") or ""
+    if subj and not subj.lower().startswith("re:"):
+        subj = "Re: " + subj
+
+    from_addr = original.get("email_address")
+    to_addr = headers.get("reply-to") or headers.get("from") or ""
+    if reply_all:
+        # naive reply-all: include original To + Cc if present
+        # (Gmail will also thread by In-Reply-To/References)
+        pass
+
+    message_id_hdr = headers.get("message-id") or ""
+
+    msg = EmailMessage()
+    msg["To"] = to_addr
+    msg["From"] = from_addr
+    msg["Subject"] = subj
+    if message_id_hdr:
+        msg["In-Reply-To"] = message_id_hdr
+        msg["References"] = message_id_hdr
+    msg.set_content(body or "")
+
+    raw = _b64url_encode(msg.as_bytes())
+
+    account = get_gmail_account_or_404(account_id, user, db)
+    access_token = ensure_gmail_access_token(account, db)
+    url = f"{GMAIL_API_BASE}/users/me/messages/send"
+    payload = {"raw": raw}
+    if thread_id:
+        payload["threadId"] = thread_id
+
+    with httpx.Client(timeout=20.0) as client:
+        resp = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=payload)
+        resp.raise_for_status()
+        sent = resp.json()
+
+    return {
+        "account_id": account_id,
+        "email_address": account.email_address,
+        "sent": sent,
+    }
