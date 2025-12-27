@@ -1,6 +1,7 @@
 # services/assistant_service.py
 from skills.engine import skills_engine_enabled, match_skill_id, execute_skill
 from services.settings_service import get_agent_greeting, get_enabled_gmail_account_ids
+from services.session_store import session_store
 import os
 from core.logging import logger
 from skills.registry import skill_registry
