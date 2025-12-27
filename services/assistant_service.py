@@ -3,6 +3,7 @@ from skills.engine import skills_engine_enabled, match_skill_id, execute_skill
 from services.settings_service import get_agent_greeting, get_enabled_gmail_account_ids
 from services.session_store import session_store
 import os
+import re
 from core.logging import logger
 from skills.registry import skill_registry
 from sqlalchemy.orm import Session
@@ -12,7 +13,6 @@ from services.settings_service import gmail_summary_enabled
 
 
 from services.gmail_service import get_default_gmail_account_id, summarize_gmail_for_assistant
-import re
 
 
 def _gmail_selection_call_id(context: dict | None) -> str:
@@ -37,36 +37,62 @@ def _list_enabled_active_gmail_accounts(db: Session, user: User) -> list[EmailAc
         accounts = [a for a in accounts if str(a.id) in enabled_set]
     accounts.sort(key=lambda a: (0 if a.is_primary else 1, (a.email_address or "").lower()))
     return accounts
-
-
 def _parse_inbox_choice(choice_text: str, accounts: list[EmailAccount]) -> EmailAccount | None:
-    t = (choice_text or "").strip().lower()
-    if not t or not accounts:
+    """Robustly parse the caller's inbox selection.
+
+    Accepts:
+      - Digits anywhere: '1', '1.', 'option 2', 'number 1'
+      - Words: 'first/one', 'second/two'
+      - Email local-part hints: 'agent', 'yasinc', 'yasinc74'
+    """
+    raw = (choice_text or "").strip().lower()
+    if not raw or not accounts:
         return None
-    if t.isdigit():
-        n = int(t)
+
+    # 1) Digit anywhere
+    m_digit = re.search(r"\b([1-9])\b", raw)
+    if m_digit:
+        n = int(m_digit.group(1))
         if 1 <= n <= len(accounts):
             return accounts[n - 1]
-    mapping = {
+
+    # 2) Ordinal words anywhere
+    word_map = {
         "first": 1, "1st": 1, "one": 1,
         "second": 2, "2nd": 2, "two": 2,
         "third": 3, "3rd": 3, "three": 3,
     }
-    if t in mapping and 1 <= mapping[t] <= len(accounts):
-        return accounts[mapping[t] - 1]
+    for w, n in word_map.items():
+        if re.search(rf"\b{re.escape(w)}\b", raw):
+            if 1 <= n <= len(accounts):
+                return accounts[n - 1]
+
+    # 3) Fuzzy local-part match
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+    raw_norm = norm(raw)
     for a in accounts:
-        hay = f"{a.email_address or ''} {a.display_name or ''}".lower()
-        if t in hay:
+        email = (a.email_address or "").lower()
+        disp = (a.display_name or "").lower()
+        local = email.split("@", 1)[0] if "@" in email else email
+
+        if norm(local) and norm(local) in raw_norm:
             return a
+        if norm(disp) and norm(disp) in raw_norm:
+            return a
+        if raw and raw in f"{email} {disp}":
+            return a
+
     return None
-
-
 def _build_inbox_prompt(accounts: list[EmailAccount]) -> str:
     parts = []
     for i, a in enumerate(accounts, start=1):
         label = a.display_name or a.email_address or str(a.id)
         parts.append(f"{i}) {label}")
-    return "I see multiple inboxes connected. " + " ".join(parts) + " Which one should I check?"
+    return "I see multiple inboxes connected. " + " ".join(parts) + " Please say 1 or 2 to choose the inbox."
+
+
 
 
 def run_assistant_route(
@@ -108,7 +134,7 @@ def run_assistant_route(
         chosen = _parse_inbox_choice(text, accounts)
         if not chosen:
             return {
-                "spoken_reply": _build_inbox_prompt(accounts) if accounts else "I don't see any active Gmail inboxes connected right now.",
+                "spoken_reply": (_build_inbox_prompt(accounts) + " If that didn't work, say just the number 1 or 2.") if accounts else "I don't see any active Gmail inboxes connected right now.",
                 "fsm": fsm_result,
                 "gmail": None,
             }
