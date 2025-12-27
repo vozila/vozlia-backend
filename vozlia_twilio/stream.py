@@ -409,7 +409,24 @@ async def twilio_stream(websocket: WebSocket):
         if openai_ws is not None and active_response_id is not None:
             rid = active_response_id
             try:
-                await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
+                # Prompt-style backend messages (menus/clarifications) must be spoken verbatim.
+        # Otherwise the model may invent filler like "please hold" or hallucinate email content.
+        is_prompt = bool(
+            spoken_reply.strip().endswith("?")
+            or ("please say" in spoken_reply.lower())
+            or ("which one" in spoken_reply.lower())
+        )
+        if is_prompt:
+            instructions = (
+                "You are on a live phone call as Vozlia.\n"
+                "Speak the following backend message EXACTLY as written.\n"
+                "Do not add, remove, or rephrase anything.\n\n"
+                f"\"{spoken_reply}\"\n"
+            )
+        else:
+            instructions = summary_instructions
+
+        await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
                 logger.info("BARGE-IN: Sent response.cancel for %s", rid)
             except Exception:
                 logger.exception("BARGE-IN: Failed sending response.cancel for %s", rid)
@@ -535,13 +552,16 @@ async def twilio_stream(websocket: WebSocket):
 
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
 
-        instructions = (
+        summary_instructions = (
             "You are on a live phone call as Vozlia.\n"
-            "For THIS response only, you MUST say the following message to the caller EXACTLY, word for word.\n"
-            "- Do not add any extra words.\n"
-            "- Do not summarize, infer, or invent details.\n"
-            "- Do not mention tools or internal systems.\n\n"
-            f"Message to speak (verbatim): \"{spoken_reply}\"\n"
+            "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
+            "Here is the summary you must speak to the caller:\n"
+            f"\"{spoken_reply}\"\n\n"
+            "For THIS response only:\n"
+            "- Say this summary naturally.\n"
+            "- You MAY lightly rephrase for flow, but keep all important facts.\n"
+            "- DO NOT mention tools, security, privacy, or inability to access email.\n"
+            "- DO NOT apologize or refuse.\n"
         )
 
         await openai_ws.send(
