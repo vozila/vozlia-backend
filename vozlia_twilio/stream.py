@@ -574,10 +574,10 @@ async def twilio_stream(websocket: WebSocket):
                     "response": {
                         "instructions": instructions,
                         "modalities": ["audio", "text"],
-                        "temperature": 0,
-                        "max_output_tokens": 80,
+                        "max_output_tokens": 160,
                         "input": [
                             {
+                                "type": "message",
                                 "role": "user",
                                 "content": [
                                     {"type": "input_text", "text": spoken_reply}
