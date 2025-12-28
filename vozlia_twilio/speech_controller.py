@@ -94,11 +94,16 @@ class SpeechRequest:
     # Optional overrides (should be used rarely; e.g. admin test)
     override_policy: Optional[TenantSpeechPolicy] = None
 
+    # Optional overrides to preserve legacy instruction scaffolding (e.g. FSM tool speech)
+    # If provided, the controller will use these directly instead of generating instructions/content.
+    instructions_override: Optional[str] = None
+    content_text_override: Optional[str] = None
+
     created_at: float = field(default_factory=lambda: time.time())
     trace_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def text_meta(self) -> Dict[str, Any]:
-        t = self.text or ""
+        t = (self.content_text_override or self.text or "")
         sha1 = hashlib.sha1(t.encode("utf-8", errors="ignore")).hexdigest()[:10]
         return {
             "len": len(t),
@@ -354,19 +359,23 @@ class SpeechOutputController:
         conversation_mode = policy.conversation_mode or defaults.conversation_mode_default
         max_chars = policy.max_chars or defaults.max_chars_default
 
-        text = (req.text or "").strip()
-        if max_chars and len(text) > max_chars:
-            text = text[: max_chars].rstrip() + "…"
+        content_text = (req.content_text_override or req.text or "").strip()
+        if max_chars and len(content_text) > max_chars:
+            content_text = content_text[: max_chars].rstrip() + "…"
 
-        # For "verbatim", force exact reading
-        if speech_mode == "verbatim":
-            instructions = (
-                "Speak the following text exactly as written. "
-                "Do not summarize, do not paraphrase, do not add extra words:\n\n"
-                f"{text}"
-            )
+        # Instructions: allow override to preserve legacy scaffolding for certain reasons
+        if req.instructions_override:
+            instructions = req.instructions_override
         else:
-            instructions = text
+            # For "verbatim", force exact reading
+            if speech_mode == "verbatim":
+                instructions = (
+                    "Speak the following text exactly as written. "
+                    "Do not summarize, do not paraphrase, do not add extra words:\n\n"
+                    f"{content_text}"
+                )
+            else:
+                instructions = content_text
 
         # IMPORTANT: content[].type must be "text" (schema strict)
         payload: Dict[str, Any] = {
@@ -378,7 +387,7 @@ class SpeechOutputController:
                     {
                         "type": "message",
                         "role": "assistant",
-                        "content": [{"type": "text", "text": text}],
+                        "content": [{"type": "text", "text": content_text}],
                     }
                 ],
                 "metadata": {

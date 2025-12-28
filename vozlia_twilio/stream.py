@@ -24,6 +24,8 @@ from vozlia_twilio.speech_controller import (
     SpeechOutputController,
     TenantSpeechDefaults,
     TenantSpeechPolicyMap,
+    ExecutionContext,
+    SpeechRequest,
 )
 
 
@@ -560,7 +562,7 @@ async def twilio_stream(websocket: WebSocket):
             await create_generic_response()
             return
 
-        await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
+        # Cancellation handled in send-path selection (controller vs legacy)
 
         instructions = (
             "You are on a live phone call as Vozlia.\n"
@@ -573,6 +575,46 @@ async def twilio_stream(websocket: WebSocket):
             "- DO NOT mention tools, security, privacy, or inability to access email.\n"
             "- DO NOT apologize or refuse.\n"
         )
+
+        # Step 3: tool/FSM speech cutover (controller owns response.create) behind flag.
+        tool_only = os.getenv("SPEECH_CONTROLLER_TOOL_ONLY", "0") == "1"
+        use_ctrl = (speech_ctrl is not None and getattr(speech_ctrl, "enabled", False) and tool_only)
+
+        logger.info(
+            "FSM_SPEECH_SEND_PATH use_ctrl=%s tool_only=%s ctrl_enabled=%s",
+            use_ctrl,
+            tool_only,
+            (getattr(speech_ctrl, "enabled", None) if speech_ctrl is not None else None),
+        )
+
+        if use_ctrl:
+            # Preserve existing behavior: cancel any active response first (same as legacy path).
+            await _cancel_active_and_clear_buffer("create_fsm_spoken_reply_ctrl")
+
+            tenant_id = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
+            ctx = ExecutionContext(
+                tenant_id=str(tenant_id),
+                call_sid=None,
+                session_id=None,
+                skill_key="fsm",
+            )
+
+            req = SpeechRequest(
+                text=spoken_reply,
+                reason="fsm_spoken_reply",
+                ctx=ctx,
+                instructions_override=instructions,  # preserve legacy scaffolding
+                content_text_override=spoken_reply,
+            )
+
+            ok = await speech_ctrl.enqueue(req)
+            if ok:
+                logger.info("FSM_SPEECH_CONTROLLER_ENQUEUED trace_id=%s reason=%s", req.trace_id, req.reason)
+                return
+            logger.warning("FSM_SPEECH_CONTROLLER_DISABLED_FALLBACK")
+
+        # Legacy path (unchanged)
+        await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
 
         await openai_ws.send(
             json.dumps(
