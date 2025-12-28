@@ -19,6 +19,33 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from core.logging import logger
 
+# Speech output controller (shadow-mode wiring)
+from vozlia_twilio.speech_controller import (
+    SpeechOutputController,
+    TenantSpeechDefaults,
+    TenantSpeechPolicyMap,
+)
+
+
+# ---------------------------------------------------------------------------
+# Tenant speech policy provider (tenant-level settings; NOT per-skill)
+# Step 2: placeholder implementation (env-driven defaults, no per-reason overrides).
+# Later: load from control-plane settings cache.
+# ---------------------------------------------------------------------------
+def _tenant_policy_provider(tenant_id: str):
+    defaults = TenantSpeechDefaults(
+        priority_default=50,
+        speech_mode_default="natural",
+        conversation_mode_default="default",
+        can_interrupt_default=True,
+        barge_grace_ms_default=int(os.getenv("BARGE_IN_GRACE_MS", "250") or 250),
+        barge_debounce_ms_default=int(os.getenv("BARGE_IN_DEBOUNCE_MS", "200") or 200),
+        max_chars_default=int(os.getenv("SPEECH_MAX_CHARS", "900") or 900),
+    )
+    policy_map: TenantSpeechPolicyMap = {}
+    return defaults, policy_map
+
+
 # Config / constants (env-driven)
 from core.config import (
     # logging toggles
@@ -229,6 +256,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Call + AI state -----------------------------------------------------
     openai_ws: Optional[websockets.WebSocketClientProtocol] = None
+    speech_ctrl: Optional[SpeechOutputController] = None
     stream_sid: Optional[str] = None
 
     barge_in_enabled: bool = False
@@ -618,6 +646,13 @@ async def twilio_stream(websocket: WebSocket):
         try:
             async for raw in openai_ws:
                 event = json.loads(raw)
+                # SpeechOutputController (Step 2): observe Realtime lifecycle events (shadow mode)
+                if speech_ctrl is not None:
+                    try:
+                        speech_ctrl.on_realtime_event(event)
+                    except Exception:
+                        logger.exception("SPEECH_CTRL_EVENT_INGEST_ERROR")
+
                 etype = event.get("type")
 
                 if REALTIME_LOG_ALL_EVENTS:
@@ -771,6 +806,29 @@ async def twilio_stream(websocket: WebSocket):
         openai_ws = await create_realtime_session(prompt_addendum, agent_greeting)
         logger.info("connection open")
 
+        # -------------------------------------------------------------------
+        # SpeechOutputController (Step 2): shadow wiring (observe-only by default)
+        # No behavior changes: controller is disabled unless SPEECH_CONTROLLER_ENABLED=1
+        # -------------------------------------------------------------------
+        async def _send_realtime_json(payload: dict):
+            await openai_ws.send(json.dumps(payload))
+
+        speech_ctrl = SpeechOutputController(
+            tenant_defaults_provider=_tenant_policy_provider,
+            send_realtime_json=_send_realtime_json,
+            cancel_active_cb=_cancel_active_and_clear_buffer,
+            clear_audio_buffer_cb=None,
+            name="speech_ctrl",
+        )
+        speech_ctrl.start()
+        logger.info(
+            "SPEECH_CTRL_WIRED enabled=%s shadow=%s fail_open=%s",
+            os.getenv("SPEECH_CONTROLLER_ENABLED", "0"),
+            os.getenv("SPEECH_CONTROLLER_SHADOW", "1"),
+            os.getenv("SPEECH_CONTROLLER_FAILOPEN", "1"),
+        )
+
+
         await asyncio.gather(openai_loop(), twilio_loop())
 
     finally:
@@ -779,6 +837,13 @@ async def twilio_stream(websocket: WebSocket):
                 transcript_action_task.cancel()
         except Exception:
             pass
+
+        try:
+            if speech_ctrl is not None:
+                await speech_ctrl.stop()
+        except Exception:
+            logger.exception("SPEECH_CTRL_STOP_ERROR")
+
 
         try:
             sender_task.cancel()
