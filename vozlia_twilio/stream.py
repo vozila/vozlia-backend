@@ -584,7 +584,7 @@ async def twilio_stream(websocket: WebSocket):
                 {
                     "type": "message",
                     "role": "assistant",
-                    "content": [{"type": "input_text", "text": spoken_reply}],
+                    "content": [{"type": "text", "text": spoken_reply}],
                 }
             ]
             logger.info("FSM_SPEECH_OOB_ENABLED conversation=none")
@@ -594,7 +594,7 @@ async def twilio_stream(websocket: WebSocket):
                 {
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": spoken_reply}],
+                    "content": [{"type": "text", "text": spoken_reply}],
                 }
             ]
 
