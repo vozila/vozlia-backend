@@ -2,6 +2,7 @@
 import json
 import httpx
 import os
+import time
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
@@ -9,6 +10,8 @@ from services.settings_service import get_selected_gmail_account_id
 
 from core.logging import logger
 from core import config as cfg
+GMAIL_DEBUG = os.getenv("GMAIL_DEBUG", "0") == "1"
+
 from core.security import encrypt_str, decrypt_str
 from models import EmailAccount, User
 from openai import OpenAI
@@ -152,11 +155,12 @@ def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
 
 
 def gmail_list_messages(account_id: str, current_user: User, db: Session, max_results: int = 20, query: str | None = None) -> dict:
-    import os as _os
-    import time as _time
-    api_debug = _os.getenv('GMAIL_API_DEBUG_LOGS', '0') == '1'
-    t0 = _time.perf_counter()
-
+    t0 = time.perf_counter()
+    if GMAIL_DEBUG:
+        logger.info(
+            "GMAIL_LIST_START account_id=%s user_id=%s max_results=%s query=%r",
+            account_id, getattr(user, 'id', None), max_results, query,
+        )
     if max_results <= 0:
         max_results = 1
     if max_results > 50:
@@ -164,8 +168,6 @@ def gmail_list_messages(account_id: str, current_user: User, db: Session, max_re
 
     account = get_gmail_account_or_404(account_id, current_user, db)
     access_token = ensure_gmail_access_token(account, db)
-    if api_debug:
-        logger.info('GMAIL_LIST_START account_id=%s email=%s max_results=%s query=%r', account_id, getattr(account, 'email_address', None), max_results, query)
 
     params = {"maxResults": max_results}
     if query:
@@ -181,8 +183,6 @@ def gmail_list_messages(account_id: str, current_user: User, db: Session, max_re
         list_data = list_resp.json()
         messages = list_data.get("messages", [])
         size_estimate = list_data.get("resultSizeEstimate", len(messages))
-        if api_debug:
-            logger.info('GMAIL_LIST_OK dt_ms=%s size_estimate=%s ids=%s', int((_time.perf_counter()-t0)*1000), size_estimate, len(messages))
 
         detailed = []
         for msg in messages:
@@ -212,9 +212,12 @@ def gmail_list_messages(account_id: str, current_user: User, db: Session, max_re
                 "date": h.get("date"),
             })
 
-    if api_debug:
-        logger.info('GMAIL_LIST_DONE dt_ms=%s detailed=%s', int((_time.perf_counter()-t0)*1000), len(detailed))
-
+    if GMAIL_DEBUG:
+        dt_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            "GMAIL_LIST_OK account_id=%s ms=%s size_estimate=%s returned=%s",
+            account_id, dt_ms, size_estimate, len(detailed),
+        )
     return {
         "account_id": account_id,
         "email_address": account.email_address,
@@ -225,14 +228,13 @@ def gmail_list_messages(account_id: str, current_user: User, db: Session, max_re
 
 
 def summarize_gmail_for_assistant(account_id: str, current_user: User, db: Session, max_results: int = 20, query: str | None = None) -> dict:
-    import os as _os
-    import time as _time
-    summary_debug = _os.getenv('GMAIL_SUMMARY_DEBUG_LOGS', '0') == '1'
-    t0 = _time.perf_counter()
-
+    t0 = time.perf_counter()
+    if GMAIL_DEBUG:
+        logger.info(
+            "GMAIL_SUMMARY_START account_id=%s user_id=%s window_days=%s query=%r",
+            account_id, getattr(user, 'id', None), window_days, query,
+        )
     data = gmail_list_messages(account_id, current_user, db, max_results=max_results, query=query)
-    if summary_debug:
-        logger.info('GMAIL_SUMMARY_START account_id=%s max_results=%s query=%r', account_id, max_results, query)
     messages = data.get("messages", [])
 
     if not cfg.OPENAI_API_KEY or client is None:
@@ -242,8 +244,6 @@ def summarize_gmail_for_assistant(account_id: str, current_user: User, db: Sessi
             return data
         subjects = [m.get("subject") or "(no subject)" for m in messages]
         data["summary"] = f"You have {len(messages)} recent emails. Some subjects include: " + "; ".join(subjects[:5]) + "."
-        if summary_debug:
-            logger.info('GMAIL_SUMMARY_FALLBACK dt_ms=%s messages=%s', int((_time.perf_counter()-t0)*1000), len(messages))
         return data
 
     if not messages:
@@ -263,13 +263,16 @@ def summarize_gmail_for_assistant(account_id: str, current_user: User, db: Sessi
             ],
         )
         data["summary"] = resp.choices[0].message.content
-        if summary_debug:
-            logger.info('GMAIL_SUMMARY_OPENAI_OK dt_ms=%s summary_len=%s', int((_time.perf_counter()-t0)*1000), len((data.get('summary') or '')))
     except Exception as e:
         logger.error("Error generating Gmail summary via OpenAI: %s", e)
         subjects = [m.get("subject") or "(no subject)" for m in messages]
         data["summary"] = f"You have {len(messages)} recent emails. Some subjects include: " + "; ".join(subjects[:5]) + "."
-        if summary_debug:
-            logger.info('GMAIL_SUMMARY_FALLBACK dt_ms=%s messages=%s', int((_time.perf_counter()-t0)*1000), len(messages))
 
+    if GMAIL_DEBUG:
+        dt_ms = int((time.perf_counter() - t0) * 1000)
+        summary = data.get('summary') if isinstance(data, dict) else None
+        logger.info(
+            "GMAIL_SUMMARY_OK account_id=%s ms=%s messages=%s summary_len=%s used_openai=%s",
+            account_id, dt_ms, len(messages), (len(summary) if isinstance(summary, str) else None), bool(client),
+        )
     return data
