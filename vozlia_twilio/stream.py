@@ -573,6 +573,9 @@ async def twilio_stream(websocket: WebSocket):
                     "type": "response.create",
                     "response": {
                         "instructions": instructions,
+                        "conversation": "none",
+                        "tools": [],
+                        "metadata": {"source": "fsm_spoken_reply"},
                         "modalities": ["audio", "text"],
                         "input": [
                             {
