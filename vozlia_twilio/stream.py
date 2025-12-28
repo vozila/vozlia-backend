@@ -9,7 +9,6 @@ import time
 from typing import Optional
 from db import SessionLocal
 from services.user_service import get_or_create_primary_user
-from services.session_store import session_store
 #from services.settings_service import get_realtime_prompt_addendum
 from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting
 
@@ -483,7 +482,7 @@ async def twilio_stream(websocket: WebSocket):
         try:
             data = await call_fsm_router(
                 transcript,
-                context={"channel": "phone", "streamSid": stream_sid},
+                context={"channel": "phone"},
             )
             spoken = data.get("spoken_reply")
             logger.info("FSM spoken_reply to send: %r", spoken)
@@ -535,70 +534,26 @@ async def twilio_stream(websocket: WebSocket):
 
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
 
-        lower = spoken_reply.strip().lower()
-        is_prompt = bool(
-            spoken_reply.strip().endswith("?")
-            or ("which one" in lower)
-            or ("please say" in lower)
-            or ("select" in lower and "inbox" in lower)
+        instructions = (
+            "You are on a live phone call as Vozlia.\n"
+            "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
+            "Here is the summary you must speak to the caller:\n"
+            f"\"{spoken_reply}\"\n\n"
+            "For THIS response only:\n"
+            "- Say this summary naturally.\n"
+            "- You MAY lightly rephrase for flow, but keep all important facts.\n"
+            "- DO NOT mention tools, security, privacy, or inability to access email.\n"
+            "- DO NOT apologize or refuse.\n"
         )
 
-        if is_prompt:
-            # Prompt-style backend messages (menus/clarifications) must be spoken verbatim.
-            # Otherwise the model may invent filler ("please hold") or refuse.
-            instructions = (
-                "You are on a live phone call as Vozlia.\n"
-                "Speak the following message EXACTLY as written, word-for-word.\n"
-                "Do not add any extra words before or after it.\n\n"
-                f"Message:\n\"{spoken_reply}\""
-            )
-        else:
-            # Summary-style backend messages can be spoken naturally.
-            instructions = (
-                "You are on a live phone call as Vozlia.\n"
-                "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
-                "Here is the summary you must speak to the caller:\n"
-                f"\"{spoken_reply}\"\n\n"
-                "For THIS response only:\n"
-                "- Say this summary naturally.\n"
-                "- You MAY lightly rephrase for flow, but keep all important facts.\n"
-                "- DO NOT mention tools, security, privacy, or inability to access email.\n"
-                "- DO NOT apologize or refuse.\n"
-            )
-
-
-        oob = os.getenv("FSM_SPEECH_OUT_OF_BAND", "0").lower() in ("1", "true", "yes")
-        response_payload = {
-            "type": "response.create",
-            "response": {
-                "instructions": instructions,
-                "modalities": ["audio", "text"],
-            },
-        }
-
-        if oob:
-            # Out-of-band: do not let prior chit-chat context affect tool/menu speech.
-            # Use conversation="none" and provide the message as an assistant utterance to avoid policy-style refusals.
-            response_payload["response"]["conversation"] = "none"
-            response_payload["response"]["input"] = [
+        await openai_ws.send(
+            json.dumps(
                 {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": spoken_reply}],
+                    "type": "response.create",
+                    "response": {"instructions": instructions},
                 }
-            ]
-            logger.info("FSM_SPEECH_OOB_ENABLED conversation=none")
-        else:
-            # In-band: keep previous behavior (may be more conversational).
-            response_payload["response"]["input"] = [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "text", "text": spoken_reply}],
-                }
-            ]
-
-        await openai_ws.send(json.dumps(response_payload))
+            )
+        )
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
     # --- Transcript handling -------------------------------------------------
@@ -618,14 +573,7 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         # Optional: skill-gated routing
-        # NOTE: if we're awaiting a Gmail inbox selection, do NOT bypass /assistant/route,
-        # even if the utterance doesn't look like an email intent (e.g., "1", "number one").
-        awaiting_inbox = False
-        if SKILL_GATED_ROUTING:
-            call_id = str(stream_sid or "").strip()
-            awaiting_inbox = bool(session_store.get(call_id).get("awaiting_gmail_inbox")) if call_id else False
-
-        if SKILL_GATED_ROUTING and not is_email and not awaiting_inbox:
+        if SKILL_GATED_ROUTING and not is_email:
             logger.info(
                 "Skill-gated routing: bypassing /assistant/route for non-email utterance: %r",
                 transcript,
