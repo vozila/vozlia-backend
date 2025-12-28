@@ -1,93 +1,16 @@
 # services/assistant_service.py
 from skills.engine import skills_engine_enabled, match_skill_id, execute_skill
-from services.settings_service import get_agent_greeting, get_enabled_gmail_account_ids
-from services.session_store import session_store
+from services.settings_service import get_agent_greeting
 import os
-import re
 from core.logging import logger
 from skills.registry import skill_registry
 from sqlalchemy.orm import Session
-from models import User, EmailAccount
+from models import User
 from vozlia_fsm import VozliaFSM
 from services.settings_service import gmail_summary_enabled
 
 
 from services.gmail_service import get_default_gmail_account_id, summarize_gmail_for_assistant
-
-
-def _gmail_selection_call_id(context: dict | None) -> str:
-    ctx = context or {}
-    return str(ctx.get("streamSid") or ctx.get("callSid") or ctx.get("CallSid") or "").strip()
-
-
-def _list_enabled_active_gmail_accounts(db: Session, user: User) -> list[EmailAccount]:
-    enabled_ids = get_enabled_gmail_account_ids(db, user)
-    q = (
-        db.query(EmailAccount)
-        .filter(
-            EmailAccount.user_id == user.id,
-            EmailAccount.provider_type == "gmail",
-            EmailAccount.oauth_provider == "google",
-            EmailAccount.is_active == True,  # noqa
-        )
-    )
-    accounts = q.all() or []
-    if enabled_ids:
-        enabled_set = set(enabled_ids)
-        accounts = [a for a in accounts if str(a.id) in enabled_set]
-    accounts.sort(key=lambda a: (0 if a.is_primary else 1, (a.email_address or "").lower()))
-    return accounts
-def _parse_inbox_choice(choice_text: str, accounts: list[EmailAccount]) -> EmailAccount | None:
-    """Parse inbox selection with STT tolerance.
-
-    Accepts:
-      - '1', '1.', 'option 1', 'number one'
-      - 'first/one', 'second/two'
-      - local-part hints like 'agent' or 'yasinc'
-    """
-    raw = (choice_text or "").strip().lower()
-    if not raw or not accounts:
-        return None
-
-    # digit anywhere (handles '1.')
-    md = re.search(r"\b([1-9])\b", raw)
-    if md:
-        n = int(md.group(1))
-        if 1 <= n <= len(accounts):
-            return accounts[n - 1]
-
-    # ordinal words anywhere
-    mapping = {"first": 1, "1st": 1, "one": 1, "second": 2, "2nd": 2, "two": 2, "third": 3, "3rd": 3, "three": 3}
-    for w, n in mapping.items():
-        if re.search(rf"\b{re.escape(w)}\b", raw):
-            if 1 <= n <= len(accounts):
-                return accounts[n - 1]
-
-    def norm(s: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-
-    raw_norm = norm(raw)
-    for acct in accounts:
-        email = (acct.email_address or "").lower()
-        disp = (acct.display_name or "").lower()
-        local = email.split("@", 1)[0] if "@" in email else email
-
-        if norm(local) and norm(local) in raw_norm:
-            return acct
-        if norm(disp) and norm(disp) in raw_norm:
-            return acct
-        if raw and raw in f"{email} {disp}":
-            return acct
-
-    return None
-def _build_inbox_prompt(accounts: list[EmailAccount]) -> str:
-    parts = []
-    for i, a in enumerate(accounts, start=1):
-        label = a.display_name or a.email_address or str(a.id)
-        parts.append(f"{i}) {label}")
-    return "I see multiple inboxes connected. " + " ".join(parts) + " Please say 1 or 2 to choose the inbox."
-
-
 
 
 def run_assistant_route(
@@ -119,24 +42,6 @@ def run_assistant_route(
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
     backend_call: dict | None = fsm_result.get("backend_call") or None
     gmail_data: dict | None = None
-    # -----------------------------------------------------------
-    # Gmail inbox selection (multi-inbox) - FSM layer only (safe).
-    # -----------------------------------------------------------
-    call_id = _gmail_selection_call_id(context)
-    pending = session_store.get(call_id).get("awaiting_gmail_inbox") if call_id else None
-    if pending:
-        accounts = _list_enabled_active_gmail_accounts(db, current_user)
-        chosen = _parse_inbox_choice(text, accounts)
-        if not chosen:
-            return {
-                "spoken_reply": _build_inbox_prompt(accounts) if accounts else "I don't see any active Gmail inboxes connected right now.",
-                "fsm": fsm_result,
-                "gmail": None,
-            }
-        session_store.set(call_id, "selected_gmail_account_id", str(chosen.id))
-        session_store.pop(call_id, "awaiting_gmail_inbox", None)
-        backend_call = {"type": "gmail_summary", "params": {"account_id": str(chosen.id)}}
-
 
     # ----------------------------
     # (1) Existing FSM backend call behavior (no change)
@@ -151,22 +56,7 @@ def run_assistant_route(
             }
 
         params = backend_call.get("params") or {}
-        account_id_effective = (
-            params.get("account_id")
-            or (session_store.get(call_id).get("selected_gmail_account_id") if call_id else None)
-            or account_id
-            or get_default_gmail_account_id(current_user, db)
-        )
-
-        accounts_enabled = _list_enabled_active_gmail_accounts(db, current_user)
-        if len(accounts_enabled) > 1 and not (session_store.get(call_id).get("selected_gmail_account_id") if call_id else None) and not params.get("account_id") and not account_id:
-            if call_id:
-                session_store.set(call_id, "awaiting_gmail_inbox", True)
-            return {
-                "spoken_reply": _build_inbox_prompt(accounts_enabled),
-                "fsm": fsm_result,
-                "gmail": None,
-            }
+        account_id_effective = params.get("account_id") or account_id or get_default_gmail_account_id(current_user, db)
 
 
         if not account_id_effective:
@@ -186,7 +76,11 @@ def run_assistant_route(
                 query=gmail_query,
             )
             if gmail_data.get("summary"):
-                spoken_reply = gmail_data["summary"].strip()
+                spoken_reply = (
+                    (spoken_reply.strip() + " " + gmail_data["summary"].strip()).strip()
+                    if spoken_reply
+                    else gmail_data["summary"].strip()
+                )
             gmail_data["used_account_id"] = account_id_effective
 
         return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
