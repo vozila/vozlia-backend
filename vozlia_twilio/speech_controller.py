@@ -381,7 +381,7 @@ class SpeechOutputController:
         payload: Dict[str, Any] = {
             "type": "response.create",
             "response": {
-                "conversation": ("none" if conversation_mode == "none" else "default"),
+                "conversation": ("none" if conversation_mode == "none" else "auto"),
                 "instructions": instructions,
                 "input": [
                     {
