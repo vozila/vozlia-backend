@@ -243,12 +243,6 @@ async def twilio_stream(websocket: WebSocket):
     # Response tracking (Pattern 1)
     active_response_id: Optional[str] = None
 
-    # FSM speech fidelity tracking (debug-only; no behavior change)
-    last_fsm_spoken_hash: Optional[str] = None
-    last_fsm_contains_at: bool = False
-    last_fsm_sent_ts: Optional[float] = None
-    last_fsm_response_id: Optional[str] = None
-
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
         if audio_buffer:
@@ -538,23 +532,6 @@ async def twilio_stream(websocket: WebSocket):
             await create_generic_response()
             return
 
-        # Debug-only meta logging / fidelity tracking
-        fsm_fidelity_logs = os.getenv("FSM_SPEECH_FIDELITY_LOGS", "0") == "1"
-        if fsm_fidelity_logs:
-            import hashlib
-            nonlocal last_fsm_spoken_hash, last_fsm_contains_at, last_fsm_sent_ts, last_fsm_response_id
-            last_fsm_spoken_hash = hashlib.sha1(spoken_reply.encode("utf-8", errors="ignore")).hexdigest()[:10]
-            last_fsm_contains_at = ("@" in spoken_reply)
-            last_fsm_sent_ts = time.time()
-            last_fsm_response_id = None
-            logger.info(
-                "FSM_SPEECH_META stream_sid=%s hash=%s spoken_len=%s contains_at=%s",
-                stream_sid,
-                last_fsm_spoken_hash,
-                len(spoken_reply),
-                last_fsm_contains_at,
-            )
-
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
 
         instructions = (
@@ -637,7 +614,6 @@ async def twilio_stream(websocket: WebSocket):
     # --- OpenAI event loop ---------------------------------------------------
     async def openai_loop():
         nonlocal active_response_id, barge_in_enabled, user_speaking_vad, transcript_action_task, prebuffer_active
-        nonlocal last_fsm_spoken_hash, last_fsm_contains_at, last_fsm_sent_ts, last_fsm_response_id
 
         try:
             async for raw in openai_ws:
@@ -653,10 +629,6 @@ async def twilio_stream(websocket: WebSocket):
                     if rid:
                         active_response_id = rid
                         logger.info("Tracking allowed response_id: %s", rid)
-                        if os.getenv("FSM_SPEECH_FIDELITY_LOGS", "0") == "1":
-                            if last_fsm_sent_ts and (time.time() - last_fsm_sent_ts) < 8.0:
-                                last_fsm_response_id = rid
-                                logger.info("FSM_SPEECH_RESPONSE_CREATED stream_sid=%s response_id=%s", stream_sid, rid)
 
                 elif etype in ("response.completed", "response.failed", "response.canceled"):
                     resp = event.get("response", {}) or {}
@@ -679,20 +651,6 @@ async def twilio_stream(websocket: WebSocket):
                         transcript = event.get("transcript")
                         if transcript:
                             logger.info("Realtime assistant said (final): %r", transcript)
-
-                            # Debug-only fidelity check: did we lose email addresses?
-                            if os.getenv("FSM_SPEECH_FIDELITY_LOGS", "0") == "1":
-                                resp_id = event.get("response_id") or active_response_id
-                                recent = bool(last_fsm_sent_ts and (time.time() - last_fsm_sent_ts) < 20.0)
-                                if recent and last_fsm_contains_at and ("@" not in transcript):
-                                    # If we can tie it to the last FSM response_id, make it explicit
-                                    if (last_fsm_response_id is None) or (resp_id == last_fsm_response_id):
-                                        logger.warning(
-                                            "FSM_SPEECH_FIDELITY_WARN stream_sid=%s resp_id=%s hash=%s expected_at=true got_at=false",
-                                            stream_sid,
-                                            resp_id,
-                                            last_fsm_spoken_hash,
-                                        )
 
                 elif etype in ("response.output_text.delta", "response.text.delta", "response.output_text"):
                     if REALTIME_LOG_TEXT:
