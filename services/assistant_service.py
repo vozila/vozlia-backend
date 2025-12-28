@@ -29,6 +29,13 @@ def run_assistant_route(
            - if gmail_summary matched -> call existing gmail summary helper and return it
       4) Otherwise return FSM response
     """
+    import time as _time
+    debug = (os.getenv("ASSISTANT_ROUTE_DEBUG_LOGS") or "").strip().lower() in ("1","true","yes","on")
+    t0 = _time.perf_counter()
+    if debug:
+        text_snip = (text[:200] + "…") if len(text or "") > 200 else (text or "")
+        logger.info("ASSISTANT_ROUTE_START user_id=%s account_id=%s text=%r context_keys=%s", getattr(current_user, "id", None), account_id, text_snip, sorted(list((context or {}).keys())))
+
     fsm = VozliaFSM()
     # Portal-controlled greeting (admin-configurable)
     fsm.greeting_text = get_agent_greeting(db, current_user)
@@ -40,6 +47,15 @@ def run_assistant_route(
     fsm_result: dict = fsm.handle_utterance(text, context=fsm_context)
 
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
+    if debug:
+        bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
+        logger.info(
+            "ASSISTANT_ROUTE_FSM spoken_len=%s backend_call=%s fsm_keys=%s dt_ms=%s",
+            len(spoken_reply or ''),
+            bc_type,
+            sorted(list(fsm_result.keys())) if isinstance(fsm_result, dict) else None,
+            int((_time.perf_counter() - t0) * 1000),
+        )
     backend_call: dict | None = fsm_result.get("backend_call") or None
     gmail_data: dict | None = None
 
@@ -57,6 +73,12 @@ def run_assistant_route(
 
         params = backend_call.get("params") or {}
         account_id_effective = params.get("account_id") or account_id or get_default_gmail_account_id(current_user, db)
+        if debug:
+            logger.info(
+                "ASSISTANT_GMAIL_CALL params=%s account_id_effective=%s",
+                {k: v for k, v in params.items() if k in ('account_id','query','max_results')},
+                account_id_effective,
+            )
 
 
         if not account_id_effective:
@@ -68,6 +90,7 @@ def run_assistant_route(
         else:
             gmail_query = params.get("query")
             gmail_max_results = params.get("max_results", 20)
+            t_g = _time.perf_counter()
             gmail_data = summarize_gmail_for_assistant(
                 account_id_effective,
                 current_user,
@@ -75,6 +98,15 @@ def run_assistant_route(
                 max_results=gmail_max_results,
                 query=gmail_query,
             )
+            if debug:
+                logger.info(
+                    "ASSISTANT_GMAIL_DONE dt_ms=%s got_messages=%s summary_len=%s used_account_id=%s",
+                    int((_time.perf_counter() - t_g) * 1000),
+                    len((gmail_data.get('messages') or [])) if isinstance(gmail_data, dict) else None,
+                    len((gmail_data.get('summary') or '')) if isinstance(gmail_data, dict) else None,
+                    account_id_effective,
+                )
+
             if gmail_data.get("summary"):
                 spoken_reply = (
                     (spoken_reply.strip() + " " + gmail_data["summary"].strip()).strip()
