@@ -3,12 +3,20 @@ from __future__ import annotations
 
 from typing import Optional
 import os
+import time
 
 import httpx
 
 from core.logging import logger
 from core import config as cfg
 
+
+FSM_ROUTER_DEBUG = os.getenv("FSM_ROUTER_DEBUG", "0") == "1"
+FSM_ROUTER_LOG_PAYLOAD = os.getenv("FSM_ROUTER_LOG_PAYLOAD", "0") == "1"
+
+def _preview(s: str, n: int = 180) -> str:
+    s = (s or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[:n] + "…"
 
 async def call_fsm_router(
     text: str,
@@ -27,6 +35,18 @@ async def call_fsm_router(
 
     base = (cfg.VOZLIA_BACKEND_BASE_URL or "").rstrip("/")
     url = f"{base}/assistant/route"
+    t0 = time.perf_counter()
+    if FSM_ROUTER_DEBUG:
+        logger.info(
+            "FSM_ROUTER_CALL start url=%s text_len=%s account_id=%s context_keys=%s text_preview=%r",
+            url,
+            len(text or ""),
+            account_id,
+            (list((context or {}).keys()) if isinstance(context, dict) else None),
+            _preview(text),
+        )
+        if FSM_ROUTER_LOG_PAYLOAD:
+            logger.info("FSM_ROUTER_PAYLOAD %s", payload)
 
     payload: dict = {"text": text}
     if context is not None:
@@ -36,14 +56,6 @@ async def call_fsm_router(
 
     timeout_s = float(os.getenv("FSM_ROUTER_TIMEOUT_S", "15.0"))
 
-    log_details = os.getenv("FSM_ROUTER_LOG_DETAILS", "0") == "1"
-    t0 = None
-    if log_details:
-        # Avoid logging full content; keep it small and safe.
-        text_snip = (text[:160] + "…") if len(text) > 160 else text
-        logger.info("FSM_ROUTER_START url=%s account_id=%s text=%r timeout_s=%s", url, account_id, text_snip, timeout_s)
-        t0 = __import__("time").perf_counter()
-
     # Optional debug logging (safe)
     if os.getenv("FSM_ROUTER_LOG_PAYLOAD", "0") == "1":
         logger.info("FSM_ROUTER POST url=%s payload=%s", url, payload)
@@ -51,10 +63,6 @@ async def call_fsm_router(
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             resp = await client.post(url, json=payload)
-
-            if log_details and t0 is not None:
-                dt_ms = int((__import__('time').perf_counter() - t0) * 1000)
-                logger.info("FSM_ROUTER_HTTP status=%s dt_ms=%s bytes=%s", resp.status_code, dt_ms, len(resp.content or b""))
 
             if resp.status_code >= 400:
                 logger.error(
@@ -65,22 +73,17 @@ async def call_fsm_router(
 
             resp.raise_for_status()
             data = resp.json()
-            if log_details and isinstance(data, dict):
-                try:
-                    fsm = data.get('fsm') if isinstance(data.get('fsm'), dict) else {}
-                    backend_call = fsm.get('backend_call') if isinstance(fsm, dict) else None
-                    bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
-                    gmail = data.get('gmail') if isinstance(data.get('gmail'), dict) else None
-                    used_acct = gmail.get('used_account_id') if isinstance(gmail, dict) else None
-                    logger.info(
-                        "FSM_ROUTER_END keys=%s spoken_len=%s backend_call=%s used_account_id=%s",
-                        sorted(list(data.keys())),
-                        len((data.get('spoken_reply') or '')),
-                        bc_type,
-                        used_acct,
-                    )
-                except Exception:
-                    logger.exception("FSM_ROUTER_END logging failed")
+            if FSM_ROUTER_DEBUG:
+                dt_ms = int((time.perf_counter() - t0) * 1000)
+                spoken = data.get("spoken_reply") if isinstance(data, dict) else None
+                logger.info(
+                    "FSM_ROUTER_CALL ok status=%s ms=%s keys=%s spoken_len=%s has_at=%s",
+                    resp.status_code,
+                    dt_ms,
+                    (list(data.keys()) if isinstance(data, dict) else None),
+                    (len(spoken) if isinstance(spoken, str) else None),
+                    ("@" in spoken if isinstance(spoken, str) else None),
+                )
             return data
 
     except Exception as e:
