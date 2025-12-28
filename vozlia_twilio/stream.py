@@ -527,48 +527,13 @@ async def twilio_stream(websocket: WebSocket):
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
-    # ---- FSM speech debug (observability only; no behavior change) ----
-
-    fsm_speech_dbg = {
-
-        "counter": 0,
-
-        "last_id": None,
-
-        "by_id": {},            # dbg_id -> {"expected": str, "is_prompt": bool, "ts": float}
-
-        "by_response_id": {},   # response_id -> dbg_id
-
-    }
-
-    # ---------------------------------------------------------------
-
-
     async def create_fsm_spoken_reply(spoken_reply: str):
         if not spoken_reply:
             logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
             await create_generic_response()
             return
 
-        # Debug: track FSM speech lifecycle (enqueued -> sent -> spoken)
-        fsm_speech_dbg["counter"] += 1
-        dbg_id = f"fsm_speech_{fsm_speech_dbg['counter']}"
-        fsm_speech_dbg["last_id"] = dbg_id
-        fsm_speech_dbg["by_id"][dbg_id] = {
-            "expected": spoken_reply,
-            "is_prompt": False,
-            "ts": time.time(),
-        }
-        logger.info(
-            "FSM_SPEECH_ENQUEUE dbg_id=%s len=%d active_response_id=%s",
-            dbg_id,
-            len(spoken_reply),
-            active_response_id,
-        )
-
-        logger.info("FSM_SPEECH_CANCEL dbg_id=%s active_response_id=%s reason=create_fsm_spoken_reply", fsm_speech_dbg.get("last_id"), active_response_id)
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
-        logger.info("FSM_SPEECH_SEND_ATTEMPT dbg_id=%s", fsm_speech_dbg.get("last_id"))
 
         lower = spoken_reply.strip().lower()
         is_prompt = bool(
@@ -577,15 +542,6 @@ async def twilio_stream(websocket: WebSocket):
             or ("please say" in lower)
             or ("select" in lower and "inbox" in lower)
         )
-        # update debug classification
-        try:
-            dbg_id = fsm_speech_dbg.get("last_id")
-            if dbg_id:
-                fsm_speech_dbg["by_id"][dbg_id]["is_prompt"] = is_prompt
-        except Exception:
-            pass
-        logger.info("FSM_SPEECH_CLASSIFY dbg_id=%s is_prompt=%s", fsm_speech_dbg.get("last_id"), is_prompt)
-
 
         if is_prompt:
             # Prompt-style backend messages (menus/clarifications) must be spoken verbatim.
@@ -614,25 +570,13 @@ async def twilio_stream(websocket: WebSocket):
         await openai_ws.send(
             json.dumps(
                 {
-                    "type": "response.create",
-                    "response": {
-                        "instructions": instructions,
-                        "modalities": ["audio", "text"],
-                        "input": [
-                            {
-                                "type": "message",
-                                "role": "user",
-                                "content": [
-                                    {"type": "input_text", "text": spoken_reply}
-                                ],
-                            }
+                    "type": "response.create", "response": {"conversation": "none", "instructions": instructions, "modalities": ["audio", "text"], "metadata": {"source": "fsm_spoken_reply"}}
                         ],
                     },
                 }
             )
         )
         logger.info("Sent FSM-driven spoken reply into Realtime session")
-        logger.info("FSM_SPEECH_SENT dbg_id=%s", fsm_speech_dbg.get("last_id"))
 
     # --- Transcript handling -------------------------------------------------
     async def handle_transcript_event(event: dict):
