@@ -322,7 +322,7 @@ class SpeechOutputController:
             conv_val = (resp_obj.get("conversation") if isinstance(resp_obj, dict) else None)
             has_input = (isinstance(resp_obj, dict) and "input" in resp_obj)
             instr_len = (len(resp_obj.get("instructions")) if isinstance(resp_obj, dict) and isinstance(resp_obj.get("instructions"), str) else None)
-            logger.info("%s_PAYLOAD_SHAPE conversation=%s has_input=%s instr_len=%s", self.name, conv_val, has_input, instr_len)
+            logger.info("%s_PAYLOAD_SHAPE conversation=%s has_input=%s has_metadata=%s instr_len=%s", self.name, conv_val, has_input, (isinstance(resp_obj, dict) and "metadata" in resp_obj), instr_len)
             logger.info("%s_SEND_RESPONSE_CREATE %s", self.name, meta)
             await self.send_realtime_json(payload)
 
@@ -356,61 +356,79 @@ class SpeechOutputController:
             if o.max_chars is not None: merged.max_chars = o.max_chars
 
         return defaults, merged
+def _build_payload(self, req: SpeechRequest) -> Dict[str, Any]:
+    defaults, policy = self._resolve_policy(req)
 
-    def _build_payload(self, req: SpeechRequest) -> Dict[str, Any]:
-        defaults, policy = self._resolve_policy(req)
+    speech_mode = policy.speech_mode or defaults.speech_mode_default
+    conversation_mode = policy.conversation_mode or defaults.conversation_mode_default
+    max_chars = policy.max_chars or defaults.max_chars_default
 
-        speech_mode = policy.speech_mode or defaults.speech_mode_default
-        conversation_mode = policy.conversation_mode or defaults.conversation_mode_default
-        max_chars = policy.max_chars or defaults.max_chars_default
+    content_text = (req.content_text_override or req.text or "").strip()
+    if max_chars and len(content_text) > max_chars:
+        content_text = content_text[: max_chars].rstrip() + "…"
 
-        content_text = (req.content_text_override or req.text or "").strip()
-        if max_chars and len(content_text) > max_chars:
-            content_text = content_text[: max_chars].rstrip() + "…"
-
-        # Instructions: allow override to preserve legacy scaffolding for certain reasons
-        if req.instructions_override:
-            instructions = req.instructions_override
+    # Instructions: allow override to preserve legacy scaffolding for certain reasons
+    if req.instructions_override:
+        instructions = req.instructions_override
+    else:
+        if speech_mode == "verbatim":
+            instructions = (
+                "Speak the following text exactly as written. "
+                "Do not summarize, do not paraphrase, do not add extra words:\n\n"
+                f"{content_text}"
+            )
         else:
-            # For "verbatim", force exact reading
-            if speech_mode == "verbatim":
-                instructions = (
-                    "Speak the following text exactly as written. "
-                    "Do not summarize, do not paraphrase, do not add extra words:\n\n"
-                    f"{content_text}"
-                )
-            else:
-                instructions = content_text
+            instructions = content_text
 
-        # IMPORTANT: content[].type must be "text" (schema strict)
-        payload: Dict[str, Any] = {
-            "type": "response.create",
-            "response": {
-                "instructions": instructions,
-                "metadata": {
-                    "trace_id": req.trace_id,
-                    "reason": req.reason,
-                    "tenant_id": req.ctx.tenant_id,
-                    "execution_id": req.ctx.execution_id,
-                    "template_id": req.ctx.template_id,
-                    "playbook_id": req.ctx.playbook_id,
-                    "skill_key": req.ctx.skill_key,
-                    "call_sid": req.ctx.call_sid,
-                    "session_id": req.ctx.session_id,
-                },
-            },
-        }
-        # Only set conversation when explicitly isolating; otherwise omit to use default server behavior.
-        if conversation_mode == "none":
-            payload["response"]["conversation"] = "none"
-        return payload
+    # Build metadata for logging/correlation, but DO NOT send it to Realtime for now.
+    # We want to confirm removal while diagnosing Realtime server_error behavior.
+    metadata = {
+        "trace_id": req.trace_id,
+        "reason": req.reason,
+        "tenant_id": req.ctx.tenant_id,
+        "execution_id": req.ctx.execution_id,
+        "template_id": req.ctx.template_id,
+        "playbook_id": req.ctx.playbook_id,
+        "skill_key": req.ctx.skill_key,
+        "call_sid": req.ctx.call_sid,
+        "session_id": req.ctx.session_id,
+    }
+    none_count = sum(1 for _k, v in metadata.items() if v is None)
+
+    logger.info(
+        "%s_METADATA_PREPARED trace_id=%s keys=%s none_count=%s",
+        self.name,
+        req.trace_id,
+        sorted(metadata.keys()),
+        none_count,
+    )
+    logger.info(
+        "%s_METADATA_STRIPPED trace_id=%s stripped=True",
+        self.name,
+        req.trace_id,
+    )
+
+    payload: Dict[str, Any] = {
+        "type": "response.create",
+        "response": {
+            "instructions": instructions,
+        },
+    }
+
+    # Only set conversation when explicitly isolating; otherwise omit (use server default).
+    if conversation_mode == "none":
+        payload["response"]["conversation"] = "none"
+
+    return payload
+
+
 
     
     def _validate_payload(self, payload: Dict[str, Any]) -> Tuple[bool, str]:
         """
         Keep validation lightweight and aligned with the Realtime schema.
         For tool speech we intentionally use the legacy-stable shape:
-          {"type":"response.create","response":{"instructions": "...", "conversation":"none"? , "metadata": {...}}}
+          {"type":"response.create","response":{"instructions": "...", "conversation":"none"? }}
 
         If an "input" field is present (future use), validate its first content part is {"type":"text","text":...}.
         """
