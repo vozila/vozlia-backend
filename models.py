@@ -189,3 +189,40 @@ class CallerSkillCache(Base):
         Index("ix_caller_skill_cache_expires", "expires_at"),
     )
 
+
+
+# -----------------------------------------------------
+# Durable caller memory (long-term, per-tenant + caller_id)
+# -----------------------------------------------------
+
+class CallerMemoryEvent(Base):
+    __tablename__ = "caller_memory_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    caller_id = Column(String, nullable=False)
+
+    # e.g. "skill_result", "note", "fact"
+    kind = Column(String, nullable=False, default="skill_result")
+
+    # Optional: which skill produced it (gmail_summary, calendar_availability, etc.)
+    skill_key = Column(String, nullable=True)
+
+    # Optional: the user's utterance or request that triggered it
+    input_text = Column(Text, nullable=True)
+
+    # A short human-readable memory summary (safe to include in prompts)
+    memory_text = Column(Text, nullable=True)
+
+    # Structured payload (ids, metadata, etc.)
+    data_json = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Optional retention (if set, retrieval should ignore expired rows)
+    expires_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_caller_mem_tenant_caller_created", "tenant_id", "caller_id", "created_at"),
+    )
