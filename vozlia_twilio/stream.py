@@ -38,7 +38,7 @@ def _tenant_policy_provider(tenant_id: str):
     defaults = TenantSpeechDefaults(
         priority_default=50,
         speech_mode_default="natural",
-        conversation_mode_default="default",
+        conversation_mode_default="auto",
         can_interrupt_default=True,
         barge_grace_ms_default=int(os.getenv("BARGE_IN_GRACE_MS", "250") or 250),
         barge_debounce_ms_default=int(os.getenv("BARGE_IN_DEBOUNCE_MS", "200") or 200),
@@ -603,8 +603,8 @@ async def twilio_stream(websocket: WebSocket):
             tenant_id = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
             ctx = ExecutionContext(
                 tenant_id=str(tenant_id),
-                call_sid=None,
-                session_id=None,
+                call_sid=call_sid,
+                session_id=stream_sid,
                 skill_key="fsm",
             )
 
@@ -811,7 +811,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Twilio event loop ---------------------------------------------------
     async def twilio_loop():
-        nonlocal stream_sid, prebuffer_active, twilio_ws_closed
+        nonlocal stream_sid, call_sid, from_number, prebuffer_active, twilio_ws_closed
 
         try:
             async for msg in websocket.iter_text():
