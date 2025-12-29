@@ -495,3 +495,62 @@ class SpeechOutputController:
                 self.active_started_at = 0.0
                 self._active_done.set()
             return
+
+    def on_realtime_event(self, event: Dict[str, Any]) -> None:
+        et = event.get("type")
+        if not et:
+            return
+
+        if et == "response.created":
+            resp = event.get("response") or {}
+            rid = resp.get("id")
+            if rid:
+                self.active_response_id = rid
+                self.active_started_at = time.time()
+                self._active_done.clear()
+                logger.info("%s_ACTIVE_CREATED response_id=%s", self.name, rid)
+            return
+
+        # ✅ ALSO treat these as completion signals
+        if et in ("response.done", "response.audio.done"):
+            rid = (event.get("response") or {}).get("id") or event.get("response_id")
+            if self.active_response_id is not None and (rid is None or rid == self.active_response_id):
+                dt_ms = int((time.time() - self.active_started_at) * 1000) if self.active_started_at else None
+                logger.info("%s_ACTIVE_DONE type=%s response_id=%s dt_ms=%s", self.name, et, self.active_response_id, dt_ms)
+                self.active_response_id = None
+                self.active_started_at = 0.0
+                self._active_done.set()
+            return
+
+        # keep your existing done handlers too:
+        if et in ("response.audio_transcript.done", "response.output_text.done", "response.text.done"):
+            rid = event.get("response_id") or (event.get("response") or {}).get("id")
+            if self.active_response_id is not None and (rid is None or rid == self.active_response_id):
+                dt_ms = int((time.time() - self.active_started_at) * 1000) if self.active_started_at else None
+                logger.info("%s_ACTIVE_DONE type=%s response_id=%s dt_ms=%s", self.name, et, self.active_response_id, dt_ms)
+                self.active_response_id = None
+                self.active_started_at = 0.0
+                self._active_done.set()
+            return
+
+        if et in ("response.completed", "response.failed", "response.canceled"):
+            resp = event.get("response") or {}
+            rid = resp.get("id")
+            if self.active_response_id is None or rid == self.active_response_id:
+                dt_ms = int((time.time() - self.active_started_at) * 1000) if self.active_started_at else None
+                logger.info("%s_ACTIVE_DONE type=%s response_id=%s dt_ms=%s", self.name, et, rid, dt_ms)
+                self.active_response_id = None
+                self.active_started_at = 0.0
+                self._active_done.set()
+            return
+
+        # Optional (helps when your state is stale after barge-in cancel races):
+        if et == "error":
+            err = event.get("error") or {}
+            if err.get("code") == "response_cancel_not_active" and self.active_response_id is not None:
+                logger.warning("%s_ACTIVE_CLEAR_STALE reason=response_cancel_not_active response_id=%s", self.name, self.active_response_id)
+                self.active_response_id = None
+                self.active_started_at = 0.0
+                self._active_done.set()
+            return
+
