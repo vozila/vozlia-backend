@@ -69,6 +69,7 @@ def run_assistant_route(
     if isinstance(ctx, dict):
         from_number = ctx.get("from_number") or ctx.get("from") or ctx.get("From")
     caller_id = normalize_caller_id(from_number)
+    gmail_data_fresh = False  # safe default; set True only when Gmail fetch occurs
 
     # Long-term memory context (durable, per tenant + caller_id)
     memory_context = ""
@@ -78,7 +79,7 @@ def run_assistant_route(
     except Exception:
         longterm_enabled = False
 
-    if longterm_enabled and caller_id and tenant_uuid and gmail_data_fresh:
+    if longterm_enabled and caller_id and tenant_uuid:
         memory_context = fetch_recent_memory_text(
             db,
             tenant_uuid=tenant_uuid,
