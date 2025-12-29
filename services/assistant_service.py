@@ -14,6 +14,14 @@ from services.memory_facade import (
     SESSION_MEMORY_ENABLED,
     SESSION_MEMORY_TTL_S,
 )
+from services.caller_cache import (
+    CALLER_MEMORY_ENABLED,
+    CALLER_MEMORY_TTL_S,
+    get_caller_cache,
+    put_caller_cache,
+    normalize_caller_id,
+)
+
 
 
 from services.gmail_service import get_default_gmail_account_id, summarize_gmail_for_assistant
@@ -43,11 +51,18 @@ def run_assistant_route(
         logger.info("ASSISTANT_ROUTE_START user_id=%s account_id=%s text=%r context_keys=%s", getattr(current_user, "id", None), account_id, text_snip, sorted(list((context or {}).keys())))
 
     # Memory identifiers (used for session caching on transcript turns)
-    tenant_id = str(getattr(current_user, "id", "") or "")
+    tenant_uuid = getattr(current_user, "id", None)
+    tenant_id = str(tenant_uuid or "")
     ctx = context or {}
     call_id = None
     if isinstance(ctx, dict):
         call_id = ctx.get("call_sid") or ctx.get("stream_sid") or ctx.get("call_id")
+
+    # Caller identifier (for Postgres TTL cache across calls)
+    from_number = None
+    if isinstance(ctx, dict):
+        from_number = ctx.get("from_number") or ctx.get("from") or ctx.get("From")
+    caller_id = normalize_caller_id(from_number)
 
     fsm = VozliaFSM()
     # Portal-controlled greeting (admin-configurable)
@@ -120,7 +135,44 @@ def run_assistant_route(
                     cache_key_hash=cache_hash,
                 )
 
-            if cached:
+            # If session cache miss, try caller-scoped cache (Postgres TTL) across calls
+            caller_cached = None
+            if (not cached) and CALLER_MEMORY_ENABLED and caller_id and tenant_uuid and cache_hash:
+                caller_cached = get_caller_cache(
+                    db,
+                    tenant_id=tenant_uuid,
+                    caller_id=caller_id,
+                    skill_key="gmail_summary",
+                    cache_key_hash=cache_hash,
+                )
+
+            if caller_cached and isinstance(caller_cached.get("gmail"), dict):
+                gmail_data = dict(caller_cached.get("gmail") or {})
+                if debug:
+                    logger.info(
+                        "ASSISTANT_GMAIL_CALLER_CACHE_HIT tenant_id=%s caller_id=%s hash=%s used_account_id=%s",
+                        tenant_id,
+                        caller_id,
+                        (cache_hash or "")[:8],
+                        account_id_effective,
+                    )
+                # Warm session cache for the rest of this call
+                if SESSION_MEMORY_ENABLED and call_id and tenant_id and cache_hash:
+                    memory.put_cached_skill_result(
+                        tenant_id=tenant_id,
+                        call_id=call_id,
+                        skill_key="gmail_summary",
+                        cache_key_hash=cache_hash,
+                        result={"gmail": gmail_data},
+                        ttl_s=SESSION_MEMORY_TTL_S,
+                    )
+                    msgs = (gmail_data.get("messages") or []) if isinstance(gmail_data, dict) else []
+                    ids = [m.get("id") for m in msgs if isinstance(m, dict) and m.get("id")]
+                    memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_message_ids", value=ids)
+                    memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_messages", value=msgs[:20])
+
+            elif cached:
+
                 gmail_data = dict((cached.result or {}).get("gmail") or {})
                 if debug:
                     logger.info(
@@ -162,6 +214,18 @@ def run_assistant_route(
                     ids = [m.get("id") for m in msgs if isinstance(m, dict) and m.get("id")]
                     memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_message_ids", value=ids)
                     memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_messages", value=msgs[:20])
+
+                    # Also cache across calls for this caller (Postgres TTL), if enabled
+                    if CALLER_MEMORY_ENABLED and caller_id and tenant_uuid and cache_hash and isinstance(gmail_data, dict):
+                        put_caller_cache(
+                            db,
+                            tenant_id=tenant_uuid,
+                            caller_id=caller_id,
+                            skill_key="gmail_summary",
+                            cache_key_hash=cache_hash,
+                            result_json={"gmail": gmail_data},
+                            ttl_s=CALLER_MEMORY_TTL_S,
+                        )
 
             if gmail_data.get("summary"):
                 spoken_reply = (
@@ -213,7 +277,43 @@ def run_assistant_route(
                         cache_key_hash=cache_hash,
                     )
 
-                if cached:
+                # If session cache miss, try caller-scoped cache (Postgres TTL) across calls
+                caller_cached = None
+                if (not cached) and CALLER_MEMORY_ENABLED and caller_id and tenant_uuid and cache_hash:
+                    caller_cached = get_caller_cache(
+                        db,
+                        tenant_id=tenant_uuid,
+                        caller_id=caller_id,
+                        skill_key="gmail_summary",
+                        cache_key_hash=cache_hash,
+                    )
+
+                if caller_cached and isinstance(caller_cached.get("gmail"), dict):
+                    gmail_data = dict(caller_cached.get("gmail") or {})
+                    logger.info(
+                        "ASSISTANT_GMAIL_CALLER_CACHE_HIT (skills_engine) tenant_id=%s caller_id=%s hash=%s used_account_id=%s",
+                        tenant_id,
+                        caller_id,
+                        (cache_hash or "")[:8],
+                        account_id_effective,
+                    )
+                    # Warm session cache for this call
+                    if SESSION_MEMORY_ENABLED and call_id and tenant_id and cache_hash:
+                        memory.put_cached_skill_result(
+                            tenant_id=tenant_id,
+                            call_id=call_id,
+                            skill_key="gmail_summary",
+                            cache_key_hash=cache_hash,
+                            result={"gmail": gmail_data},
+                            ttl_s=SESSION_MEMORY_TTL_S,
+                        )
+                        msgs = (gmail_data.get("messages") or []) if isinstance(gmail_data, dict) else []
+                        ids = [mm.get("id") for mm in msgs if isinstance(mm, dict) and mm.get("id")]
+                        memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_message_ids", value=ids)
+                        memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_messages", value=msgs[:20])
+
+                elif cached:
+
                     gmail_data = dict((cached.result or {}).get("gmail") or {})
                     logger.info(
                         "ASSISTANT_GMAIL_CACHE_HIT (skills_engine) tenant_id=%s call_id=%s hash=%s used_account_id=%s",
@@ -238,6 +338,17 @@ def run_assistant_route(
                         ids = [m.get("id") for m in msgs if isinstance(m, dict) and m.get("id")]
                         memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_message_ids", value=ids)
                         memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_messages", value=msgs[:20])
+                        # Also cache across calls for this caller (Postgres TTL), if enabled
+                        if CALLER_MEMORY_ENABLED and caller_id and tenant_uuid and cache_hash and isinstance(gmail_data, dict):
+                            put_caller_cache(
+                                db,
+                                tenant_id=tenant_uuid,
+                                caller_id=caller_id,
+                                skill_key="gmail_summary",
+                                cache_key_hash=cache_hash,
+                                result_json={"gmail": gmail_data},
+                                ttl_s=CALLER_MEMORY_TTL_S,
+                            )
 
                 gmail_data["used_account_id"] = account_id_effective
 
