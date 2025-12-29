@@ -828,7 +828,12 @@ async def twilio_stream(websocket: WebSocket):
                         logger.exception("Failed to base64-decode Twilio payload")
                         continue
 
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": payload}))
+                    try:
+                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": payload}))
+                    except Exception:
+                        logger.exception("OpenAI WS send failed while streaming audio; ending call loop")
+                        twilio_ws_closed = True
+                        break
 
                 elif event_type == "stop":
                     logger.info("Twilio stream event: stop")

@@ -318,6 +318,11 @@ class SpeechOutputController:
                     logger.error("%s_FAILOPEN_REQUIRED %s", self.name, meta)
                 return
 
+            resp_obj = payload.get("response") if isinstance(payload, dict) else None
+            conv_val = (resp_obj.get("conversation") if isinstance(resp_obj, dict) else None)
+            has_input = (isinstance(resp_obj, dict) and "input" in resp_obj)
+            instr_len = (len(resp_obj.get("instructions")) if isinstance(resp_obj, dict) and isinstance(resp_obj.get("instructions"), str) else None)
+            logger.info("%s_PAYLOAD_SHAPE conversation=%s has_input=%s instr_len=%s", self.name, conv_val, has_input, instr_len)
             logger.info("%s_SEND_RESPONSE_CREATE %s", self.name, meta)
             await self.send_realtime_json(payload)
 
@@ -381,15 +386,7 @@ class SpeechOutputController:
         payload: Dict[str, Any] = {
             "type": "response.create",
             "response": {
-                "conversation": ("none" if conversation_mode == "none" else "auto"),
                 "instructions": instructions,
-                "input": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": content_text}],
-                    }
-                ],
                 "metadata": {
                     "trace_id": req.trace_id,
                     "reason": req.reason,
@@ -403,36 +400,57 @@ class SpeechOutputController:
                 },
             },
         }
+        # Only set conversation when explicitly isolating; otherwise omit to use default server behavior.
+        if conversation_mode == "none":
+            payload["response"]["conversation"] = "none"
         return payload
 
+    
     def _validate_payload(self, payload: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Keep validation lightweight and aligned with the Realtime schema.
+        For tool speech we intentionally use the legacy-stable shape:
+          {"type":"response.create","response":{"instructions": "...", "conversation":"none"? , "metadata": {...}}}
+
+        If an "input" field is present (future use), validate its first content part is {"type":"text","text":...}.
+        """
         try:
             if payload.get("type") != "response.create":
                 return False, "payload.type must be response.create"
+
             resp = payload.get("response")
             if not isinstance(resp, dict):
-                return False, "payload.response missing"
-            inp = resp.get("input")
-            if not isinstance(inp, list) or not inp:
-                return False, "response.input must be non-empty list"
-            msg = inp[0]
-            if msg.get("type") != "message":
-                return False, "response.input[0].type must be message"
-            content = msg.get("content")
-            if not isinstance(content, list) or not content:
-                return False, "response.input[0].content must be non-empty list"
-            c0 = content[0]
-            if c0.get("type") != "text":
-                return False, "response.input[0].content[0].type must be text"
-            if not isinstance(c0.get("text"), str):
-                return False, "response.input[0].content[0].text must be str"
+                return False, "payload.response missing or not a dict"
+
+            conv = resp.get("conversation")
+            if conv is not None and conv not in ("auto", "none"):
+                return False, "response.conversation must be 'auto' or 'none' when provided"
+
+            instr = resp.get("instructions")
+            if not isinstance(instr, str) or not instr.strip():
+                return False, "response.instructions must be a non-empty string"
+
+            # Optional input validation (not used in legacy-stable tool speech)
+            if "input" in resp:
+                inp = resp.get("input")
+                if not isinstance(inp, list) or not inp:
+                    return False, "response.input must be a non-empty list when provided"
+                msg = inp[0]
+                if not isinstance(msg, dict) or msg.get("type") != "message":
+                    return False, "response.input[0].type must be message"
+                content = msg.get("content")
+                if not isinstance(content, list) or not content:
+                    return False, "response.input[0].content must be non-empty list"
+                c0 = content[0]
+                if not isinstance(c0, dict) or c0.get("type") != "text":
+                    return False, "response.input[0].content[0].type must be text"
+                if not isinstance(c0.get("text"), str):
+                    return False, "response.input[0].content[0].text must be str"
+
             return True, ""
         except Exception as e:
             return False, f"exception validating payload: {e}"
 
-    # -----------------------------
-    # Logging helpers
-    # -----------------------------
 
     def _log_meta(self, req: SpeechRequest) -> Dict[str, Any]:
         defaults, policy = self._resolve_policy(req)
@@ -474,15 +492,9 @@ class SpeechOutputController:
             return
 
         # ✅ Treat transcript/text done events as completion too (Realtime often ends here)
+        # NOTE: We do NOT treat transcript/text completion as full response completion.
+        # We wait for response.done / response.completed / response.canceled to avoid sending the next response too early.
         if et in ("response.audio_transcript.done", "response.output_text.done", "response.text.done"):
-            rid = event.get("response_id") or (event.get("response") or {}).get("id")
-            # If we can't match IDs, still clear defensively if something is active
-            if self.active_response_id is not None and (rid is None or rid == self.active_response_id):
-                dt_ms = int((time.time() - self.active_started_at) * 1000) if self.active_started_at else None
-                logger.info("%s_ACTIVE_DONE type=%s response_id=%s dt_ms=%s", self.name, et, self.active_response_id, dt_ms)
-                self.active_response_id = None
-                self.active_started_at = 0.0
-                self._active_done.set()
             return
 
         if et in ("response.completed", "response.failed", "response.canceled"):
@@ -512,7 +524,7 @@ class SpeechOutputController:
             return
 
         # ✅ ALSO treat these as completion signals
-        if et in ("response.done", "response.audio.done"):
+        if et in ("response.done",):
             rid = (event.get("response") or {}).get("id") or event.get("response_id")
             if self.active_response_id is not None and (rid is None or rid == self.active_response_id):
                 dt_ms = int((time.time() - self.active_started_at) * 1000) if self.active_started_at else None
@@ -553,4 +565,3 @@ class SpeechOutputController:
                 self.active_started_at = 0.0
                 self._active_done.set()
             return
-
