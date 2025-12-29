@@ -260,6 +260,8 @@ async def twilio_stream(websocket: WebSocket):
     openai_ws: Optional[websockets.WebSocketClientProtocol] = None
     speech_ctrl: Optional[SpeechOutputController] = None
     stream_sid: Optional[str] = None
+    call_sid: Optional[str] = None
+    from_number: Optional[str] = None
 
     barge_in_enabled: bool = False
     twilio_ws_closed: bool = False
@@ -504,21 +506,28 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- FSM router ----------------------------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
-        # Guard against the exact bug you just fixed
-        assert isinstance(transcript, str), (
-            f"route_to_fsm_and_get_reply expected str transcript, got {type(transcript)}"
-        )
-
         try:
-            data = await call_fsm_router(
-                transcript,
-                context={"channel": "phone"},
-            )
-            spoken = data.get("spoken_reply")
-            logger.info("FSM spoken_reply to send: %r", spoken)
-            return spoken
+            ctx = {"channel": "phone"}
+            if stream_sid:
+                ctx["stream_sid"] = stream_sid
+            if call_sid:
+                ctx["call_sid"] = call_sid
+            if from_number:
+                ctx["from_number"] = from_number
+
+            data = await call_fsm_router(transcript, context=ctx)
+            if isinstance(data, dict):
+                # Common patterns we’ve used across codepaths
+                spoken = (
+                    data.get("spoken_reply")
+                    or (data.get("result") or {}).get("spoken_reply")
+                    or (data.get("skill_result") or {}).get("spoken_reply")
+                )
+                if isinstance(spoken, str) and spoken.strip():
+                    return spoken.strip()
+            return None
         except Exception:
-            logger.exception("Error calling /assistant/route")
+            logger.exception("FSM_ROUTE_ERROR")
             return None
 
 
@@ -821,6 +830,10 @@ async def twilio_stream(websocket: WebSocket):
                 elif event_type == "start":
                     start = data.get("start", {})
                     stream_sid = start.get("streamSid")
+                    call_sid = start.get("callSid") or start.get("call_sid")
+                    custom = start.get("customParameters") or {}
+                    from_number = custom.get("from") or custom.get("From") or start.get("from") or start.get("From")
+
                     prebuffer_active = True
                     logger.info("Twilio stream event: start")
                     logger.info("Stream started: %s", stream_sid)
