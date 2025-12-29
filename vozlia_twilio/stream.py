@@ -12,6 +12,8 @@ from services.user_service import get_or_create_primary_user
 #from services.settings_service import get_realtime_prompt_addendum
 from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting
 
+from services.longterm_memory import fetch_recent_memory_text, longterm_memory_enabled_for_tenant
+
 
 
 import websockets
@@ -235,9 +237,11 @@ async def twilio_stream(websocket: WebSocket):
     # Load portal-controlled Realtime prompt addendum ONCE per call (not in hot path)
     prompt_addendum = ""
     agent_greeting = ""
+    tenant_uuid: str = ""
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
+        tenant_uuid = str(getattr(user, "id", "") or "")
         prompt_addendum = get_realtime_prompt_addendum(db, user)
         agent_greeting = get_agent_greeting(db, user)
 
@@ -274,6 +278,74 @@ async def twilio_stream(websocket: WebSocket):
 
     # Response tracking (Pattern 1)
     active_response_id: Optional[str] = None
+
+    # --- Long-term memory injection into Realtime (chitchat) -----------------
+    # Runs once per call, after Twilio 'start' provides caller_id (from_number).
+    # Fail-open: any DB error becomes a no-op.
+    async def _inject_longterm_memory_into_realtime():
+        nonlocal openai_ws, from_number, tenant_uuid, prompt_addendum
+
+        if openai_ws is None:
+            return
+        if not from_number or not tenant_uuid:
+            return
+
+        # Global kill-switch (in addition to per-tenant gate)
+        if (os.getenv("REALTIME_INJECT_LONGTERM_MEMORY", "0") or "1").strip().lower() not in ("1", "true", "yes", "on"):
+            return
+
+        # Per-tenant gate (env-driven allowlist/blocklist)
+        if not longterm_memory_enabled_for_tenant(tenant_uuid):
+            return
+
+        limit = int(os.getenv("LONGTERM_MEMORY_CONTEXT_LIMIT", "8") or 8)
+
+        db = SessionLocal()
+        try:
+            mem_text = fetch_recent_memory_text(
+                db,
+                tenant_uuid=tenant_uuid,
+                caller_id=from_number,
+                limit=limit,
+            )
+        except Exception:
+            logger.exception("REALTIME_MEM_FETCH_FAILED tenant=%s caller=%s", tenant_uuid, from_number)
+            return
+        finally:
+            db.close()
+
+        mem_text = (mem_text or "").strip()
+        if not mem_text:
+            logger.info("REALTIME_MEM_INJECT_SKIP no_memory tenant=%s caller=%s", tenant_uuid, from_number)
+            return
+
+        max_chars = int(os.getenv("REALTIME_MEMORY_MAX_CHARS", "1500") or 1500)
+        if len(mem_text) > max_chars:
+            mem_text = mem_text[: max_chars - 3].rstrip() + "..."
+
+        base_instr = _build_realtime_instructions(REALTIME_SYSTEM_PROMPT, prompt_addendum)
+        memory_block = f"\n\n--- CALLER MEMORY (RECENT) ---\n{mem_text}\n"
+        new_instr = (base_instr + memory_block).strip()
+
+        try:
+            await openai_ws.send(
+                json.dumps(
+                    {
+                        "type": "session.update",
+                        "session": {"instructions": new_instr},
+                    }
+                )
+            )
+            logger.info(
+                "REALTIME_MEM_INJECT_OK tenant=%s caller=%s chars=%d lines=%d",
+                tenant_uuid,
+                from_number,
+                len(mem_text),
+                mem_text.count("\n") + 1,
+            )
+        except Exception:
+            logger.exception("REALTIME_MEM_INJECT_FAILED tenant=%s caller=%s", tenant_uuid, from_number)
+
 
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
@@ -835,6 +907,13 @@ async def twilio_stream(websocket: WebSocket):
                     from_number = custom.get("from") or custom.get("From") or start.get("from") or start.get("From")
 
                     prebuffer_active = True
+
+                    # Inject long-term memory into Realtime instructions (chitchat)
+                    try:
+                        asyncio.create_task(_inject_longterm_memory_into_realtime())
+                    except Exception:
+                        logger.exception("REALTIME_MEM_INJECT_TASK_CREATE_FAILED")
+
                     logger.info("Twilio stream event: start")
                     logger.info("Stream started: %s", stream_sid)
 
