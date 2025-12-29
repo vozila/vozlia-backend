@@ -606,16 +606,16 @@ async def twilio_stream(websocket: WebSocket):
                 instructions_override=instructions,  # preserve legacy scaffolding
                 content_text_override=spoken_reply,
             )
-
             try:
                 ok = await speech_ctrl.enqueue(req)
             except Exception:
-                logger.exception("FSM_SPEECH_CONTROLLER_ENQUEUE_ERROR trace_id=%s reason=%s", req.trace_id, req.reason)
+                logger.exception("FSM_SPEECH_CONTROLLER_ENQUEUE_EXCEPTION")
                 ok = False
+
             if ok:
                 logger.info("FSM_SPEECH_CONTROLLER_ENQUEUED trace_id=%s reason=%s", req.trace_id, req.reason)
                 return
-            logger.warning("FSM_SPEECH_CONTROLLER_DISABLED_FALLBACK")
+            logger.warning("FSM_SPEECH_CONTROLLER_FALLBACK_LEGACY")
 
         # Legacy path (unchanged)
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
@@ -787,6 +787,13 @@ async def twilio_stream(websocket: WebSocket):
                         logger.info("OpenAI cancel race (expected): %s", event)
                     else:
                         logger.error("OpenAI error event: %s", event)
+                        # Attach last tool payload trace (if controller is wired) for immediate diagnosis.
+                        if speech_ctrl is not None:
+                            try:
+                                dbg = speech_ctrl.get_last_tool_payload_debug()
+                                logger.error("SPEECH_CTRL_LAST_TOOL_PAYLOAD_ON_ERROR %s", dbg)
+                            except Exception:
+                                logger.exception("SPEECH_CTRL_LAST_TOOL_PAYLOAD_ON_ERROR_FAILED")
 
         except websockets.ConnectionClosed:
             logger.info("OpenAI Realtime WebSocket closed")
