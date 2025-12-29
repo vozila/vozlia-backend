@@ -42,6 +42,13 @@ def run_assistant_route(
         text_snip = (text[:200] + "…") if len(text or "") > 200 else (text or "")
         logger.info("ASSISTANT_ROUTE_START user_id=%s account_id=%s text=%r context_keys=%s", getattr(current_user, "id", None), account_id, text_snip, sorted(list((context or {}).keys())))
 
+    # Memory identifiers (used for session caching on transcript turns)
+    tenant_id = str(getattr(current_user, "id", "") or "")
+    ctx = context or {}
+    call_id = None
+    if isinstance(ctx, dict):
+        call_id = ctx.get("call_sid") or ctx.get("stream_sid") or ctx.get("call_id")
+
     fsm = VozliaFSM()
     # Portal-controlled greeting (admin-configurable)
     fsm.greeting_text = get_agent_greeting(db, current_user)
@@ -96,22 +103,65 @@ def run_assistant_route(
         else:
             gmail_query = params.get("query")
             gmail_max_results = params.get("max_results", 20)
-            t_g = _time.perf_counter()
-            gmail_data = summarize_gmail_for_assistant(
-                account_id_effective,
-                current_user,
-                db,
-                max_results=gmail_max_results,
-                query=gmail_query,
-            )
-            if debug:
-                logger.info(
-                    "ASSISTANT_GMAIL_DONE dt_ms=%s got_messages=%s summary_len=%s used_account_id=%s",
-                    int((_time.perf_counter() - t_g) * 1000),
-                    len((gmail_data.get('messages') or [])) if isinstance(gmail_data, dict) else None,
-                    len((gmail_data.get('summary') or '')) if isinstance(gmail_data, dict) else None,
+
+            cache_hash = None
+            cached = None
+            if SESSION_MEMORY_ENABLED and call_id and tenant_id:
+                cache_hash = make_skill_cache_key_hash(
+                    "gmail_summary",
                     account_id_effective,
+                    (gmail_query or ""),
+                    int(gmail_max_results),
                 )
+                cached = memory.get_cached_skill_result(
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                    skill_key="gmail_summary",
+                    cache_key_hash=cache_hash,
+                )
+
+            if cached:
+                gmail_data = dict((cached.result or {}).get("gmail") or {})
+                if debug:
+                    logger.info(
+                        "ASSISTANT_GMAIL_CACHE_HIT tenant_id=%s call_id=%s hash=%s used_account_id=%s",
+                        tenant_id,
+                        call_id,
+                        (cache_hash or "")[:8],
+                        account_id_effective,
+                    )
+            else:
+                t_g = _time.perf_counter()
+                gmail_data = summarize_gmail_for_assistant(
+                    account_id_effective,
+                    current_user,
+                    db,
+                    max_results=gmail_max_results,
+                    query=gmail_query,
+                )
+                if debug:
+                    logger.info(
+                        "ASSISTANT_GMAIL_DONE dt_ms=%s got_messages=%s summary_len=%s used_account_id=%s",
+                        int((_time.perf_counter() - t_g) * 1000),
+                        len((gmail_data.get('messages') or [])) if isinstance(gmail_data, dict) else None,
+                        len((gmail_data.get('summary') or '')) if isinstance(gmail_data, dict) else None,
+                        account_id_effective,
+                    )
+
+                # Cache for follow-ups within this call
+                if SESSION_MEMORY_ENABLED and call_id and tenant_id and cache_hash and isinstance(gmail_data, dict):
+                    memory.put_cached_skill_result(
+                        tenant_id=tenant_id,
+                        call_id=call_id,
+                        skill_key="gmail_summary",
+                        cache_key_hash=cache_hash,
+                        result={"gmail": gmail_data},
+                        ttl_s=SESSION_MEMORY_TTL_S,
+                    )
+                    msgs = (gmail_data.get("messages") or []) if isinstance(gmail_data, dict) else []
+                    ids = [m.get("id") for m in msgs if isinstance(m, dict) and m.get("id")]
+                    memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_message_ids", value=ids)
+                    memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_messages", value=msgs[:20])
 
             if gmail_data.get("summary"):
                 spoken_reply = (
@@ -151,7 +201,44 @@ def run_assistant_route(
                     spoken_reply = "I tried to check your email, but I don't see a Gmail account connected for you yet."
                     return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": {"summary": None, "used_account_id": None}}
 
-                gmail_data = summarize_gmail_for_assistant(account_id_effective, current_user, db)
+                # Session memory cache (SkillsEngine path)
+                cache_hash = None
+                cached = None
+                if SESSION_MEMORY_ENABLED and call_id and tenant_id:
+                    cache_hash = make_skill_cache_key_hash("gmail_summary", account_id_effective, "", 20)
+                    cached = memory.get_cached_skill_result(
+                        tenant_id=tenant_id,
+                        call_id=call_id,
+                        skill_key="gmail_summary",
+                        cache_key_hash=cache_hash,
+                    )
+
+                if cached:
+                    gmail_data = dict((cached.result or {}).get("gmail") or {})
+                    logger.info(
+                        "ASSISTANT_GMAIL_CACHE_HIT (skills_engine) tenant_id=%s call_id=%s hash=%s used_account_id=%s",
+                        tenant_id,
+                        call_id,
+                        (cache_hash or "")[:8],
+                        account_id_effective,
+                    )
+                else:
+                    gmail_data = summarize_gmail_for_assistant(account_id_effective, current_user, db)
+                    # Cache for follow-ups within this call
+                    if SESSION_MEMORY_ENABLED and call_id and tenant_id and cache_hash and isinstance(gmail_data, dict):
+                        memory.put_cached_skill_result(
+                            tenant_id=tenant_id,
+                            call_id=call_id,
+                            skill_key="gmail_summary",
+                            cache_key_hash=cache_hash,
+                            result={"gmail": gmail_data},
+                            ttl_s=SESSION_MEMORY_TTL_S,
+                        )
+                        msgs = (gmail_data.get("messages") or []) if isinstance(gmail_data, dict) else []
+                        ids = [m.get("id") for m in msgs if isinstance(m, dict) and m.get("id")]
+                        memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_message_ids", value=ids)
+                        memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="last_gmail_messages", value=msgs[:20])
+
                 gmail_data["used_account_id"] = account_id_effective
 
                 summary = (gmail_data.get("summary") or "").strip()
