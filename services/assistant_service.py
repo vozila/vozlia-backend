@@ -21,6 +21,12 @@ from services.caller_cache import (
     put_caller_cache,
     normalize_caller_id,
 )
+from services.longterm_memory import (
+    longterm_memory_enabled_for_tenant,
+    fetch_recent_memory_text,
+    record_skill_result,
+)
+
 
 
 
@@ -64,11 +70,38 @@ def run_assistant_route(
         from_number = ctx.get("from_number") or ctx.get("from") or ctx.get("From")
     caller_id = normalize_caller_id(from_number)
 
+    # Long-term memory context (durable, per tenant + caller_id)
+    memory_context = ""
+    longterm_enabled = False
+    try:
+        longterm_enabled = longterm_memory_enabled_for_tenant(tenant_id)
+    except Exception:
+        longterm_enabled = False
+
+    if longterm_enabled and caller_id and tenant_uuid and gmail_data_fresh:
+        memory_context = fetch_recent_memory_text(
+            db,
+            tenant_uuid=tenant_uuid,
+            caller_id=caller_id,
+            limit=int(os.getenv("LONGTERM_MEMORY_CONTEXT_LIMIT", "8") or 8),
+        )
+        if debug and memory_context:
+            logger.info(
+                "LONGTERM_MEM_CONTEXT_READY tenant_id=%s caller_id=%s chars=%s",
+                tenant_id,
+                caller_id,
+                len(memory_context),
+            )
+
+
     fsm = VozliaFSM()
     # Portal-controlled greeting (admin-configurable)
     fsm.greeting_text = get_agent_greeting(db, current_user)
 
     fsm_context = context or {}
+    if isinstance(fsm_context, dict) and memory_context:
+        fsm_context.setdefault("memory_context", memory_context)
+
     fsm_context.setdefault("user_id", current_user.id)
     fsm_context.setdefault("channel", "phone")
 
@@ -118,6 +151,8 @@ def run_assistant_route(
         else:
             gmail_query = params.get("query")
             gmail_max_results = params.get("max_results", 20)
+
+            gmail_data_fresh = False
 
             cache_hash = None
             cached = None
@@ -191,6 +226,7 @@ def run_assistant_route(
                     max_results=gmail_max_results,
                     query=gmail_query,
                 )
+                gmail_data_fresh = True
                 if debug:
                     logger.info(
                         "ASSISTANT_GMAIL_DONE dt_ms=%s got_messages=%s summary_len=%s used_account_id=%s",
@@ -233,6 +269,28 @@ def run_assistant_route(
                     if spoken_reply
                     else gmail_data["summary"].strip()
                 )
+
+            # Long-term memory write (per tenant + caller) - fail-open
+            if longterm_enabled and caller_id and tenant_uuid:
+                try:
+                    record_skill_result(
+                        db,
+                        tenant_uuid=tenant_uuid,
+                        caller_id=caller_id,
+                        skill_key="gmail_summary",
+                        input_text=text,
+                        memory_text=(gmail_data.get("summary") or "").strip()[:900],
+                        data_json={
+                            "account_id": account_id_effective,
+                            "query": gmail_query,
+                            "max_results": gmail_max_results,
+                            "used_account_id": gmail_data.get("used_account_id"),
+                            "fresh": bool(gmail_data_fresh),
+                        },
+                        expires_in_s=int(os.getenv("LONGTERM_MEMORY_SKILL_EVENT_TTL_S", "0") or 0) or None,
+                    )
+                except Exception:
+                    logger.exception("LONGTERM_MEM_RECORD_GMAIL_FAILED")
             gmail_data["used_account_id"] = account_id_effective
 
         return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
@@ -373,4 +431,3 @@ def run_assistant_route(
     # (3) Default: return FSM result (no change)
     # ----------------------------
     return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
-
