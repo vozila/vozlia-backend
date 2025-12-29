@@ -607,7 +607,11 @@ async def twilio_stream(websocket: WebSocket):
                 content_text_override=spoken_reply,
             )
 
-            ok = await speech_ctrl.enqueue(req)
+try:
+    ok = await speech_ctrl.enqueue(req)
+except Exception:
+    logger.exception("FSM_SPEECH_CONTROLLER_ENQUEUE_ERROR trace_id=%s reason=%s", req.trace_id, req.reason)
+    ok = False
             if ok:
                 logger.info("FSM_SPEECH_CONTROLLER_ENQUEUED trace_id=%s reason=%s", req.trace_id, req.reason)
                 return
@@ -654,7 +658,10 @@ async def twilio_stream(websocket: WebSocket):
         spoken_reply = await route_to_fsm_and_get_reply(transcript)
 
         if spoken_reply:
-            await create_fsm_spoken_reply(spoken_reply)
+        try:
+    await create_fsm_spoken_reply(spoken_reply)
+except Exception:
+    logger.exception("FSM_SPEECH_CREATE_ERROR (fallback may have failed)")
         else:
             await create_generic_response()
 
@@ -875,6 +882,17 @@ async def twilio_stream(websocket: WebSocket):
             os.getenv("SPEECH_CONTROLLER_FAILOPEN", "1"),
         )
 
+
+try:
+    import vozlia_twilio.speech_controller as _scm
+    logger.info(
+        "SPEECH_CTRL_FINGERPRINT version=%s file=%s has__log_meta=%s",
+        getattr(_scm, "SPEECH_CTRL_VERSION", None),
+        getattr(_scm, "__file__", None),
+        hasattr(SpeechOutputController, "_log_meta"),
+    )
+except Exception:
+    logger.exception("SPEECH_CTRL_FINGERPRINT_ERROR")
 
         await asyncio.gather(openai_loop(), twilio_loop())
 
