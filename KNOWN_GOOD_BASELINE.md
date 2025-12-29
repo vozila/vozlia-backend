@@ -1,22 +1,28 @@
-Last good known update Dec 29 3:30PM
+Last good known update Dec 29 4:28PM
 still working on portal
 completed the first iteration of short-term  memory
+completed the first iteration of long-term  memory
 
+Two key points from your renderlog17.txt:
 
-Nice — that confirms caller-scoped Postgres TTL cache is working (across calls), which is the hardest part.
+The API call did happen — /assistant/route returned 200 OK.
 
-What “long-term memory for all skills” means in practice
+The Gmail API did NOT fire because you got a caller-scoped cache hit:
 
-You already have:
+SESSION_MEM_MISS ... call_id=CA... (new call, so per-call cache miss is normal)
 
-Session memory (per call) ✅
+CALLER_MEM_HIT ... caller_id=+19178057859 (cross-call Postgres TTL cache hit, so Gmail fetch is skipped)
 
-Caller TTL cache (cross-call, per caller) ✅
+So the system behaved exactly like we wanted: new call → session miss → caller cache hit → no Gmail/OpenAI tool execution.
 
-Next is durable memory (not TTL-cached results), so any skill can:
+If you want to force a fresh Gmail pull (bypass cache)
 
-read a compact “what we know about this caller” context
+Pick one of these:
 
-write back important outcomes for future calls
+Easiest (ops): temporarily set CALLER_MEMORY_ENABLED=0 and call again.
 
-And you want it per-tenant toggleable (env vars for now; later portal settings).
+Safer (still on): lower CALLER_MEMORY_TTL_S to something small (e.g. 60–300) for testing.
+
+Best UX (code): treat phrases like “refresh” / “latest” / “check again” as force_refresh=True and bypass caller cache for that request.
+
+If you want, I’ll implement the “force refresh” behavior as the next tiny patch (it’s a small conditional in assistant_service.py and keeps everything fail-open).
