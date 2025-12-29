@@ -6,20 +6,43 @@ import base64
 import json
 import os
 import time
+from collections import deque
 from typing import Optional
-from db import SessionLocal
-from services.user_service import get_or_create_primary_user
-#from services.settings_service import get_realtime_prompt_addendum
-from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting
-
-from services.longterm_memory import fetch_recent_memory_text, longterm_memory_enabled_for_tenant
-
-
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 
 from core.logging import logger
+from core.config import (
+    REALTIME_LOG_TEXT,
+    REALTIME_LOG_ALL_EVENTS,
+    SKILL_GATED_ROUTING,
+    OPENAI_INTERRUPT_RESPONSE,
+    BYTES_PER_FRAME,
+    FRAME_INTERVAL,
+    PREBUFFER_BYTES,
+    MAX_TWILIO_BACKLOG_SECONDS,
+    OPENAI_REALTIME_URL,
+    OPENAI_REALTIME_HEADERS,
+    VOICE_NAME,
+    REALTIME_SYSTEM_PROMPT,
+    REALTIME_INPUT_AUDIO_FORMAT,
+    REALTIME_OUTPUT_AUDIO_FORMAT,
+    REALTIME_VAD_THRESHOLD,
+    REALTIME_VAD_SILENCE_MS,
+    REALTIME_VAD_PREFIX_MS,
+)
+
+from db import SessionLocal
+from services.user_service import get_or_create_primary_user
+from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting
+from services.longterm_memory import (
+    fetch_recent_memory_text,
+    longterm_memory_enabled_for_tenant,
+    record_skill_result,
+)
+
+from core.fsm_router_client import call_fsm_router
 
 # Speech output controller (shadow-mode wiring)
 from vozlia_twilio.speech_controller import (
@@ -33,14 +56,12 @@ from vozlia_twilio.speech_controller import (
 
 # ---------------------------------------------------------------------------
 # Tenant speech policy provider (tenant-level settings; NOT per-skill)
-# Step 2: placeholder implementation (env-driven defaults, no per-reason overrides).
-# Later: load from control-plane settings cache.
 # ---------------------------------------------------------------------------
 def _tenant_policy_provider(tenant_id: str):
     defaults = TenantSpeechDefaults(
         priority_default=50,
         speech_mode_default="natural",
-        conversation_mode_default="auto",
+        conversation_mode_default="default",
         can_interrupt_default=True,
         barge_grace_ms_default=int(os.getenv("BARGE_IN_GRACE_MS", "250") or 250),
         barge_debounce_ms_default=int(os.getenv("BARGE_IN_DEBOUNCE_MS", "200") or 200),
@@ -48,38 +69,6 @@ def _tenant_policy_provider(tenant_id: str):
     )
     policy_map: TenantSpeechPolicyMap = {}
     return defaults, policy_map
-
-
-# Config / constants (env-driven)
-from core.config import (
-    # logging toggles
-    REALTIME_LOG_TEXT,
-    REALTIME_LOG_ALL_EVENTS,
-    # feature flags
-    SKILL_GATED_ROUTING,
-    OPENAI_INTERRUPT_RESPONSE,
-    # twilio audio constants
-    BYTES_PER_FRAME,
-    FRAME_INTERVAL,
-    PREBUFFER_BYTES,
-    MAX_TWILIO_BACKLOG_SECONDS,
-    # realtime session config
-    OPENAI_REALTIME_URL,
-    OPENAI_REALTIME_HEADERS,
-    VOICE_NAME,
-    REALTIME_SYSTEM_PROMPT,
-    REALTIME_INPUT_AUDIO_FORMAT,
-    REALTIME_OUTPUT_AUDIO_FORMAT,
-    REALTIME_VAD_THRESHOLD,
-    REALTIME_VAD_SILENCE_MS,
-    REALTIME_VAD_PREFIX_MS,
-)
-
-# Router client (Flow B)
-# NOTE: This must be implemented as an async function returning a dict (or adjust below accordingly).
-#from services.fsm_router_client import call_fsm_router
-from core.fsm_router_client import call_fsm_router
-
 
 
 def _normalize_text(s: str) -> str:
@@ -91,7 +80,6 @@ def _normalize_text(s: str) -> str:
 
 
 def get_style_for_feature(feature: str) -> str:
-    # feature: "email", "chitchat", "calendar", etc.
     key = f"VOZLIA_STYLE_{feature.upper()}"
     s = (os.getenv(key, "") or "").strip().lower()
     if s in {"warm", "concise"}:
@@ -114,41 +102,27 @@ def should_reply(text: str, style: str, *, is_skill_intent: bool) -> bool:
     if n in HARD_IGNORE:
         return False
 
-    # Never ignore continuation commands
     if n in CONTINUE_TRIGGERS:
         return True
 
     if style == "concise":
-        # In concise mode, ignore acknowledgements unless configured otherwise
         concise_acks = os.getenv("VOZLIA_CONCISE_ACKS", "0") == "1"
         if (n in ACKS) and (not concise_acks):
             return False
 
-        # Also ignore super-short non-skill utterances
         if len(n.split()) <= 2 and not is_skill_intent:
             return False
 
         return True
 
-    # Warm: respond to almost everything
     return True
 
 
 def _build_realtime_instructions(base: str, prompt_addendum: Optional[str]) -> str:
-    """
-    Build the Realtime `instructions` string for session.update.
-
-    Hardening rules:
-    - Only append once (this function is only called at session start).
-    - Ignore empty/whitespace addenda.
-    - Strip leading/trailing whitespace on addendum.
-    - Insert a clear delimiter so the "portal opening rule" stays scoped and readable.
-    """
     add = (prompt_addendum or "").strip()
     if not add:
         return base
 
-    # Prevent accidental double-delimiter if the saved addendum already contains it.
     delimiter = "--- PORTAL OPENING RULE ---"
     if add.startswith(delimiter):
         add = add[len(delimiter):].lstrip("\n ").strip()
@@ -157,9 +131,6 @@ def _build_realtime_instructions(base: str, prompt_addendum: Optional[str]) -> s
 
 
 async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
-    """
-    Connect to OpenAI Realtime WS and send session.update + an initial greeting.
-    """
     logger.info(f"Connecting to OpenAI Realtime at {OPENAI_REALTIME_URL}")
 
     try:
@@ -171,7 +142,6 @@ async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
             ping_timeout=None,
         )
     except TypeError:
-        # Newer websockets versions renamed extra_headers -> additional_headers
         ws = await websockets.connect(
             OPENAI_REALTIME_URL,
             additional_headers=OPENAI_REALTIME_HEADERS,
@@ -205,13 +175,10 @@ async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
     logger.info("Sent session.update to OpenAI Realtime")
 
     opening = (agent_greeting or "").strip()
-
-    # Keep this behind a flag so you can disable instantly without rollback if needed
     if os.getenv("FORCE_REALTIME_OPENING", "1") == "1" and opening:
         evt = {
             "type": "response.create",
             "response": {
-                # per-response instructions override session instructions for this response :contentReference[oaicite:1]{index=1}
                 "instructions": (
                     "CALL OPENING (FIRST UTTERANCE ONLY): "
                     "Say EXACTLY this one sentence with no extra words before or after: "
@@ -225,23 +192,15 @@ async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
     await ws.send(json.dumps(evt))
     logger.info("Sent initial greeting request to OpenAI Realtime")
 
-
     return ws
 
 
-
 async def twilio_stream(websocket: WebSocket):
-    """
-    Pattern 1 (no response_id adoption):
-    """
-    # Load portal-controlled Realtime prompt addendum ONCE per call (not in hot path)
     prompt_addendum = ""
     agent_greeting = ""
-    tenant_uuid: str = ""
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
-        tenant_uuid = str(getattr(user, "id", "") or "")
         prompt_addendum = get_realtime_prompt_addendum(db, user)
         agent_greeting = get_agent_greeting(db, user)
 
@@ -249,7 +208,6 @@ async def twilio_stream(websocket: WebSocket):
         logger.info("Agent greeting loaded (len=%d)", len(agent_greeting or ""))
 
     except Exception:
-        #logger.exception("Failed to load realtime prompt addendum; proceeding without it")
         logger.exception("Failed to load settings; proceeding with defaults")
         prompt_addendum = ""
         agent_greeting = ""
@@ -259,8 +217,6 @@ async def twilio_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
-
-    # --- Call + AI state -----------------------------------------------------
     openai_ws: Optional[websockets.WebSocketClientProtocol] = None
     speech_ctrl: Optional[SpeechOutputController] = None
     stream_sid: Optional[str] = None
@@ -276,86 +232,20 @@ async def twilio_stream(websocket: WebSocket):
     assistant_last_audio_time: float = 0.0
     prebuffer_active: bool = True
 
-    # Response tracking (Pattern 1)
     active_response_id: Optional[str] = None
 
-    # --- Long-term memory injection into Realtime (chitchat) -----------------
-    # Runs once per call, after Twilio 'start' provides caller_id (from_number).
-    # Fail-open: any DB error becomes a no-op.
-    async def _inject_longterm_memory_into_realtime():
-        nonlocal openai_ws, from_number, tenant_uuid, prompt_addendum
+    # --- Chitchat durable memory plumbing (maps user turn -> response_id -> assistant transcript)
+    pending_response_queue = deque()  # FIFO of dicts for next response.created
+    response_meta_by_id = {}  # response_id -> meta
 
-        if openai_ws is None:
-            return
-        if not from_number or not tenant_uuid:
-            return
-
-        # Global kill-switch (in addition to per-tenant gate)
-        if (os.getenv("REALTIME_INJECT_LONGTERM_MEMORY", "0") or "1").strip().lower() not in ("1", "true", "yes", "on"):
-            return
-
-        # Per-tenant gate (env-driven allowlist/blocklist)
-        if not longterm_memory_enabled_for_tenant(tenant_uuid):
-            return
-
-        limit = int(os.getenv("LONGTERM_MEMORY_CONTEXT_LIMIT", "8") or 8)
-
-        db = SessionLocal()
-        try:
-            mem_text = fetch_recent_memory_text(
-                db,
-                tenant_uuid=tenant_uuid,
-                caller_id=from_number,
-                limit=limit,
-            )
-        except Exception:
-            logger.exception("REALTIME_MEM_FETCH_FAILED tenant=%s caller=%s", tenant_uuid, from_number)
-            return
-        finally:
-            db.close()
-
-        mem_text = (mem_text or "").strip()
-        if not mem_text:
-            logger.info("REALTIME_MEM_INJECT_SKIP no_memory tenant=%s caller=%s", tenant_uuid, from_number)
-            return
-
-        max_chars = int(os.getenv("REALTIME_MEMORY_MAX_CHARS", "1500") or 1500)
-        if len(mem_text) > max_chars:
-            mem_text = mem_text[: max_chars - 3].rstrip() + "..."
-
-        base_instr = _build_realtime_instructions(REALTIME_SYSTEM_PROMPT, prompt_addendum)
-        memory_block = f"\n\n--- CALLER MEMORY (RECENT) ---\n{mem_text}\n"
-        new_instr = (base_instr + memory_block).strip()
-
-        try:
-            await openai_ws.send(
-                json.dumps(
-                    {
-                        "type": "session.update",
-                        "session": {"instructions": new_instr},
-                    }
-                )
-            )
-            logger.info(
-                "REALTIME_MEM_INJECT_OK tenant=%s caller=%s chars=%d lines=%d",
-                tenant_uuid,
-                from_number,
-                len(mem_text),
-                mem_text.count("\n") + 1,
-            )
-        except Exception:
-            logger.exception("REALTIME_MEM_INJECT_FAILED tenant=%s caller=%s", tenant_uuid, from_number)
-
-
-    # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
         if audio_buffer:
             return True
-        if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) < 0.5:
+        window_s = float(os.getenv("ASSISTANT_SPEAKING_RECENCY_S", "1.5") or 1.5)
+        if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) < window_s:
             return True
         return False
 
-    # --- Helper: send μ-law audio TO Twilio ---------------------------------
     async def send_audio_to_twilio():
         nonlocal audio_buffer, assistant_last_audio_time
 
@@ -376,7 +266,6 @@ async def twilio_stream(websocket: WebSocket):
         await websocket.send_text(json.dumps(msg))
         assistant_last_audio_time = time.monotonic()
 
-    # --- Background task: paced audio sender to Twilio ----------------------
     async def twilio_audio_sender():
         nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled
 
@@ -398,7 +287,6 @@ async def twilio_stream(websocket: WebSocket):
 
                 now = time.monotonic()
 
-                # 1Hz stats
                 if now - last_stat_ts >= 1.0:
                     logger.info(
                         "twilio_send stats: q_bytes=%d frames_sent=%d underruns=%d late_ms_max=%.1f prebuf=%s",
@@ -413,7 +301,6 @@ async def twilio_stream(websocket: WebSocket):
                     underruns = 0
                     late_ms_max = 0.0
 
-                # idle reset
                 if len(audio_buffer) == 0:
                     if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) > 1.0:
                         send_start_ts = None
@@ -421,7 +308,6 @@ async def twilio_stream(websocket: WebSocket):
                     await asyncio.sleep(0.005)
                     continue
 
-                # prebuffer at utterance start
                 if prebuffer_active:
                     if len(audio_buffer) < PREBUFFER_BYTES:
                         await asyncio.sleep(0.005)
@@ -440,7 +326,6 @@ async def twilio_stream(websocket: WebSocket):
                     send_start_ts = time.monotonic()
                     frame_idx = 0
 
-                # backlog cap
                 call_elapsed = now - send_start_ts
                 audio_sent_duration = frame_idx * FRAME_INTERVAL
                 backlog_seconds = audio_sent_duration - call_elapsed
@@ -448,7 +333,6 @@ async def twilio_stream(websocket: WebSocket):
                     await asyncio.sleep(0.005)
                     continue
 
-                # deadline-based pacing
                 target = send_start_ts + frame_idx * FRAME_INTERVAL
                 now = time.monotonic()
                 if now < target:
@@ -490,11 +374,7 @@ async def twilio_stream(websocket: WebSocket):
         except Exception:
             logger.exception("Failed to send Twilio clear")
 
-    # --- Barge-in: local mute only ------------------------------------------
     async def handle_barge_in():
-        """
-        Cancel the active OpenAI response on barge-in and clear Twilio audio.
-        """
         nonlocal active_response_id, prebuffer_active
         if not barge_in_enabled:
             logger.info("BARGE-IN: ignored (not yet enabled)")
@@ -504,11 +384,9 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("BARGE-IN: assistant not actively speaking; nothing to mute")
             return
 
-        logger.info(
-            "BARGE-IN: user speech started while AI speaking; canceling active response and clearing audio buffer."
-        )
+        logger.info("BARGE-IN: user speech started while AI speaking; clearing audio buffer.")
 
-        # Cancel server-side generation if possible
+        # Cancel server-side generation if possible (best-effort)
         if openai_ws is not None and active_response_id is not None:
             rid = active_response_id
             try:
@@ -517,15 +395,11 @@ async def twilio_stream(websocket: WebSocket):
             except Exception:
                 logger.exception("BARGE-IN: Failed sending response.cancel for %s", rid)
 
-        # Clear local audio immediately
         await twilio_clear_buffer()
         audio_buffer.clear()
-
-        # Reset playback state
         prebuffer_active = True
         active_response_id = None
 
-    # --- Intent helpers ------------------------------------------------------
     EMAIL_KEYWORDS_LOCAL = [
         "email",
         "emails",
@@ -576,34 +450,21 @@ async def twilio_stream(websocket: WebSocket):
 
         return False
 
-    # --- FSM router ----------------------------------------------------------
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
-        try:
-            ctx = {"channel": "phone"}
-            if stream_sid:
-                ctx["stream_sid"] = stream_sid
-            if call_sid:
-                ctx["call_sid"] = call_sid
-            if from_number:
-                ctx["from_number"] = from_number
+        ctx = {"channel": "phone"}
+        if stream_sid:
+            ctx["stream_sid"] = stream_sid
+        if call_sid:
+            ctx["call_sid"] = call_sid
+        if from_number:
+            ctx["from_number"] = from_number
+        data = await call_fsm_router(transcript, context=ctx)
+        if isinstance(data, dict):
+            return (data.get("spoken_reply") or data.get("reply") or data.get("text") or "").strip() or None
+        if isinstance(data, str):
+            return data.strip() or None
+        return None
 
-            data = await call_fsm_router(transcript, context=ctx)
-            if isinstance(data, dict):
-                # Common patterns we’ve used across codepaths
-                spoken = (
-                    data.get("spoken_reply")
-                    or (data.get("result") or {}).get("spoken_reply")
-                    or (data.get("skill_result") or {}).get("spoken_reply")
-                )
-                if isinstance(spoken, str) and spoken.strip():
-                    return spoken.strip()
-            return None
-        except Exception:
-            logger.exception("FSM_ROUTE_ERROR")
-            return None
-
-
-    # --- Cancel active response & clear audio buffer -------------------------
     async def _cancel_active_and_clear_buffer(reason: str):
         nonlocal active_response_id, prebuffer_active
 
@@ -631,8 +492,23 @@ async def twilio_stream(websocket: WebSocket):
         audio_buffer.clear()
         prebuffer_active = True
 
-    # --- Create responses ----------------------------------------------------
-    async def create_generic_response():
+    async def create_generic_response(user_text: str | None = None):
+        # Queue meta so we can persist assistant transcript when response finishes.
+        try:
+            tenant_uuid = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
+            if from_number and longterm_memory_enabled_for_tenant(str(tenant_uuid)):
+                pending_response_queue.append(
+                    {
+                        "kind": "chitchat",
+                        "tenant_uuid": str(tenant_uuid),
+                        "caller_id": from_number,
+                        "user_text": (user_text or "").strip() or None,
+                        "t0": time.monotonic(),
+                    }
+                )
+        except Exception:
+            logger.exception("CHITCHAT_MEM_QUEUE_FAILED")
+
         await _cancel_active_and_clear_buffer("create_generic_response")
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
@@ -642,8 +518,6 @@ async def twilio_stream(websocket: WebSocket):
             logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
             await create_generic_response()
             return
-
-        # Cancellation handled in send-path selection (controller vs legacy)
 
         instructions = (
             "You are on a live phone call as Vozlia.\n"
@@ -657,7 +531,6 @@ async def twilio_stream(websocket: WebSocket):
             "- DO NOT apologize or refuse.\n"
         )
 
-        # Step 3: tool/FSM speech cutover (controller owns response.create) behind flag.
         tool_only = os.getenv("SPEECH_CONTROLLER_TOOL_ONLY", "0") == "1"
         use_ctrl = (speech_ctrl is not None and getattr(speech_ctrl, "enabled", False) and tool_only)
 
@@ -669,14 +542,13 @@ async def twilio_stream(websocket: WebSocket):
         )
 
         if use_ctrl:
-            # Preserve existing behavior: cancel any active response first (same as legacy path).
             await _cancel_active_and_clear_buffer("create_fsm_spoken_reply_ctrl")
 
             tenant_id = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
             ctx = ExecutionContext(
                 tenant_id=str(tenant_id),
-                call_sid=call_sid,
-                session_id=stream_sid,
+                call_sid=None,
+                session_id=None,
                 skill_key="fsm",
             )
 
@@ -684,7 +556,7 @@ async def twilio_stream(websocket: WebSocket):
                 text=spoken_reply,
                 reason="fsm_spoken_reply",
                 ctx=ctx,
-                instructions_override=instructions,  # preserve legacy scaffolding
+                instructions_override=instructions,
                 content_text_override=spoken_reply,
             )
             try:
@@ -698,9 +570,7 @@ async def twilio_stream(websocket: WebSocket):
                 return
             logger.warning("FSM_SPEECH_CONTROLLER_FALLBACK_LEGACY")
 
-        # Legacy path (unchanged)
         await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
-
         await openai_ws.send(
             json.dumps(
                 {
@@ -711,7 +581,6 @@ async def twilio_stream(websocket: WebSocket):
         )
         logger.info("Sent FSM-driven spoken reply into Realtime session")
 
-    # --- Transcript handling -------------------------------------------------
     async def handle_transcript_event(event: dict):
         transcript: str = (event.get("transcript") or "").strip()
         if not transcript:
@@ -727,13 +596,9 @@ async def twilio_stream(websocket: WebSocket):
             logger.info("Ignoring transcript (style=%s feature=%s): %r", style, feature, transcript)
             return
 
-        # Optional: skill-gated routing
         if SKILL_GATED_ROUTING and not is_email:
-            logger.info(
-                "Skill-gated routing: bypassing /assistant/route for non-email utterance: %r",
-                transcript,
-            )
-            await create_generic_response()
+            logger.info("Skill-gated routing: bypassing /assistant/route for non-email utterance: %r", transcript)
+            await create_generic_response(transcript)
             return
 
         spoken_reply = await route_to_fsm_and_get_reply(transcript)
@@ -741,9 +606,8 @@ async def twilio_stream(websocket: WebSocket):
         if spoken_reply:
             await create_fsm_spoken_reply(spoken_reply)
         else:
-            await create_generic_response()
+            await create_generic_response(transcript)
 
-    # --- Logging helpers -----------------------------------------------------
     def _log_realtime_audio_transcript_delta(event: dict):
         delta = event.get("delta")
         if isinstance(delta, str) and delta.strip():
@@ -766,14 +630,58 @@ async def twilio_stream(websocket: WebSocket):
             if isinstance(out, str) and out.strip():
                 logger.info("Realtime text delta: %r", out)
 
-    # --- OpenAI event loop ---------------------------------------------------
+    async def maybe_inject_longterm_memory(tenant_uuid: str, from_number: str):
+        if not (tenant_uuid and from_number):
+            return
+        if (os.getenv("REALTIME_LONGTERM_MEMORY", "0") or "").strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        if not longterm_memory_enabled_for_tenant(tenant_uuid):
+            return
+
+        limit = int(os.getenv("LONGTERM_MEMORY_CONTEXT_LIMIT", "8") or 8)
+
+        dbx = SessionLocal()
+        try:
+            mem_text = fetch_recent_memory_text(
+                dbx,
+                tenant_uuid=tenant_uuid,
+                caller_id=from_number,
+                limit=limit,
+            )
+        finally:
+            dbx.close()
+
+        if not mem_text:
+            logger.info("REALTIME_MEM_INJECT_SKIP no_memory tenant=%s caller=%s", tenant_uuid, from_number)
+            return
+
+        max_chars = int(os.getenv("REALTIME_MEMORY_MAX_CHARS", "1500") or 1500)
+        if len(mem_text) > max_chars:
+            mem_text = mem_text[: max_chars - 3].rstrip() + "..."
+
+        base_instr = _build_realtime_instructions(REALTIME_SYSTEM_PROMPT, prompt_addendum)
+        memory_block = f"\n\n--- CALLER MEMORY (RECENT) ---\n{mem_text}\n"
+        new_instr = (base_instr + memory_block).strip()
+
+        try:
+            await openai_ws.send(json.dumps({"type": "session.update", "session": {"instructions": new_instr}}))
+            logger.info(
+                "REALTIME_MEM_INJECT_OK tenant=%s caller=%s chars=%d lines=%d",
+                tenant_uuid,
+                from_number,
+                len(mem_text),
+                mem_text.count("\n") + 1,
+            )
+        except Exception:
+            logger.exception("REALTIME_MEM_INJECT_FAILED tenant=%s caller=%s", tenant_uuid, from_number)
+
     async def openai_loop():
         nonlocal active_response_id, barge_in_enabled, user_speaking_vad, transcript_action_task, prebuffer_active
 
         try:
             async for raw in openai_ws:
                 event = json.loads(raw)
-                # SpeechOutputController (Step 2): observe Realtime lifecycle events (shadow mode)
+
                 if speech_ctrl is not None:
                     try:
                         speech_ctrl.on_realtime_event(event)
@@ -791,8 +699,13 @@ async def twilio_stream(websocket: WebSocket):
                     if rid:
                         active_response_id = rid
                         logger.info("Tracking allowed response_id: %s", rid)
+                        if pending_response_queue:
+                            meta = pending_response_queue.popleft()
+                            response_meta_by_id[rid] = meta
+                            logger.info("CHITCHAT_MEM_ATTACHED response_id=%s kind=%s", rid, meta.get("kind"))
 
-                elif etype in ("response.completed", "response.failed", "response.canceled"):
+                # FIX: treat response.done as completion (your logs show response.done, not response.completed)
+                elif etype in ("response.completed", "response.failed", "response.canceled", "response.done"):
                     resp = event.get("response", {}) or {}
                     rid = resp.get("id")
                     if active_response_id is not None and rid == active_response_id:
@@ -814,6 +727,48 @@ async def twilio_stream(websocket: WebSocket):
                         if transcript:
                             logger.info("Realtime assistant said (final): %r", transcript)
 
+                    # Persist chitchat turns (durable memory) using assistant final transcript.
+                    try:
+                        rid = event.get("response_id")
+                        transcript_final = (event.get("transcript") or "").strip()
+                        meta = response_meta_by_id.get(rid) if rid else None
+                        if meta and meta.get("kind") == "chitchat" and transcript_final:
+                            max_chars = int(os.getenv("LONGTERM_CHAT_TURN_MAX_CHARS", "600") or 600)
+                            if len(transcript_final) > max_chars:
+                                transcript_final = transcript_final[: max_chars - 3].rstrip() + "..."
+
+                            user_text = (meta.get("user_text") or "").strip() or None
+                            tenant_uuid = meta.get("tenant_uuid")
+                            caller_id = meta.get("caller_id")
+
+                            async def _persist():
+                                def _sync_write():
+                                    db2 = SessionLocal()
+                                    try:
+                                        record_skill_result(
+                                            db2,
+                                            tenant_uuid=tenant_uuid,
+                                            caller_id=caller_id,
+                                            skill_key="chitchat",
+                                            input_text=user_text,
+                                            memory_text=transcript_final,
+                                            data_json={"channel": "realtime"},
+                                            expires_in_s=None,
+                                        )
+                                    finally:
+                                        db2.close()
+
+                                await asyncio.to_thread(_sync_write)
+
+                            asyncio.create_task(_persist())
+                            logger.info("CHITCHAT_MEM_PERSIST_QUEUED response_id=%s", rid)
+                            try:
+                                response_meta_by_id.pop(rid, None)
+                            except Exception:
+                                pass
+                    except Exception:
+                        logger.exception("CHITCHAT_MEM_PERSIST_FAILED")
+
                 elif etype in ("response.output_text.delta", "response.text.delta", "response.output_text"):
                     if REALTIME_LOG_TEXT:
                         _log_realtime_text_delta(event)
@@ -826,13 +781,8 @@ async def twilio_stream(websocket: WebSocket):
                     resp_id = event.get("response_id")
                     delta_b64 = event.get("delta")
 
-                    # Pattern 1: ONLY accept audio for the active_response_id
                     if resp_id != active_response_id:
-                        logger.info(
-                            "Dropping unsolicited audio for response_id=%s (active=%s)",
-                            resp_id,
-                            active_response_id,
-                        )
+                        logger.info("Dropping unsolicited audio for response_id=%s (active=%s)", resp_id, active_response_id)
                         continue
 
                     if not delta_b64:
@@ -851,6 +801,14 @@ async def twilio_stream(websocket: WebSocket):
                     logger.info("OpenAI VAD: user speech START")
                     if assistant_actively_speaking():
                         await handle_barge_in()
+                    else:
+                        # Still clear if we spoke very recently; Twilio may still be playing buffered audio.
+                        try:
+                            window_s = float(os.getenv("ASSISTANT_SPEAKING_RECENCY_S", "1.5") or 1.5)
+                            if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) < window_s:
+                                await handle_barge_in()
+                        except Exception:
+                            pass
 
                 elif etype == "input_audio_buffer.speech_stopped":
                     user_speaking_vad = False
@@ -868,7 +826,6 @@ async def twilio_stream(websocket: WebSocket):
                         logger.info("OpenAI cancel race (expected): %s", event)
                     else:
                         logger.error("OpenAI error event: %s", event)
-                        # Attach last tool payload trace (if controller is wired) for immediate diagnosis.
                         if speech_ctrl is not None:
                             try:
                                 dbg = speech_ctrl.get_last_tool_payload_debug()
@@ -881,9 +838,8 @@ async def twilio_stream(websocket: WebSocket):
         except Exception:
             logger.exception("Error in OpenAI event loop")
 
-    # --- Twilio event loop ---------------------------------------------------
     async def twilio_loop():
-        nonlocal stream_sid, call_sid, from_number, prebuffer_active, twilio_ws_closed
+        nonlocal stream_sid, prebuffer_active, twilio_ws_closed, call_sid, from_number
 
         try:
             async for msg in websocket.iter_text():
@@ -907,15 +863,16 @@ async def twilio_stream(websocket: WebSocket):
                     from_number = custom.get("from") or custom.get("From") or start.get("from") or start.get("From")
 
                     prebuffer_active = True
-
-                    # Inject long-term memory into Realtime instructions (chitchat)
-                    try:
-                        asyncio.create_task(_inject_longterm_memory_into_realtime())
-                    except Exception:
-                        logger.exception("REALTIME_MEM_INJECT_TASK_CREATE_FAILED")
-
                     logger.info("Twilio stream event: start")
                     logger.info("Stream started: %s", stream_sid)
+
+                    # Inject durable memory at call start (safe: one-time, not per-frame)
+                    try:
+                        tenant_uuid = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
+                        if from_number:
+                            await maybe_inject_longterm_memory(str(tenant_uuid), from_number)
+                    except Exception:
+                        logger.exception("REALTIME_MEM_INJECT_EXCEPTION")
 
                 elif event_type == "media":
                     if not openai_ws:
@@ -949,17 +906,11 @@ async def twilio_stream(websocket: WebSocket):
             twilio_ws_closed = True
         except Exception:
             logger.exception("Error in Twilio event loop")
-            
 
-    # --- Main orchestration --------------------------------------------------
     try:
         openai_ws = await create_realtime_session(prompt_addendum, agent_greeting)
         logger.info("connection open")
 
-        # -------------------------------------------------------------------
-        # SpeechOutputController (Step 2): shadow wiring (observe-only by default)
-        # No behavior changes: controller is disabled unless SPEECH_CONTROLLER_ENABLED=1
-        # -------------------------------------------------------------------
         async def _send_realtime_json(payload: dict):
             await openai_ws.send(json.dumps(payload))
 
@@ -978,7 +929,6 @@ async def twilio_stream(websocket: WebSocket):
             os.getenv("SPEECH_CONTROLLER_FAILOPEN", "1"),
         )
 
-
         await asyncio.gather(openai_loop(), twilio_loop())
 
     finally:
@@ -993,7 +943,6 @@ async def twilio_stream(websocket: WebSocket):
                 await speech_ctrl.stop()
         except Exception:
             logger.exception("SPEECH_CTRL_STOP_ERROR")
-
 
         try:
             sender_task.cancel()
