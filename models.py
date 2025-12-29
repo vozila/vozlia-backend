@@ -11,6 +11,8 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     Text,
+    Index,
+    UniqueConstraint,
     Enum as SAEnum,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -147,3 +149,43 @@ class Task(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="tasks")
+
+
+# ---------------------------------------------------------------------------
+# Caller-scoped TTL cache (Postgres-backed)
+# Purpose:
+# - Persist short-term "skill results" across calls for the same caller ID.
+# - Keyed by (tenant_id, caller_id, skill_key, cache_key_hash) with expires_at.
+# - Used as a best-effort cache to avoid re-hitting external APIs for follow-ups.
+# ---------------------------------------------------------------------------
+
+class CallerSkillCache(Base):
+    __tablename__ = "caller_skill_cache"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    # Tenant scope (for now, tenant == user id)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    # E.164 caller id (e.g., +15551234567). Stored as text to preserve formatting.
+    caller_id = Column(String, nullable=False)
+
+    # Skill identifier (e.g., "gmail_summary")
+    skill_key = Column(String, nullable=False)
+
+    # Hash of meaningful inputs (e.g., account_id + query + max_results)
+    cache_key_hash = Column(String, nullable=False)
+
+    # Cached payload (skill output + any metadata required for follow-ups)
+    result_json = Column(JSONB, nullable=False, default=dict)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "caller_id", "skill_key", "cache_key_hash", name="uq_caller_skill_cache"),
+        Index("ix_caller_skill_cache_lookup", "tenant_id", "caller_id", "skill_key", "cache_key_hash"),
+        Index("ix_caller_skill_cache_expires", "expires_at"),
+    )
+
