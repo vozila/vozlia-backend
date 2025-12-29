@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import os
 import time
 from collections import deque
@@ -198,9 +199,15 @@ async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
 async def twilio_stream(websocket: WebSocket):
     prompt_addendum = ""
     agent_greeting = ""
+    tenant_uuid: str = (os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default").strip() or "default"
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
+        # Tenant UUID: today == primary user id (future: signup user id)
+        try:
+            tenant_uuid = str(getattr(user, "id", tenant_uuid) or tenant_uuid)
+        except Exception:
+            pass
         prompt_addendum = get_realtime_prompt_addendum(db, user)
         agent_greeting = get_agent_greeting(db, user)
 
@@ -450,6 +457,60 @@ async def twilio_stream(websocket: WebSocket):
 
         return False
 
+    # --- Long-term memory: simple fact extraction (chitchat) ----------------
+    # Keep it cheap, deterministic, and fail-open. This runs on transcript turns only.
+    def _extract_simple_facts(text: str) -> list[str]:
+        t = (text or "").strip()
+        out: list[str] = []
+
+        # Examples:
+        # - "remember this: my favorite color is blue"
+        # - "my favorite color is blue"
+        m = re.search(r"\bmy favorite color is ([a-zA-Z]+)\b", t, re.IGNORECASE)
+        if m:
+            out.append(f"Favorite color: {m.group(1).strip().lower()}")
+
+        m = re.search(r"\bmy name is ([a-zA-Z]+)\b", t, re.IGNORECASE)
+        if m:
+            out.append(f"Caller name: {m.group(1).strip()}")
+
+        return out
+
+    async def _persist_facts_if_any(user_text: str):
+        if not (tenant_uuid and from_number):
+            return
+        facts = _extract_simple_facts(user_text)
+        if not facts:
+            return
+        if not longterm_memory_enabled_for_tenant(str(tenant_uuid)):
+            return
+
+        ttl_s = int(os.getenv("LONGTERM_FACT_TTL_S", "2592000") or 2592000)  # default 30 days
+
+        def _sync_write():
+            db2 = SessionLocal()
+            try:
+                for fact in facts:
+                    record_skill_result(
+                        db2,
+                        tenant_uuid=str(tenant_uuid),
+                        caller_id=str(from_number),
+                        skill_key="chitchat_fact",
+                        input_text=user_text,
+                        memory_text=fact,
+                        data_json={"kind": "fact"},
+                        expires_in_s=ttl_s,
+                    )
+            finally:
+                db2.close()
+
+        try:
+            await asyncio.to_thread(_sync_write)
+            logger.info("CHITCHAT_FACT_SAVED tenant=%s caller=%s facts=%d", tenant_uuid, from_number, len(facts))
+        except Exception:
+            logger.exception("CHITCHAT_FACT_SAVE_FAILED tenant=%s caller=%s", tenant_uuid, from_number)
+
+
     async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
         ctx = {"channel": "phone"}
         if stream_sid:
@@ -587,6 +648,12 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         logger.info("USER Transcript completed: %r", transcript)
+        # Persist simple caller facts for long-term memory (fail-open, async)
+        try:
+            asyncio.create_task(_persist_facts_if_any(transcript))
+        except Exception:
+            logger.exception("CHITCHAT_FACT_PERSIST_TASK_FAILED")
+
 
         is_email = looks_like_email_intent(transcript)
         feature = "email" if is_email else "chitchat"
@@ -631,11 +698,21 @@ async def twilio_stream(websocket: WebSocket):
                 logger.info("Realtime text delta: %r", out)
 
     async def maybe_inject_longterm_memory(tenant_uuid: str, from_number: str):
-        if not (tenant_uuid and from_number):
+        if not tenant_uuid:
+            logger.info("REALTIME_MEM_INJECT_SKIP missing_tenant_uuid caller=%s", from_number)
             return
-        if (os.getenv("REALTIME_LONGTERM_MEMORY", "0") or "").strip().lower() not in ("1", "true", "yes", "on"):
+        if not from_number:
+            logger.info("REALTIME_MEM_INJECT_SKIP missing_from_number tenant=%s", tenant_uuid)
             return
+
+        # Global flag: support both env var names to avoid mismatches during rollout.
+        mem_flag = (os.getenv("REALTIME_INJECT_LONGTERM_MEMORY") or os.getenv("REALTIME_LONGTERM_MEMORY") or "0").strip().lower()
+        if mem_flag not in ("1", "true", "yes", "on"):
+            logger.info("REALTIME_MEM_INJECT_SKIP flag_off tenant=%s caller=%s", tenant_uuid, from_number)
+            return
+
         if not longterm_memory_enabled_for_tenant(tenant_uuid):
+            logger.info("REALTIME_MEM_INJECT_SKIP tenant_disabled tenant=%s caller=%s", tenant_uuid, from_number)
             return
 
         limit = int(os.getenv("LONGTERM_MEMORY_CONTEXT_LIMIT", "8") or 8)
@@ -868,7 +945,6 @@ async def twilio_stream(websocket: WebSocket):
 
                     # Inject durable memory at call start (safe: one-time, not per-frame)
                     try:
-                        tenant_uuid = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
                         if from_number:
                             await maybe_inject_longterm_memory(str(tenant_uuid), from_number)
                     except Exception:
