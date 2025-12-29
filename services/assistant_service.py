@@ -8,6 +8,12 @@ from sqlalchemy.orm import Session
 from models import User
 from vozlia_fsm import VozliaFSM
 from services.settings_service import gmail_summary_enabled
+from services.memory_facade import (
+    memory,
+    make_skill_cache_key_hash,
+    SESSION_MEMORY_ENABLED,
+    SESSION_MEMORY_TTL_S,
+)
 
 
 from services.gmail_service import get_default_gmail_account_id, summarize_gmail_for_assistant
