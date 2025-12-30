@@ -189,3 +189,50 @@ class CallerSkillCache(Base):
         Index("ix_caller_skill_cache_expires", "expires_at"),
     )
 
+
+# =========================
+# Durable caller memory (long-term)
+# =========================
+
+class CallerMemoryEvent(Base):
+    __tablename__ = "caller_memory_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    # Multi-tenant (tenant_id == user.id string)
+    tenant_id = Column(String, nullable=False, index=True)
+
+    # Per-caller (E.164 normalized, e.g. +15551234567)
+    caller_id = Column(String, nullable=False, index=True)
+
+    # Call/session identifiers (optional but helpful)
+    call_sid = Column(String, nullable=True, index=True)
+
+    # What produced this memory row (skill key, chitchat turn, etc.)
+    skill_key = Column(String, nullable=False, index=True)
+
+    # Human-readable snippet/summary
+    text = Column(Text, nullable=False)
+
+    # Structured payload (skill outputs, extracted fields, tags)
+    data_json = Column(JSONB, nullable=True)
+    tags_json = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+
+
+Index(
+    "ix_caller_memory_events_tenant_caller_created",
+    CallerMemoryEvent.tenant_id,
+    CallerMemoryEvent.caller_id,
+    CallerMemoryEvent.created_at.desc(),
+)
+
+Index(
+    "ix_caller_memory_events_tenant_caller_skill_created",
+    CallerMemoryEvent.tenant_id,
+    CallerMemoryEvent.caller_id,
+    CallerMemoryEvent.skill_key,
+    CallerMemoryEvent.created_at.desc(),
+)
