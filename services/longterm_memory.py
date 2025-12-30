@@ -180,6 +180,160 @@ def fetch_recent_memory_text(
         return ""
 
 
+
+# -------------------------
+# Memory recall helpers
+# -------------------------
+from dataclasses import dataclass
+from zoneinfo import ZoneInfo
+import re as _re
+
+NY_TZ = ZoneInfo(os.getenv("VOZLIA_TZ", "America/New_York") or "America/New_York")
+
+_STOPWORDS = {
+    "the","a","an","and","or","to","of","in","on","for","with","at","from","by","about","is","are","was","were",
+    "i","me","my","you","your","we","our","it","that","this","what","did","say","ago","last","time","talked",
+    "please","vozlia","hey","hi","hello","remind","remember",
+}
+
+@dataclass
+class MemoryQuery:
+    start_utc: datetime
+    end_utc: datetime
+    keywords: list[str]
+    tag: str | None = None
+
+def _utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(ZoneInfo("UTC"))
+
+def parse_memory_query(text: str, *, now_utc: datetime | None = None) -> MemoryQuery:
+    """
+    Very lightweight parser: detects rough time windows + keywords.
+    This is intentionally cheap (no heavy NLP) and safe for the voice hot path.
+    """
+    s = (text or "").strip()
+    now = now_utc or datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+
+    # Defaults (configurable)
+    default_days = int((os.getenv("LONGTERM_MEMORY_DEFAULT_LOOKBACK_DAYS", "7") or "7").strip() or "7")
+    start = now - timedelta(days=default_days)
+    end = now
+
+    # Relative times: "5 minutes ago", "2 hours ago"
+    m = _re.search(r"\b(\d{1,3})\s*(minute|minutes|hour|hours|day|days)\s*ago\b", s, flags=_re.I)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        if "minute" in unit:
+            start = now - timedelta(minutes=n)
+        elif "hour" in unit:
+            start = now - timedelta(hours=n)
+        elif "day" in unit:
+            start = now - timedelta(days=n)
+
+    # Named windows
+    low = s.lower()
+    if "yesterday" in low:
+        local_now = now.astimezone(NY_TZ)
+        y = (local_now - timedelta(days=1)).date()
+        start_local = datetime(y.year, y.month, y.day, 0, 0, 0, tzinfo=NY_TZ)
+        end_local = datetime(y.year, y.month, y.day, 23, 59, 59, tzinfo=NY_TZ)
+        start = _utc(start_local)
+        end = _utc(end_local)
+    elif "today" in low:
+        local_now = now.astimezone(NY_TZ)
+        d = local_now.date()
+        start_local = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=NY_TZ)
+        start = _utc(start_local)
+        end = now
+    elif "last week" in low:
+        start = now - timedelta(days=7)
+    elif "last month" in low:
+        start = now - timedelta(days=30)
+
+    # Topic tags (very small set for now)
+    tag = None
+    if "favorite color" in low or "favourite colour" in low or "favorite colour" in low:
+        tag = "favorite_color"
+    elif "weather" in low or "forecast" in low:
+        tag = "weather"
+    elif "email" in low or "gmail" in low or "inbox" in low:
+        tag = "gmail_summary"
+
+    # Keywords
+    toks = [_t for _t in _re.split(r"[^a-zA-Z0-9_]+", low) if _t]
+    kws: list[str] = []
+    for t in toks:
+        if len(t) < 3:
+            continue
+        if t in _STOPWORDS:
+            continue
+        kws.append(t)
+    # De-dupe while preserving order
+    seen=set()
+    keywords=[]
+    for k in kws:
+        if k in seen:
+            continue
+        seen.add(k)
+        keywords.append(k)
+
+    return MemoryQuery(start_utc=_utc(start), end_utc=_utc(end), keywords=keywords[:12], tag=tag)
+
+def search_memory_events(
+    db: Any,
+    *,
+    tenant_uuid: str,
+    caller_id: str,
+    q: MemoryQuery,
+    limit: int = 12,
+):
+    """Cheap SQLAlchemy query for relevant memory events (time + keywords + optional tag)."""
+    if CallerMemoryEvent is None:
+        return []
+
+    qry = (
+        db.query(CallerMemoryEvent)
+        .filter(CallerMemoryEvent.tenant_id == str(tenant_uuid))
+        .filter(CallerMemoryEvent.caller_id == str(caller_id))
+        .filter(CallerMemoryEvent.created_at >= q.start_utc.replace(tzinfo=None))
+        .filter(CallerMemoryEvent.created_at <= q.end_utc.replace(tzinfo=None))
+    )
+
+    if q.tag:
+        # Prefer tag match; fall back to skill_key match
+        try:
+            qry = qry.filter(
+                (CallerMemoryEvent.skill_key == q.tag) | (CallerMemoryEvent.tags_json.contains([q.tag]))
+            )
+        except Exception:
+            qry = qry.filter(CallerMemoryEvent.skill_key == q.tag)
+
+    if q.keywords:
+        clauses = []
+        for kw in q.keywords:
+            clauses.append(CallerMemoryEvent.text.ilike(f"%{kw}%"))
+        try:
+            from sqlalchemy import or_
+            qry = qry.filter(or_(*clauses))
+        except Exception:
+            pass
+
+    return qry.order_by(CallerMemoryEvent.created_at.desc()).limit(int(limit)).all()
+
+def extract_favorite_color(text: str) -> str | None:
+    """Extracts a favorite color value from a user utterance."""
+    s = (text or "").strip()
+    m = _re.search(r"\bfavo(?:u)?rite\s+colou?r\s+(?:is|=)\s+([a-zA-Z]+)\b", s, flags=_re.I)
+    if not m:
+        m = _re.search(r"\bmy\s+favo(?:u)?rite\s+colou?r\s+(?:is|=)\s+([a-zA-Z]+)\b", s, flags=_re.I)
+    if m:
+        return m.group(1).strip().lower()
+    return None
+
+
 # -------------------------
 # Backwards-compatible API
 # -------------------------

@@ -141,6 +141,27 @@ def get_caller_cache(
             age_s = int((now - (row.updated_at or row.created_at)).total_seconds())
         except Exception:
             age_s = -1
+
+        # If the TTL env changed since this cache row was written, enforce the CURRENT TTL
+        # using age_s as a fallback guard (prevents old rows with long expires_at lingering).
+        if age_s >= 0 and age_s > CALLER_MEMORY_TTL_S:
+            if CALLER_MEMORY_DEBUG:
+                logger.info(
+                    "CALLER_MEM_TTL_EXPIRED_BY_AGE skill=%s hash=%s age_s=%s ttl_s=%s tenant_id=%s caller_id=%s",
+                    skill_key,
+                    cache_key_hash[:8],
+                    age_s,
+                    CALLER_MEMORY_TTL_S,
+                    str(tenant_id),
+                    caller_id_norm,
+                )
+            try:
+                db.query(CallerSkillCache).filter(CallerSkillCache.id == row.id).delete()
+                db.commit()
+            except Exception:
+                db.rollback()
+            return None
+
         logger.info(
             "CALLER_MEM_HIT skill=%s hash=%s age_s=%s tenant_id=%s caller_id=%s",
             skill_key,
