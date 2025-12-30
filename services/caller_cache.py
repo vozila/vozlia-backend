@@ -112,11 +112,15 @@ def get_caller_cache(
         return None
 
     if CALLER_MEMORY_DEBUG:
+        try:
+            age_s = int((now - (row.updated_at or row.created_at)).total_seconds())
+        except Exception:
+            age_s = -1
         logger.info(
             "CALLER_MEM_HIT skill=%s hash=%s age_s=%s tenant_id=%s caller_id=%s",
             skill_key,
             cache_key_hash[:8],
-            int((now - (row.updated_at or row.created_at)).total_seconds()),
+            age_s,
             str(tenant_id),
             caller_id_norm,
         )
@@ -138,6 +142,12 @@ def put_caller_cache(
     result_json: Dict[str, Any],
     ttl_s: int = CALLER_MEMORY_TTL_S,
 ) -> None:
+    """Write caller-scoped cache entry.
+
+    Important: We opportunistically delete *expired* rows **before** we upsert. This avoids a race where
+    an expired row is loaded + updated in-memory, but then a bulk delete (based on stale DB state)
+    deletes it before flush/commit, which can trigger SQLAlchemy's StaleDataError.
+    """
     if not (CALLER_MEMORY_ENABLED and tenant_id and caller_id and skill_key and cache_key_hash):
         return
     if not is_skill_allowed(skill_key):
@@ -150,6 +160,18 @@ def put_caller_cache(
     ttl_s_i = max(60, int(ttl_s or CALLER_MEMORY_TTL_S))  # at least 60s
     now = datetime.utcnow()
     expires_at = now + timedelta(seconds=ttl_s_i)
+
+    # Opportunistic cleanup of old rows (cheap, bounded to this tenant+caller)
+    # NOTE: Do this BEFORE reading/updating the target row to avoid StaleDataError.
+    try:
+        db.query(CallerSkillCache).filter(
+            CallerSkillCache.tenant_id == tenant_id,
+            CallerSkillCache.caller_id == caller_id_norm,
+            CallerSkillCache.expires_at <= now,
+        ).delete(synchronize_session=False)
+    except Exception:
+        # Cleanup failures shouldn't block writes.
+        logger.debug("CALLER_MEM_CLEANUP_FAILED", exc_info=True)
 
     row = (
         db.query(CallerSkillCache)
@@ -178,17 +200,6 @@ def put_caller_cache(
             expires_at=expires_at,
         )
         db.add(row)
-
-    # Opportunistic cleanup of old rows (cheap, bounded to this tenant+caller)
-    try:
-        db.query(CallerSkillCache).filter(
-            CallerSkillCache.tenant_id == tenant_id,
-            CallerSkillCache.caller_id == caller_id_norm,
-            CallerSkillCache.expires_at <= now,
-        ).delete(synchronize_session=False)
-    except Exception:
-        # Cleanup failures shouldn't block writes.
-        logger.debug("CALLER_MEM_CLEANUP_FAILED", exc_info=True)
 
     try:
         db.commit()
