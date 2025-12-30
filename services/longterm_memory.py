@@ -141,7 +141,10 @@ def fetch_recent_memory_text(
     caller_id: str,
     limit: int = 8,
 ) -> str:
-    """Returns a compact memory block for prompt injection."""
+    """Returns a compact memory block for prompt injection.
+
+    Note: We default to excluding assistant turns to keep the injected context high-signal.
+    """
     if CallerMemoryEvent is None:
         return ""
     tenant_id = str(tenant_uuid or "")
@@ -151,20 +154,26 @@ def fetch_recent_memory_text(
         return ""
 
     max_chars = int((os.getenv("LONGTERM_MEMORY_CONTEXT_MAX_CHARS", "1200") or "1200").strip() or 1200)
+    include_assistant = (os.getenv("LONGTERM_MEMORY_CONTEXT_INCLUDE_ASSISTANT", "0") or "0").strip() == "1"
 
     try:
-        rows = (
+        q = (
             db.query(CallerMemoryEvent)
             .filter(CallerMemoryEvent.tenant_id == tenant_id)
             .filter(CallerMemoryEvent.caller_id == str(caller_id))
-            .order_by(CallerMemoryEvent.created_at.desc())
+        )
+        if not include_assistant:
+            q = q.filter(CallerMemoryEvent.skill_key != "turn_assistant")
+
+        rows = (
+            q.order_by(CallerMemoryEvent.created_at.desc())
             .limit(int(limit or 8))
             .all()
         )
 
         lines = []
         for r in rows:
-            ts = r.created_at.isoformat(timespec="seconds")
+            ts = r.created_at.isoformat(timespec="seconds") if getattr(r, "created_at", None) else ""
             lines.append(f"- [{ts}] ({r.skill_key}) {r.text}")
 
         block = "\n".join(lines).strip()
@@ -172,7 +181,13 @@ def fetch_recent_memory_text(
             block = block[:max_chars] + "…"
 
         if (os.getenv("VOZLIA_DEBUG_MEMORY", "0") or "0").strip() == "1" and block:
-            logger.info("MEMORY_CONTEXT_READY tenant_id=%s caller_id=%s rows=%s chars=%s", tenant_id, caller_id, len(rows), len(block))
+            logger.info(
+                "MEMORY_CONTEXT_READY tenant_id=%s caller_id=%s rows=%s chars=%s",
+                tenant_id,
+                caller_id,
+                len(rows),
+                len(block),
+            )
 
         return block
     except Exception as e:
@@ -180,159 +195,88 @@ def fetch_recent_memory_text(
         return ""
 
 
-
 # -------------------------
-# Memory recall helpers
+# Turn capture (Option A: write everything)
 # -------------------------
-from dataclasses import dataclass
-from zoneinfo import ZoneInfo
-import re as _re
-
-NY_TZ = ZoneInfo(os.getenv("VOZLIA_TZ", "America/New_York") or "America/New_York")
-
-_STOPWORDS = {
-    "the","a","an","and","or","to","of","in","on","for","with","at","from","by","about","is","are","was","were",
-    "i","me","my","you","your","we","our","it","that","this","what","did","say","ago","last","time","talked",
-    "please","vozlia","hey","hi","hello","remind","remember",
-}
-
-@dataclass
-class MemoryQuery:
-    start_utc: datetime
-    end_utc: datetime
-    keywords: list[str]
-    tag: str | None = None
-
-def _utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=ZoneInfo("UTC"))
-    return dt.astimezone(ZoneInfo("UTC"))
-
-def parse_memory_query(text: str, *, now_utc: datetime | None = None) -> MemoryQuery:
-    """
-    Very lightweight parser: detects rough time windows + keywords.
-    This is intentionally cheap (no heavy NLP) and safe for the voice hot path.
-    """
-    s = (text or "").strip()
-    now = now_utc or datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
-
-    # Defaults (configurable)
-    default_days = int((os.getenv("LONGTERM_MEMORY_DEFAULT_LOOKBACK_DAYS", "7") or "7").strip() or "7")
-    start = now - timedelta(days=default_days)
-    end = now
-
-    # Relative times: "5 minutes ago", "2 hours ago"
-    m = _re.search(r"\b(\d{1,3})\s*(minute|minutes|hour|hours|day|days)\s*ago\b", s, flags=_re.I)
-    if m:
-        n = int(m.group(1))
-        unit = m.group(2).lower()
-        if "minute" in unit:
-            start = now - timedelta(minutes=n)
-        elif "hour" in unit:
-            start = now - timedelta(hours=n)
-        elif "day" in unit:
-            start = now - timedelta(days=n)
-
-    # Named windows
-    low = s.lower()
-    if "yesterday" in low:
-        local_now = now.astimezone(NY_TZ)
-        y = (local_now - timedelta(days=1)).date()
-        start_local = datetime(y.year, y.month, y.day, 0, 0, 0, tzinfo=NY_TZ)
-        end_local = datetime(y.year, y.month, y.day, 23, 59, 59, tzinfo=NY_TZ)
-        start = _utc(start_local)
-        end = _utc(end_local)
-    elif "today" in low:
-        local_now = now.astimezone(NY_TZ)
-        d = local_now.date()
-        start_local = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=NY_TZ)
-        start = _utc(start_local)
-        end = now
-    elif "last week" in low:
-        start = now - timedelta(days=7)
-    elif "last month" in low:
-        start = now - timedelta(days=30)
-
-    # Topic tags (very small set for now)
-    tag = None
-    if "favorite color" in low or "favourite colour" in low or "favorite colour" in low:
-        tag = "favorite_color"
-    elif "weather" in low or "forecast" in low:
-        tag = "weather"
-    elif "email" in low or "gmail" in low or "inbox" in low:
-        tag = "gmail_summary"
-
-    # Keywords
-    toks = [_t for _t in _re.split(r"[^a-zA-Z0-9_]+", low) if _t]
-    kws: list[str] = []
-    for t in toks:
-        if len(t) < 3:
-            continue
-        if t in _STOPWORDS:
-            continue
-        kws.append(t)
-    # De-dupe while preserving order
-    seen=set()
-    keywords=[]
-    for k in kws:
-        if k in seen:
-            continue
-        seen.add(k)
-        keywords.append(k)
-
-    return MemoryQuery(start_utc=_utc(start), end_utc=_utc(end), keywords=keywords[:12], tag=tag)
-
-def search_memory_events(
+def record_turn_event(
     db: Any,
     *,
     tenant_uuid: str,
     caller_id: str,
-    q: MemoryQuery,
-    limit: int = 12,
-):
-    """Cheap SQLAlchemy query for relevant memory events (time + keywords + optional tag)."""
-    if CallerMemoryEvent is None:
-        return []
+    call_sid: str | None,
+    role: str,
+    raw_text: str,
+    extra: Optional[dict[str, _Any]] = None,
+) -> bool:
+    """Write a *turn* event (user or assistant) with normalized text + meta tags.
 
-    qry = (
-        db.query(CallerMemoryEvent)
-        .filter(CallerMemoryEvent.tenant_id == str(tenant_uuid))
-        .filter(CallerMemoryEvent.caller_id == str(caller_id))
-        .filter(CallerMemoryEvent.created_at >= q.start_utc.replace(tzinfo=None))
-        .filter(CallerMemoryEvent.created_at <= q.end_utc.replace(tzinfo=None))
+    - Stores cleaned text in `text` (filler removed)
+    - Stores original text in data_json['raw_text']
+    """
+    if not (os.getenv("LONGTERM_MEMORY_CAPTURE_TURNS", "1") or "1").strip() == "1":
+        return False
+
+    try:
+        from services.memory_enricher import strip_fillers, extract_facts, build_tags
+    except Exception as e:
+        logger.warning("MEMORY_ENRICHER_IMPORT_FAIL err=%s", e)
+        return False
+
+    raw = (raw_text or "").strip()
+    if not raw:
+        return False
+
+    clean, tokens, keywords = strip_fillers(raw)
+    facts = extract_facts(raw)
+    tags = build_tags(role=role, keywords=keywords, facts=facts)
+
+    data_json = dict(extra or {})
+    data_json.update(
+        {
+            "raw_text": raw,
+            "clean_text": clean,
+            "tokens": tokens[:80],
+            "keywords": keywords[:40],
+            "facts": facts,
+            "role": role,
+        }
     )
 
-    if q.tag:
-        # Prefer tag match; fall back to skill_key match
-        try:
-            qry = qry.filter(
-                (CallerMemoryEvent.skill_key == q.tag) | (CallerMemoryEvent.tags_json.contains([q.tag]))
-            )
-        except Exception:
-            qry = qry.filter(CallerMemoryEvent.skill_key == q.tag)
+    ok = write_memory_event(
+        db,
+        tenant_uuid=str(tenant_uuid),
+        caller_id=str(caller_id),
+        call_sid=call_sid,
+        skill_key=str(role),
+        text=clean or raw,
+        data_json=data_json,
+        tags_json=tags,
+    )
 
-    if q.keywords:
-        clauses = []
-        for kw in q.keywords:
-            clauses.append(CallerMemoryEvent.text.ilike(f"%{kw}%"))
-        try:
-            from sqlalchemy import or_
-            qry = qry.filter(or_(*clauses))
-        except Exception:
-            pass
+    if (os.getenv("VOZLIA_DEBUG_MEMORY", "0") or "0").strip() == "1":
+        logger.info(
+            "MEMORY_TURN_WRITE role=%s ok=%s tenant_id=%s caller_id=%s call_sid=%s chars_raw=%s chars_clean=%s facts=%s",
+            role,
+            ok,
+            str(tenant_uuid),
+            str(caller_id),
+            call_sid or None,
+            len(raw),
+            len(clean),
+            facts,
+        )
+    return ok
 
-    return qry.order_by(CallerMemoryEvent.created_at.desc()).limit(int(limit)).all()
 
-def extract_favorite_color(text: str) -> str | None:
-    """Extracts a favorite color value from a user utterance."""
-    s = (text or "").strip()
-    m = _re.search(r"\bfavo(?:u)?rite\s+colou?r\s+(?:is|=)\s+([a-zA-Z]+)\b", s, flags=_re.I)
-    if not m:
-        m = _re.search(r"\bmy\s+favo(?:u)?rite\s+colou?r\s+(?:is|=)\s+([a-zA-Z]+)\b", s, flags=_re.I)
-    if m:
-        return m.group(1).strip().lower()
+def extract_fact_from_tags(tags: list[str] | None, fact_key: str) -> str | None:
+    """Parse fact value from tags like 'fact:favorite_color=green'."""
+    if not tags or not fact_key:
+        return None
+    prefix = f"fact:{fact_key}="
+    for t in tags:
+        if isinstance(t, str) and t.startswith(prefix):
+            return t[len(prefix):].strip() or None
     return None
-
 
 # -------------------------
 # Backwards-compatible API
