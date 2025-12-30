@@ -47,6 +47,20 @@ _CALLER_CACHE_SKILLS_RAW = (os.getenv("CALLER_CACHE_SKILLS") or "gmail_summary")
 CALLER_CACHE_SKILLS = {s.strip() for s in _CALLER_CACHE_SKILLS_RAW.split(",") if s.strip()}
 
 
+
+
+# Log configuration once at import time so env issues are visible in Render logs.
+try:
+    logger.info(
+        "CALLER_CACHE_CONFIG enabled=%s debug=%s ttl_s=%s skills=%s",
+        CALLER_MEMORY_ENABLED,
+        CALLER_MEMORY_DEBUG,
+        CALLER_MEMORY_TTL_S,
+        sorted(CALLER_CACHE_SKILLS),
+    )
+except Exception:
+    pass
+
 def normalize_caller_id(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
@@ -78,8 +92,19 @@ def get_caller_cache(
     cache_key_hash: str,
 ) -> Optional[Dict[str, Any]]:
     if not (CALLER_MEMORY_ENABLED and tenant_id and caller_id and skill_key and cache_key_hash):
+        if CALLER_MEMORY_DEBUG:
+            logger.info(
+                "CALLER_MEM_SKIP preconditions enabled=%s tenant=%s caller=%s skill=%s hash=%s",
+                CALLER_MEMORY_ENABLED,
+                bool(tenant_id),
+                bool(caller_id),
+                bool(skill_key),
+                bool(cache_key_hash),
+            )
         return None
     if not is_skill_allowed(skill_key):
+        if CALLER_MEMORY_DEBUG:
+            logger.info("CALLER_MEM_SKIP skill_not_allowed skill=%s allowed=%s", skill_key, sorted(CALLER_CACHE_SKILLS))
         return None
 
     now = datetime.utcnow()
@@ -149,6 +174,15 @@ def put_caller_cache(
     deletes it before flush/commit, which can trigger SQLAlchemy's StaleDataError.
     """
     if not (CALLER_MEMORY_ENABLED and tenant_id and caller_id and skill_key and cache_key_hash):
+        if CALLER_MEMORY_DEBUG:
+            logger.info(
+                "CALLER_MEM_SKIP_WRITE preconditions enabled=%s tenant=%s caller=%s skill=%s hash=%s",
+                CALLER_MEMORY_ENABLED,
+                bool(tenant_id),
+                bool(caller_id),
+                bool(skill_key),
+                bool(cache_key_hash),
+            )
         return
     if not is_skill_allowed(skill_key):
         return
