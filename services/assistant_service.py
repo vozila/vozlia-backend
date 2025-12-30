@@ -21,9 +21,12 @@ from services.caller_cache import (
     put_caller_cache,
     normalize_caller_id,
 )
+from services.memory_controller import parse_memory_query, search_memory_events
+
 from services.longterm_memory import (
     longterm_memory_enabled_for_tenant,
     fetch_recent_memory_text,
+    write_memory_event,
     record_skill_result,
 )
 
@@ -71,7 +74,73 @@ def run_assistant_route(
     caller_id = normalize_caller_id(from_number)
     gmail_data_fresh = False  # safe default; set True only when Gmail fetch occurs
 
-    # Long-term memory context (durable, per tenant + caller_id)
+    
+    # Optional: persist user turns as memory events (OFF by default).
+    capture_turns = (os.getenv("LONGTERM_MEMORY_CAPTURE_TURNS", "0") or "0").strip() == "1"
+    if capture_turns and caller_id and tenant_uuid:
+        try:
+            # Store the user's utterance (trimmed) for future recall.
+            user_txt = (text or "").strip()
+            if user_txt:
+                write_memory_event(
+                    db,
+                    tenant_uuid=str(tenant_uuid),
+                    caller_id=caller_id,
+                    call_sid=str(call_id) if call_id else None,
+                    skill_key="chitchat_turn_user",
+                    text=user_txt[:800],
+                    data_json={"kind": "user_turn"},
+                    tags=None,
+                    expires_in_s=None,
+                )
+        except Exception:
+            logger.exception("MEMORY_CAPTURE_TURN_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+
+    # Backend-call: memory recall (Option A: stream.py unchanged; caller sets context.backend_call)
+    backend_call = None
+    if isinstance(ctx, dict):
+        backend_call = (ctx.get("backend_call") or "").strip().lower() or None
+
+    if backend_call == "memory_recall":
+        try:
+            if not (caller_id and tenant_id):
+                return {"spoken_reply": "I can try, but I don’t have enough context to look that up yet.", "fsm": {"mode": "memory_recall", "hits": 0}, "gmail": None}
+
+            mq = parse_memory_query(text)
+            hits = search_memory_events(db, tenant_id=tenant_id, caller_id=caller_id, q=mq, limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "8") or 8))
+
+            if not hits:
+                return {
+                    "spoken_reply": "I don’t see any saved notes about that yet. Which report or date are you referring to?",
+                    "fsm": {"mode": "memory_recall", "hits": 0},
+                    "gmail": None,
+                }
+
+            # Compose a short, speakable answer grounded in evidence snippets.
+            # Keep it brief; details are available in evidence.
+            snippets = []
+            for h in reversed(hits[:3]):  # oldest-first
+                sk = (h.get("skill_key") or "memory").strip()
+                txt = (h.get("text") or "").strip()
+                if txt:
+                    snippets.append(f"{sk}: {txt}")
+
+            spoken = "Here’s what I found: " + " / ".join(snippets)
+
+            return {
+                "spoken_reply": spoken,
+                "fsm": {"mode": "memory_recall", "hits": len(hits), "evidence": hits},
+                "gmail": None,
+            }
+        except Exception:
+            logger.exception("MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+            return {
+                "spoken_reply": "I tried to look that up, but something went wrong. Can you try again with a bit more detail?",
+                "fsm": {"mode": "memory_recall", "error": "exception"},
+                "gmail": None,
+            }
+
+# Long-term memory context (durable, per tenant + caller_id)
     memory_context = ""
     longterm_enabled = False
     try:
