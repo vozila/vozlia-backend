@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import os
 import random
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import datetime, timedelta
+from typing import Any, Optional, Any as _Any
 
 from core.logging import logger
 
-# Rollback-safe import: if the model isn't present, we fail-open and disable.
 try:
     from models import CallerMemoryEvent  # type: ignore
 except Exception as e:
@@ -16,82 +15,123 @@ except Exception as e:
     logger.warning("LONGTERM_MEMORY_DISABLED (missing CallerMemoryEvent): %s", e)
 
 
-DEBUG_MEMORY = (os.getenv("VOZLIA_DEBUG_MEMORY", "0") or "0").strip() == "1"
-
-# Configurable retention policy (days). Set to 0 to disable retention purge.
-RETENTION_DAYS = int((os.getenv("LONGTERM_MEMORY_RETENTION_DAYS", "30") or "30").strip() or 30)
-
-# Limit how much memory text we inject into the FSM context (prevents prompt bloat).
-CONTEXT_MAX_CHARS = int((os.getenv("LONGTERM_MEMORY_CONTEXT_MAX_CHARS", "1200") or "1200").strip() or 1200)
-
-# Keep the old allowlist/blocklist semantics.
 def longterm_memory_enabled_for_tenant(tenant_uuid: str) -> bool:
-    if not tenant_uuid:
+    if CallerMemoryEvent is None:
         return False
-    default_on = (os.getenv("LONGTERM_MEMORY_ENABLED_DEFAULT", "0") or "0").strip() == "1"
+
+    default_on = (os.getenv("LONGTERM_MEMORY_ENABLED_DEFAULT", "0") or "0").strip().lower() in ("1","true","yes","on")
     allowlist = (os.getenv("LONGTERM_MEMORY_TENANT_ALLOWLIST", "") or "").strip()
     blocklist = (os.getenv("LONGTERM_MEMORY_TENANT_BLOCKLIST", "") or "").strip()
 
     if blocklist:
-        blocked = {t.strip() for t in blocklist.split(",") if t.strip()}
+        blocked = {t.strip() for t in blocklist.split(",") if t.strip() and "<" not in t and ">" not in t}
         if tenant_uuid in blocked:
             return False
 
     if allowlist:
-        allowed = {t.strip() for t in allowlist.split(",") if t.strip()}
+        allowed = {t.strip() for t in allowlist.split(",") if t.strip() and "<" not in t and ">" not in t}
         return tenant_uuid in allowed
 
     return default_on
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+def _retention_days() -> int:
+    try:
+        return int((os.getenv("LONGTERM_MEMORY_RETENTION_DAYS", "30") or "30").strip())
+    except Exception:
+        return 30
 
 
-def purge_expired_memory(db: Any, *, tenant_id: str, caller_id: Optional[str] = None) -> int:
-    """Best-effort retention purge. Never raises."""
+def _purge_prob() -> float:
+    try:
+        return float((os.getenv("LONGTERM_MEMORY_PURGE_PROB", "0.03") or "0.03").strip())
+    except Exception:
+        return 0.03
+
+
+def purge_expired_memory(db: Any, *, tenant_uuid: str) -> int:
+    """Best-effort purge; returns deleted row count."""
     if CallerMemoryEvent is None:
         return 0
-    if not tenant_id:
+    if not longterm_memory_enabled_for_tenant(tenant_uuid):
         return 0
+
+    days = _retention_days()
+    if days <= 0:
+        return 0
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    try:
+        q = db.query(CallerMemoryEvent).filter(CallerMemoryEvent.tenant_id == str(tenant_uuid)).filter(CallerMemoryEvent.created_at < cutoff)
+        deleted = q.delete(synchronize_session=False)
+        db.commit()
+        logger.info("MEMORY_PURGE_OK tenant_id=%s deleted=%s retention_days=%s", tenant_uuid, deleted, days)
+        return int(deleted or 0)
+    except Exception as e:
+        db.rollback()
+        logger.exception("MEMORY_PURGE_FAIL tenant_id=%s err=%s", tenant_uuid, e)
+        return 0
+
+
+def write_memory_event(
+    db: Any,
+    *,
+    tenant_uuid: str,
+    caller_id: str,
+    call_sid: str | None,
+    skill_key: str,
+    text: str,
+    data_json: Optional[dict[str, _Any]] = None,
+    tags_json: Optional[list[str]] = None,
+) -> bool:
+    """Best-effort insert. Never raise to callers."""
+    if CallerMemoryEvent is None:
+        return False
+    tenant_id = str(tenant_uuid or "")
+    if not tenant_id or not caller_id:
+        return False
+    if not longterm_memory_enabled_for_tenant(tenant_id):
+        return False
+
+    body = (text or "").strip()
+    if not body:
+        return False
+
+    # Clamp to avoid bloat
+    max_chars = int((os.getenv("LONGTERM_MEMORY_EVENT_MAX_CHARS", "1200") or "1200").strip() or 1200)
+    if len(body) > max_chars:
+        body = body[:max_chars] + "…"
 
     try:
-        q = db.query(CallerMemoryEvent).filter(CallerMemoryEvent.tenant_id == tenant_id)
+        row = CallerMemoryEvent(
+            tenant_id=tenant_id,
+            caller_id=str(caller_id),
+            call_sid=(str(call_sid) if call_sid else None),
+            skill_key=str(skill_key or "unknown"),
+            text=body,
+            data_json=data_json,
+            tags_json=tags_json,
+        )
+        db.add(row)
+        db.commit()
 
-        if caller_id:
-            q = q.filter(CallerMemoryEvent.caller_id == caller_id)
-
-        now = _utcnow()
-
-        # Expiration-based purge
-        q_exp = q.filter(CallerMemoryEvent.expires_at.isnot(None)).filter(CallerMemoryEvent.expires_at < now)
-        deleted_exp = q_exp.delete(synchronize_session=False)
-
-        deleted_ret = 0
-        if RETENTION_DAYS and RETENTION_DAYS > 0:
-            cutoff = now - timedelta(days=RETENTION_DAYS)
-            q_ret = q.filter(CallerMemoryEvent.created_at < cutoff)
-            deleted_ret = q_ret.delete(synchronize_session=False)
-
-        total = int((deleted_exp or 0) + (deleted_ret or 0))
-        if total:
-            db.commit()
+        if (os.getenv("VOZLIA_DEBUG_MEMORY", "0") or "0").strip() == "1":
             logger.info(
-                "MEMORY_PURGE_OK tenant_id=%s caller_id=%s deleted=%s retention_days=%s",
-                tenant_id,
-                caller_id or None,
-                total,
-                RETENTION_DAYS,
+                "MEMORY_WRITE_OK tenant_id=%s caller_id=%s call_sid=%s skill=%s chars=%s tags=%s",
+                tenant_id, caller_id, call_sid or None, skill_key, len(body), (tags_json or []),
             )
-        return total
+        else:
+            logger.info("MEMORY_WRITE_OK tenant_id=%s caller_id=%s skill=%s chars=%s", tenant_id, caller_id, skill_key, len(body))
+
+        # Probabilistic purge
+        if random.random() < _purge_prob():
+            purge_expired_memory(db, tenant_uuid=tenant_id)
+
+        return True
     except Exception as e:
-        # Fail-open. Never block calls.
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        logger.warning("MEMORY_PURGE_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id or None, e)
-        return 0
+        db.rollback()
+        logger.exception("MEMORY_WRITE_FAIL tenant_id=%s caller_id=%s skill=%s err=%s", tenant_id, caller_id, skill_key, e)
+        return False
 
 
 def fetch_recent_memory_text(
@@ -101,140 +141,69 @@ def fetch_recent_memory_text(
     caller_id: str,
     limit: int = 8,
 ) -> str:
-    """Returns a compact text block for FSM context injection."""
+    """Returns a compact memory block for prompt injection."""
     if CallerMemoryEvent is None:
         return ""
-    if not longterm_memory_enabled_for_tenant(tenant_uuid):
+    tenant_id = str(tenant_uuid or "")
+    if not tenant_id or not caller_id:
         return ""
-    if not caller_id:
+    if not longterm_memory_enabled_for_tenant(tenant_id):
         return ""
 
-    tenant_id = str(tenant_uuid)
+    max_chars = int((os.getenv("LONGTERM_MEMORY_CONTEXT_MAX_CHARS", "1200") or "1200").strip() or 1200)
 
     try:
-        now = _utcnow()
-        q = (
+        rows = (
             db.query(CallerMemoryEvent)
             .filter(CallerMemoryEvent.tenant_id == tenant_id)
-            .filter(CallerMemoryEvent.caller_id == caller_id)
-            .filter((CallerMemoryEvent.expires_at.is_(None)) | (CallerMemoryEvent.expires_at >= now))
+            .filter(CallerMemoryEvent.caller_id == str(caller_id))
             .order_by(CallerMemoryEvent.created_at.desc())
             .limit(int(limit or 8))
+            .all()
         )
-        rows = q.all() or []
-        if not rows:
-            return ""
 
-        # Oldest-first for readability in prompt context
-        rows = list(reversed(rows))
-
-        parts: list[str] = []
+        lines = []
         for r in rows:
-            ts = (r.created_at or now).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-            sk = (r.skill_key or "memory").strip()
-            txt = (r.text or "").strip()
-            if not txt:
-                continue
-            line = f"[{ts}] ({sk}) {txt}"
-            parts.append(line)
+            ts = r.created_at.isoformat(timespec="seconds")
+            lines.append(f"- [{ts}] ({r.skill_key}) {r.text}")
 
-        out = "\n".join(parts).strip()
-        if not out:
-            return ""
+        block = "\n".join(lines).strip()
+        if len(block) > max_chars:
+            block = block[:max_chars] + "…"
 
-        if len(out) > CONTEXT_MAX_CHARS:
-            out = out[-CONTEXT_MAX_CHARS:]
-            # Trim to a clean line boundary
-            nl = out.find("\n")
-            if nl != -1 and nl < 200:
-                out = out[nl + 1 :]
+        if (os.getenv("VOZLIA_DEBUG_MEMORY", "0") or "0").strip() == "1" and block:
+            logger.info("MEMORY_CONTEXT_READY tenant_id=%s caller_id=%s rows=%s chars=%s", tenant_id, caller_id, len(rows), len(block))
 
-        if DEBUG_MEMORY:
-            logger.info(
-                "MEMORY_CONTEXT_READY tenant_id=%s caller_id=%s rows=%s chars=%s",
-                tenant_id,
-                caller_id,
-                len(rows),
-                len(out),
-            )
-        return out
-
+        return block
     except Exception as e:
-        logger.warning("MEMORY_CONTEXT_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
+        logger.exception("MEMORY_CONTEXT_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
         return ""
 
 
-def write_memory_event(
+# -------------------------
+# Backwards-compatible API
+# -------------------------
+def record_skill_result(
     db: Any,
     *,
     tenant_uuid: str,
     caller_id: str,
-    call_sid: Optional[str],
     skill_key: str,
-    text: str,
-    data_json: Optional[dict[str, Any]] = None,
-    tags: Optional[list[str]] = None,
+    input_text: str | None = None,
+    memory_text: str = "",
+    data_json: Optional[dict[str, _Any]] = None,
     expires_in_s: Optional[int] = None,
 ) -> bool:
-    """Best-effort durable memory write. Never raises."""
-    if CallerMemoryEvent is None:
-        return False
-    if not longterm_memory_enabled_for_tenant(str(tenant_uuid)):
-        return False
-
-    tenant_id = str(tenant_uuid)
-    if not (tenant_id and caller_id and skill_key and (text or "").strip()):
-        return False
-
-    try:
-        now = _utcnow()
-        expires_at = None
-        if expires_in_s is not None and int(expires_in_s) > 0:
-            expires_at = now + timedelta(seconds=int(expires_in_s))
-
-        row = CallerMemoryEvent(
-            tenant_id=tenant_id,
-            caller_id=caller_id,
-            call_sid=call_sid,
-            skill_key=skill_key,
-            text=(text or "").strip(),
-            data_json=data_json,
-            tags_json=tags or None,
-            created_at=now,
-            expires_at=expires_at,
-        )
-        db.add(row)
-        db.commit()
-
-        if DEBUG_MEMORY:
-            logger.info(
-                "MEMORY_WRITE_OK tenant_id=%s caller_id=%s call_sid=%s skill_key=%s chars=%s tags=%s",
-                tenant_id,
-                caller_id,
-                call_sid or None,
-                skill_key,
-                len((text or "").strip()),
-                len(tags or []),
-            )
-
-        # Opportunistic retention purge (best-effort, low frequency).
-        # Tune with LONGTERM_MEMORY_PURGE_PROB (default 0.03 = ~3% of writes).
-        p = float((os.getenv("LONGTERM_MEMORY_PURGE_PROB", "0.03") or "0.03").strip() or 0.03)
-        if p > 0 and random.random() < p:
-            purge_expired_memory(db, tenant_id=tenant_id, caller_id=caller_id)
-
-        return True
-    except Exception as e:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        logger.warning(
-            "MEMORY_WRITE_FAIL tenant_id=%s caller_id=%s call_sid=%s skill_key=%s err=%s",
-            str(tenant_uuid),
-            caller_id,
-            call_sid or None,
-            skill_key,
-            e,
-        )
-        return False
+    """Compat shim used by assistant_service; persists a skill outcome as a memory event."""
+    _ = input_text  # reserved for later
+    _ = expires_in_s  # reserved for later (future per-event TTL)
+    return write_memory_event(
+        db,
+        tenant_uuid=str(tenant_uuid),
+        caller_id=str(caller_id),
+        call_sid=None,
+        skill_key=str(skill_key or "skill"),
+        text=(memory_text or "").strip(),
+        data_json=data_json,
+        tags_json=[str(skill_key or "skill")],
+    )

@@ -1,29 +1,31 @@
 # services/memory_controller.py
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from core.logging import logger
-
-try:
-    from models import CallerMemoryEvent  # type: ignore
-except Exception:
-    CallerMemoryEvent = None  # type: ignore
-
-
-DEBUG_MEMORY = (os.getenv("VOZLIA_DEBUG_MEMORY", "0") or "0").strip() == "1"
+from models import CallerMemoryEvent
 
 
 @dataclass
 class MemoryQuery:
-    start_ts: Optional[datetime] = None
-    end_ts: Optional[datetime] = None
-    skill_key: Optional[str] = None
-    keywords: list[str] = None  # type: ignore
+    start_ts: datetime
+    end_ts: datetime
+    skill_key: str | None
+    keywords: list[str]
+    raw_text: str
+
+
+_TIME_PATTERNS = [
+    # (regex, days_back)
+    (re.compile(r"\b(yesterday)\b", re.I), 1),
+    (re.compile(r"\b(last\s+week)\b", re.I), 7),
+    (re.compile(r"\b(last\s+month)\b", re.I), 30),
+    (re.compile(r"\b(last\s+\d+)\s+days\b", re.I), None),
+]
 
 
 def _utcnow() -> datetime:
@@ -31,39 +33,37 @@ def _utcnow() -> datetime:
 
 
 def parse_memory_query(text: str) -> MemoryQuery:
-    t = (text or "").lower()
+    raw = (text or "").strip()
     now = _utcnow()
-
-    start = None
+    start = now - timedelta(days=30)
     end = now
 
-    # Time parsing (minimal, expandable)
-    if "yesterday" in t:
-        start = now - timedelta(days=1)
-    elif "last week" in t:
-        start = now - timedelta(days=7)
-    elif "last month" in t:
-        start = now - timedelta(days=30)
-    elif "last day" in t or "past day" in t:
-        start = now - timedelta(days=1)
-    elif "past" in t and "hours" in t:
-        m = re.search(r"past\s+(\d{1,2})\s+hours", t)
-        if m:
-            start = now - timedelta(hours=int(m.group(1)))
+    # Time parsing (MVP)
+    m = re.search(r"\b(last)\s+(\d+)\s+days\b", raw, re.I)
+    if m:
+        n = int(m.group(2))
+        start = now - timedelta(days=max(1, min(n, 365)))
+    else:
+        for rx, days in _TIME_PATTERNS:
+            if rx.search(raw):
+                if days is not None:
+                    start = now - timedelta(days=days)
+                break
 
-    # Topic/skill inference (simple)
+    # Topic inference (MVP)
     skill = None
-    if any(w in t for w in ["weather", "forecast", "temperature", "rain", "snow"]):
+    low = raw.lower()
+    if any(w in low for w in ["weather", "forecast", "temperature", "rain", "snow"]):
         skill = "weather"
-    elif any(w in t for w in ["email", "inbox", "gmail"]):
+    elif any(w in low for w in ["email", "inbox", "gmail"]):
         skill = "gmail_summary"
 
-    # Keywords: simple token extraction
-    toks = re.findall(r"[a-zA-Z0-9_\-']{3,}", t)
-    stop = {"what", "did", "say", "about", "that", "this", "last", "week", "yesterday", "previous", "call", "remind", "me", "we", "talked", "past", "hours", "month", "day"}
-    keywords = [x for x in toks if x not in stop][:12]
+    # Keyword extraction (cheap)
+    tokens = re.findall(r"[a-zA-Z0-9_]{3,}", low)
+    stop = {"what","did","say","about","that","this","last","week","yesterday","remind","me","we","talked","previous","call","report"}
+    kws = [t for t in tokens if t not in stop][:12]
 
-    return MemoryQuery(start_ts=start, end_ts=end, skill_key=skill, keywords=keywords)
+    return MemoryQuery(start_ts=start, end_ts=end, skill_key=skill, keywords=kws, raw_text=raw)
 
 
 def search_memory_events(
@@ -72,59 +72,31 @@ def search_memory_events(
     tenant_id: str,
     caller_id: str,
     q: MemoryQuery,
-    limit: int = 8,
-) -> list[dict[str, Any]]:
-    if CallerMemoryEvent is None:
-        return []
-    if not (tenant_id and caller_id):
+    limit: int = 12,
+) -> list[CallerMemoryEvent]:
+    # Defensive: if DB missing, return empty
+    if not tenant_id or not caller_id:
         return []
 
-    now = _utcnow()
-    qry = (
+    # Base query
+    qq = (
         db.query(CallerMemoryEvent)
         .filter(CallerMemoryEvent.tenant_id == tenant_id)
         .filter(CallerMemoryEvent.caller_id == caller_id)
-        .filter((CallerMemoryEvent.expires_at.is_(None)) | (CallerMemoryEvent.expires_at >= now))
+        .filter(CallerMemoryEvent.created_at >= q.start_ts.replace(tzinfo=None))
+        .filter(CallerMemoryEvent.created_at <= q.end_ts.replace(tzinfo=None))
     )
 
-    if q.start_ts is not None:
-        qry = qry.filter(CallerMemoryEvent.created_at >= q.start_ts)
-    if q.end_ts is not None:
-        qry = qry.filter(CallerMemoryEvent.created_at <= q.end_ts)
-
     if q.skill_key:
-        # Match either exact skill_key or tag-ish matches like "weather:*"
-        qry = qry.filter(CallerMemoryEvent.skill_key.ilike(f"%{q.skill_key}%"))
+        qq = qq.filter(CallerMemoryEvent.skill_key == q.skill_key)
 
-    # Keyword filters (ILIKE AND). Cheap and good enough for MVP.
+    # MVP keyword filter: OR over ILIKE
     if q.keywords:
-        for kw in q.keywords:
-            qry = qry.filter(CallerMemoryEvent.text.ilike(f"%{kw}%"))
+        ors = []
+        for kw in q.keywords[:8]:
+            ors.append(CallerMemoryEvent.text.ilike(f"%{kw}%"))
+        from sqlalchemy import or_
+        qq = qq.filter(or_(*ors))
 
-    rows = qry.order_by(CallerMemoryEvent.created_at.desc()).limit(int(limit or 8)).all() or []
-
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        out.append(
-            {
-                "id": str(getattr(r, "id", "")),
-                "created_at": (r.created_at or now).astimezone(timezone.utc).isoformat(),
-                "skill_key": r.skill_key,
-                "text": r.text,
-                "call_sid": r.call_sid,
-                "data_json": r.data_json,
-                "tags": r.tags_json,
-            }
-        )
-
-    if DEBUG_MEMORY:
-        logger.info(
-            "MEMORY_SEARCH_OK tenant_id=%s caller_id=%s hits=%s skill=%s kws=%s",
-            tenant_id,
-            caller_id,
-            len(out),
-            q.skill_key,
-            len(q.keywords or []),
-        )
-
-    return out
+    rows = qq.order_by(CallerMemoryEvent.created_at.desc()).limit(limit).all()
+    return rows
