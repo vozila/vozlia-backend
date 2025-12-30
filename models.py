@@ -190,49 +190,30 @@ class CallerSkillCache(Base):
     )
 
 
+
 # =========================
-# Durable caller memory (long-term)
+# Long-term Memory Events
 # =========================
+
+from sqlalchemy import Column, String, DateTime, Text, JSON, Index
+from datetime import datetime as _dt
 
 class CallerMemoryEvent(Base):
     __tablename__ = "caller_memory_events"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String, index=True, nullable=False)
+    caller_id = Column(String, index=True, nullable=False)
+    call_sid = Column(String, index=True, nullable=True)
 
-    # Multi-tenant (tenant_id == user.id string)
-    tenant_id = Column(String, nullable=False, index=True)
+    created_at = Column(DateTime, default=_dt.utcnow, index=True, nullable=False)
 
-    # Per-caller (E.164 normalized, e.g. +15551234567)
-    caller_id = Column(String, nullable=False, index=True)
-
-    # Call/session identifiers (optional but helpful)
-    call_sid = Column(String, nullable=True, index=True)
-
-    # What produced this memory row (skill key, chitchat turn, etc.)
-    skill_key = Column(String, nullable=False, index=True)
-
-    # Human-readable snippet/summary
+    skill_key = Column(String, index=True, nullable=False)
     text = Column(Text, nullable=False)
 
-    # Structured payload (skill outputs, extracted fields, tags)
-    data_json = Column(JSONB, nullable=True)
-    tags_json = Column(JSONB, nullable=True)
+    data_json = Column(JSON, nullable=True)
+    tags_json = Column(JSON, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
-    expires_at = Column(DateTime, nullable=True, index=True)
-
-
-Index(
-    "ix_caller_memory_events_tenant_caller_created",
-    CallerMemoryEvent.tenant_id,
-    CallerMemoryEvent.caller_id,
-    CallerMemoryEvent.created_at.desc(),
-)
-
-Index(
-    "ix_caller_memory_events_tenant_caller_skill_created",
-    CallerMemoryEvent.tenant_id,
-    CallerMemoryEvent.caller_id,
-    CallerMemoryEvent.skill_key,
-    CallerMemoryEvent.created_at.desc(),
-)
+# Helpful composite indexes for time-scoped recall
+Index("ix_mem_tenant_caller_created", CallerMemoryEvent.tenant_id, CallerMemoryEvent.caller_id, CallerMemoryEvent.created_at.desc())
+Index("ix_mem_tenant_caller_skill_created", CallerMemoryEvent.tenant_id, CallerMemoryEvent.caller_id, CallerMemoryEvent.skill_key, CallerMemoryEvent.created_at.desc())
