@@ -31,6 +31,8 @@ INTENT_GREETING = "greeting"
 INTENT_CHECK_EMAIL = "check_email"
 INTENT_SMALL_TALK = "small_talk"
 INTENT_GENERIC_HELP = "generic_help"
+INTENT_MEMORY_STORE = "memory_store"
+INTENT_MEMORY_RECALL = "memory_recall"
 INTENT_UNKNOWN = "unknown"
 
 
@@ -152,6 +154,17 @@ class VozliaFSM:
             self.to_small_talk()
             spoken_reply = self._handle_small_talk(cleaned)
 
+
+        elif intent == INTENT_MEMORY_STORE:
+            # Let backend persist the fact; keep spoken reply short as a fallback.
+            self.to_small_talk()
+            backend_call = {"type": "memory_store", "text": cleaned}
+            spoken_reply = "Got it — I’ll remember that."
+
+        elif intent == INTENT_MEMORY_RECALL:
+            self.to_small_talk()
+            backend_call = {"type": "memory_recall"}
+            spoken_reply = "Let me check what you told me."
         elif intent == INTENT_GENERIC_HELP:
             self.to_generic_help()
             spoken_reply = (
@@ -187,6 +200,32 @@ class VozliaFSM:
         will already be very smart. The FSM just nudges clear patterns
         into explicit backend actions.
         """
+
+        # Memory store / recall (long-term memory)
+        # Store: "remember my favorite color is green"
+        if any(p in lowered for p in [
+            "please remember",
+            "remember that",
+            "remember this",
+            "note that",
+            "my favorite color is",
+            "my favourite colour is",
+            "my favorite colour is",
+            "my favourite color is",
+        ]):
+            return INTENT_MEMORY_STORE
+
+        # Recall: "what did I say my favorite color was 5 minutes ago?"
+        if any(p in lowered for p in [
+            "what did i say",
+            "remind me",
+            "do you remember",
+            "what was my",
+            "what is my",
+        ]) and ("favorite color" in lowered or "favourite colour" in lowered or "favorite colour" in lowered):
+            return INTENT_MEMORY_RECALL
+        if ("favorite color" in lowered or "favourite colour" in lowered or "favorite colour" in lowered) and ("ago" in lowered or "last time" in lowered):
+            return INTENT_MEMORY_RECALL
 
         # Check email / inbox / unread
         email_keywords = [
