@@ -36,12 +36,31 @@ from services.gmail_service import get_default_gmail_account_id, summarize_gmail
 
 
 def _looks_like_memory_question(text: str) -> bool:
-    t = (text or "").lower()
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    # Explicit recall phrasing
     if "what did i say" in t or "remind me" in t or "last time" in t or "previous call" in t:
         return True
-    if "favorite color" in t:
-        return True
+
+    # Avoid treating memory *store* utterances as recall questions.
+    if ("favorite color" in t or "favourite colour" in t) and "remember" in t and (" is " in t or t.endswith("?") is False):
+        if any(p in t for p in [
+            "my favorite color is",
+            "my favourite colour is",
+            "remember that my favorite color is",
+            "remember my favorite color is",
+        ]):
+            return False
+
+    # Favorite color recall (question-like only)
+    if ("favorite color" in t or "favourite colour" in t):
+        if "what" in t or "which" in t or "remind" in t or t.endswith("?"):
+            return True
+
     return False
+
 
 
 def _answer_favorite_color(rows) -> str | None:
@@ -142,36 +161,144 @@ def run_assistant_route(
         )
 
     # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
-    if longterm_enabled and caller_id and tenant_uuid:
+        # -------------------------
+    # AUTO memory question handling (facts-first for MVP)
+    # -------------------------
+    if longterm_enabled and caller_id and tenant_uuid and _looks_like_memory_question(text):
+        from services.memory_controller import (
+            parse_memory_query,
+            search_memory_events,
+            infer_fact_key,
+            fetch_fact_history,
+        )
+
         try:
-            memory_context = fetch_recent_memory_text(
-                db,
-                tenant_uuid=tenant_uuid,
-                caller_id=caller_id,
-                limit=int(os.getenv("LONGTERM_MEMORY_CONTEXT_LIMIT", "8") or 8),
-            )
-            if debug and memory_context:
-                logger.info(
-                    "LONGTERM_MEM_CONTEXT_READY tenant_id=%s caller_id=%s chars=%s",
-                    tenant_id,
-                    caller_id,
-                    len(memory_context),
+            qmem = parse_memory_query(text or "")
+
+            # 1) Facts-first: if the question maps to a known fact key (e.g., favorite_color),
+            # answer deterministically from stored facts (no guessing).
+            fact_key = infer_fact_key(text or "")
+            if fact_key:
+                facts = fetch_fact_history(
+                    db,
+                    tenant_id=str(tenant_uuid),
+                    caller_id=str(caller_id),
+                    fact_key=fact_key,
+                    start_ts=qmem.start_ts,
+                    end_ts=qmem.end_ts,
+                    limit=int(os.getenv("LONGTERM_FACT_RECALL_LIMIT", "8") or 8),
                 )
+
+                if facts:
+                    newest = facts[0]
+                    newest_val = (newest.get("value") or "").strip()
+
+                    distinct: list[str] = []
+                    for f in facts:
+                        v = (f.get("value") or "").strip()
+                        if v and v not in distinct:
+                            distinct.append(v)
+
+                    label = "favorite color" if fact_key == "favorite_color" else fact_key.replace("_", " ")
+
+                    if newest_val and len(distinct) == 1:
+                        return {
+                            "spoken_reply": f"You told me your {label} is {newest_val}.",
+                            "fsm": {
+                                "mode": "memory_fact",
+                                "fact_key": fact_key,
+                                "value": newest_val,
+                                "as_of": newest.get("created_at_iso"),
+                            },
+                            "gmail": None,
+                        }
+
+                    if newest_val and len(distinct) > 1:
+                        choices = []
+                        for f in facts[:3]:
+                            v = (f.get("value") or "").strip()
+                            ts = f.get("created_at_iso") or ""
+                            if v:
+                                choices.append(f"{v} (as of {ts})")
+                        choice_str = "; ".join(choices) if choices else ", ".join(distinct[:3])
+                        return {
+                            "spoken_reply": f"I have a couple different answers for your {label}: {choice_str}. Which one should I use going forward?",
+                            "fsm": {
+                                "mode": "memory_fact_conflict",
+                                "fact_key": fact_key,
+                                "values": distinct[:5],
+                                "evidence": facts[:3],
+                            },
+                            "gmail": None,
+                        }
+
+                # No fact hits: fail-soft WITHOUT guessing.
+                label = "favorite color" if fact_key == "favorite_color" else fact_key.replace("_", " ")
+                return {
+                    "spoken_reply": f"I couldn’t find your {label} in my notes. What did you want it to be?",
+                    "fsm": {"mode": "memory_fact", "fact_key": fact_key, "status": "no_hits"},
+                    "gmail": None,
+                }
+
+            # 2) Fallback: evidence snippets for generic “what did I say” questions.
+            rows = search_memory_events(
+                db,
+                tenant_id=str(tenant_uuid),
+                caller_id=str(caller_id),
+                q=qmem,
+                limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "50") or 50),
+            )
         except Exception as e:
-            memory_context = ""
-            logger.exception("LONGTERM_MEM_CONTEXT_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
+            logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
+            rows = []
+
+        if not rows:
+            if debug:
+                logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (text or "")[:200])
+            return {
+                "spoken_reply": "I couldn’t find that in my recent history. Can you repeat it, or give me a slightly wider timeframe?",
+                "fsm": {"mode": "memory_recall", "status": "no_hits"},
+                "gmail": None,
+            }
+
+        snippets = []
+        for r in rows[:4]:
+            try:
+                ts = r.created_at.isoformat(timespec="seconds")
+            except Exception:
+                ts = ""
+            snippets.append(f"[{ts}] {r.text}")
+
+        spoken = "Here’s what I found: " + " … ".join(snippets[:3])
+        if len(snippets) > 3:
+            spoken += " …and I found a few more related notes."
+
+        return {
+            "spoken_reply": spoken,
+            "fsm": {
+                "mode": "memory_recall",
+                "has_evidence": True,
+                "hits": len(rows),
+                "skill_key": qmem.skill_key,
+                "keywords": qmem.keywords,
+                "evidence": snippets,
+            },
+            "gmail": None,
+        }
+
 
     # Capture *every* user turn (best-effort; fail-open)
     if longterm_enabled and capture_turns and caller_id and tenant_uuid:
         ok = record_turn_event(
             db,
-            tenant_id=str(tenant_uuid),
+            tenant_uuid=str(tenant_uuid),
             caller_id=str(caller_id),
             call_sid=str(call_id) if call_id else None,
-            session_id=str(call_id) if call_id else None,  # stable per-call correlation
+            session_id=str(call_id) if call_id else None,
             role="user",
             text=text or "",
         )
+
         if debug:
             logger.info("MEMORY_CAPTURE_TURN_USER ok=%s tenant_id=%s caller_id=%s", ok, tenant_id, caller_id)
 
@@ -495,7 +622,7 @@ def run_assistant_route(
                 try:
                     record_skill_result(
                         db,
-                        tenant_id=tenant_uuid,
+                        tenant_uuid=tenant_uuid,
                         caller_id=caller_id,
                         skill_key="gmail_summary",
                         input_text=text,
