@@ -1,12 +1,20 @@
 # services/settings_service.py
 from __future__ import annotations
 
-from typing import Optional
+import os
+from typing import Any, Optional
+
 from sqlalchemy.orm import Session
 
 from models import User, UserSetting
 
-DEFAULTS = {
+DEFAULT_GMAIL_SUMMARY_LLM_PROMPT = (
+    "You are Vozlia. Given email metadata (subject, sender, snippet, date), "
+    "produce a VERY short spoken-style summary (1–3 sentences). "
+    "Do NOT read email addresses or long codes out loud."
+)
+
+DEFAULTS: dict[str, dict[str, Any]] = {
     "agent_greeting": {"text": "Hello! How can I assist you today?"},
     "gmail_summary_enabled": {"enabled": True},
     "gmail_account_id": {"account_id": "d8c8cd99-c9bc-4e8c-a560-d220782665a1"},
@@ -14,57 +22,60 @@ DEFAULTS = {
         "text": (
             "CALL OPENING RULE (FIRST UTTERANCE ONLY): "
             "Greet the caller and introduce yourself as Vozlia in one short sentence. "
-            "Example: \"Hello, you're speaking with Vozlia — how can I help today?\" "
+            'Example: "Hello, you\'re speaking with Vozlia — how can I help today?" '
             "Do not repeat the brand intro after the first utterance."
         )
     },
+    # NEW (modular): per-skill configuration
+    "skills_config": {
+        "skills": {
+            "gmail_summary": {
+                "enabled": True,
+                "add_to_greeting": False,
+                "engagement_phrases": ["email summaries"],
+                "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
+            }
+        }
+    },
 }
 
-def get_realtime_prompt_addendum(db: Session, user: User) -> str:
-    v = get_setting(db, user, "realtime_prompt_addendum")
-    txt = (v or {}).get("text")
-    if isinstance(txt, str) and txt.strip():
-        return txt.strip()
-    return DEFAULTS["realtime_prompt_addendum"]["text"]
+
+def _get_setting_row(db: Session, user: User, key: str) -> Optional[UserSetting]:
+    return db.query(UserSetting).filter(UserSetting.user_id == user.id, UserSetting.key == key).first()
 
 
 def get_setting(db: Session, user: User, key: str) -> dict:
-    row = (
-        db.query(UserSetting)
-        .filter(UserSetting.user_id == user.id, UserSetting.key == key)
-        .first()
-    )
+    row = _get_setting_row(db, user, key)
     if row and isinstance(row.value, dict):
         return row.value
     return DEFAULTS.get(key, {})
 
-def set_setting(db: Session, user: User, key: str, value: dict) -> dict:
-    row = (
-        db.query(UserSetting)
-        .filter(UserSetting.user_id == user.id, UserSetting.key == key)
-        .first()
-    )
+
+def set_setting(db: Session, user: User, key: str, value: dict) -> None:
+    row = _get_setting_row(db, user, key)
     if row:
-        row.value = value
+        row.value = value or {}
     else:
-        row = UserSetting(user_id=user.id, key=key, value=value)
+        row = UserSetting(user_id=user.id, key=key, value=value or {})
         db.add(row)
 
-    db.commit()
-    db.refresh(row)
-    return row.value
 
+# -----------------------------
+# Core settings
+# -----------------------------
 def get_agent_greeting(db: Session, user: User) -> str:
     v = get_setting(db, user, "agent_greeting")
-    txt = (v or {}).get("text")
-    if isinstance(txt, str) and txt.strip():
-        return txt.strip()
-    return DEFAULTS["agent_greeting"]["text"]
+    t = (v or {}).get("text")
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    return str(DEFAULTS["agent_greeting"]["text"])
+
 
 def gmail_summary_enabled(db: Session, user: User) -> bool:
     v = get_setting(db, user, "gmail_summary_enabled")
     enabled = (v or {}).get("enabled")
     return bool(True if enabled is None else enabled)
+
 
 def get_selected_gmail_account_id(db: Session, user: User) -> Optional[str]:
     v = get_setting(db, user, "gmail_account_id")
@@ -74,41 +85,106 @@ def get_selected_gmail_account_id(db: Session, user: User) -> Optional[str]:
     return None
 
 
+def get_realtime_prompt_addendum(db: Session, user: User) -> str:
+    v = get_setting(db, user, "realtime_prompt_addendum")
+    t = (v or {}).get("text")
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    return str(DEFAULTS["realtime_prompt_addendum"]["text"])
 
-def get_enabled_gmail_account_ids(db: Session, user: User) -> list[str]:
-    """Return allow-listed Gmail account IDs for the agent, if configured.
 
-    Storage formats supported:
-      - JSON array: ["uuid1","uuid2"]
-      - JSON object: {"account_ids": ["uuid1","uuid2"]}
-      - Empty / null means: no allowlist configured (treat as 'all active Gmail accounts').
-    """
-    v = get_setting(db, user, "gmail_enabled_account_ids")
-    ids: list[str] = []
-    if isinstance(v, list):
-        ids = [str(x).strip() for x in v if str(x).strip()]
-    elif isinstance(v, dict):
-        raw = v.get("account_ids") or v.get("ids") or []
-        if isinstance(raw, list):
-            ids = [str(x).strip() for x in raw if str(x).strip()]
-    seen = set()
-    out: list[str] = []
-    for x in ids:
-        if x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out
-# ---------------------------------------------------------------------------
-# Lightweight service wrapper for admin router compatibility.
-# The backend itself can continue using the function helpers above.
-# ---------------------------------------------------------------------------
+# -----------------------------
+# NEW: Skill config helpers
+# -----------------------------
+def get_skills_config(db: Session, user: User) -> dict[str, dict]:
+    v = get_setting(db, user, "skills_config")
+    skills = (v or {}).get("skills")
+    if isinstance(skills, dict):
+        out: dict[str, dict] = {}
+        for k, cfg in skills.items():
+            if isinstance(k, str) and isinstance(cfg, dict):
+                out[k] = cfg
+        return out
+    return dict(DEFAULTS["skills_config"]["skills"])
 
-from db import SessionLocal
-from services.user_service import get_or_create_primary_user
+
+def get_skill_config(db: Session, user: User, skill_id: str) -> dict:
+    skills = get_skills_config(db, user)
+    base = dict(DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
+    override = skills.get(skill_id)
+    if isinstance(override, dict):
+        base.update(override)
+    return base
+
+
+def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> dict[str, dict]:
+    current = get_skills_config(db, user)
+    base = dict(current.get(skill_id) or DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
+    for k in ("enabled", "add_to_greeting", "engagement_phrases", "llm_prompt"):
+        if k in patch:
+            base[k] = patch[k]
+    current[skill_id] = base
+    set_setting(db, user, "skills_config", {"skills": current})
+    return current
+
+
+def get_gmail_summary_llm_prompt(db: Session, user: User) -> str:
+    cfg = get_skill_config(db, user, "gmail_summary")
+    p = (cfg or {}).get("llm_prompt")
+    if isinstance(p, str) and p.strip():
+        return p.strip()
+    return DEFAULT_GMAIL_SUMMARY_LLM_PROMPT
+
+
+def get_gmail_summary_engagement_phrases(db: Session, user: User) -> list[str]:
+    cfg = get_skill_config(db, user, "gmail_summary")
+    phrases = (cfg or {}).get("engagement_phrases")
+    if isinstance(phrases, list):
+        return [str(x).strip() for x in phrases if str(x).strip()]
+    return []
+
+
+def gmail_summary_add_to_greeting(db: Session, user: User) -> bool:
+    cfg = get_skill_config(db, user, "gmail_summary")
+    return bool((cfg or {}).get("add_to_greeting") or False)
+
+
+# -----------------------------
+# NEW: Memory toggles (DB overrides, env fallback when unset)
+# -----------------------------
+def shortterm_memory_enabled(db: Session, user: User) -> bool:
+    row = _get_setting_row(db, user, "shortterm_memory_enabled")
+    if row and isinstance(row.value, dict) and "enabled" in row.value:
+        return bool(row.value.get("enabled"))
+    # env fallback preserves current behavior (memory_facade defaults to ON)
+    return (os.getenv("SESSION_MEMORY_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def longterm_memory_enabled(db: Session, user: User) -> bool:
+    row = _get_setting_row(db, user, "longterm_memory_enabled")
+    if row and isinstance(row.value, dict) and "enabled" in row.value:
+        return bool(row.value.get("enabled"))
+    # env fallback preserves current behavior (longterm defaults to OFF)
+    return (os.getenv("LONGTERM_MEMORY_ENABLED_DEFAULT") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_memory_engagement_phrases(db: Session, user: User) -> list[str]:
+    v = get_setting(db, user, "memory_engagement_phrases")
+    phrases = (v or {}).get("phrases")
+    if isinstance(phrases, list):
+        return [str(x).strip() for x in phrases if str(x).strip()]
+    return []
+
+
+# -----------------------------
+# Legacy class wrapper (kept for compatibility)
+# -----------------------------
+from db import SessionLocal  # noqa: E402
+from services.user_service import get_or_create_primary_user  # noqa: E402
 
 
 class SettingsService:
-    def get_current_settings(self) -> dict:
+    def get_settings(self) -> dict:
         db = SessionLocal()
         try:
             user = get_or_create_primary_user(db)
@@ -117,36 +193,53 @@ class SettingsService:
                 "gmail_summary_enabled": gmail_summary_enabled(db, user),
                 "gmail_account_id": (get_selected_gmail_account_id(db, user) or DEFAULTS["gmail_account_id"]["account_id"]),
                 "realtime_prompt_addendum": get_realtime_prompt_addendum(db, user),
+                "skills_config": get_skills_config(db, user),
+                "shortterm_memory_enabled": shortterm_memory_enabled(db, user),
+                "longterm_memory_enabled": longterm_memory_enabled(db, user),
+                "memory_engagement_phrases": get_memory_engagement_phrases(db, user),
             }
         finally:
             db.close()
 
-    def update_settings(self, patch: dict) -> dict:
+    def patch_settings(self, patch: dict) -> dict:
         db = SessionLocal()
         try:
             user = get_or_create_primary_user(db)
 
-            if "agent_greeting" in patch:
-                set_setting(db, user, "agent_greeting", {"text": str(patch["agent_greeting"])})
+            if "agent_greeting" in patch and patch["agent_greeting"] is not None:
+                set_setting(db, user, "agent_greeting", {"text": str(patch["agent_greeting"]).strip()})
+
             if "gmail_summary_enabled" in patch:
                 set_setting(db, user, "gmail_summary_enabled", {"enabled": bool(patch["gmail_summary_enabled"])})
+
             if "gmail_account_id" in patch:
-                # allow explicit selection
                 v = patch["gmail_account_id"]
                 if v is None:
                     set_setting(db, user, "gmail_account_id", {"account_id": DEFAULTS["gmail_account_id"]["account_id"]})
                 else:
-                    set_setting(db, user, "gmail_account_id", {"account_id": str(v)})
-            if "realtime_prompt_addendum" in patch:
-                set_setting(db, user, "realtime_prompt_addendum", {"text": str(patch["realtime_prompt_addendum"])})
+                    set_setting(db, user, "gmail_account_id", {"account_id": str(v).strip()})
+
+            if "realtime_prompt_addendum" in patch and patch["realtime_prompt_addendum"] is not None:
+                set_setting(db, user, "realtime_prompt_addendum", {"text": str(patch["realtime_prompt_addendum"]).strip()})
+
+            if "skills_config" in patch and isinstance(patch["skills_config"], dict):
+                for sid, cfg in patch["skills_config"].items():
+                    if isinstance(sid, str) and isinstance(cfg, dict):
+                        patch_skill_config(db, user, sid, cfg)
+
+            if "shortterm_memory_enabled" in patch:
+                set_setting(db, user, "shortterm_memory_enabled", {"enabled": bool(patch["shortterm_memory_enabled"])})
+
+            if "longterm_memory_enabled" in patch:
+                set_setting(db, user, "longterm_memory_enabled", {"enabled": bool(patch["longterm_memory_enabled"])})
+
+            if "memory_engagement_phrases" in patch:
+                phrases = patch.get("memory_engagement_phrases")
+                cleaned = [str(x).strip() for x in phrases if str(x).strip()] if isinstance(phrases, list) else []
+                set_setting(db, user, "memory_engagement_phrases", {"phrases": cleaned})
 
             db.commit()
-            return {
-                "agent_greeting": get_agent_greeting(db, user),
-                "gmail_summary_enabled": gmail_summary_enabled(db, user),
-                "gmail_account_id": (get_selected_gmail_account_id(db, user) or DEFAULTS["gmail_account_id"]["account_id"]),
-                "realtime_prompt_addendum": get_realtime_prompt_addendum(db, user),
-            }
+            return self.get_settings()
         finally:
             db.close()
 
