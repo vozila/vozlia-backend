@@ -40,12 +40,24 @@ def _looks_like_memory_question(text: str) -> bool:
     if not t:
         return False
 
-    # Explicit recall phrasing
-    if "what did i say" in t or "remind me" in t or "last time" in t or "previous call" in t:
+    # Strong recall phrasing
+    if any(p in t for p in [
+        "what did i say",
+        "remind me",
+        "last time",
+        "previous call",
+        "earlier today",
+        "earlier on",
+        "mentioned earlier",
+        "that i mentioned",
+        "you mentioned",
+        "did i mention",
+    ]):
         return True
 
-    # Avoid treating memory *store* utterances as recall questions.
-    if ("favorite color" in t or "favourite colour" in t) and "remember" in t and (" is " in t or t.endswith("?") is False):
+    # Favorite color recall (question-like only)
+    if ("favorite color" in t or "favourite colour" in t):
+        # avoid treating store utterances as recall
         if any(p in t for p in [
             "my favorite color is",
             "my favourite colour is",
@@ -53,13 +65,16 @@ def _looks_like_memory_question(text: str) -> bool:
             "remember my favorite color is",
         ]):
             return False
-
-    # Favorite color recall (question-like only)
-    if ("favorite color" in t or "favourite colour" in t):
         if "what" in t or "which" in t or "remind" in t or t.endswith("?"):
             return True
 
+    # Generic "what X was" questions often imply recall
+    if t.endswith("?") and any(q in t for q in ["what", "which", "where", "when", "who", "how"]):
+        if any(p in t for p in ["mentioned", "said", "told you", "earlier", "before"]):
+            return True
+
     return False
+
 
 
 
