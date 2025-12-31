@@ -104,10 +104,12 @@ def write_memory_event(
         body = body[:max_chars] + "…"
 
     try:
+        kind_val = "turn" if str(skill_key or "").lower().startswith("turn_") else "skill"
         row = CallerMemoryEvent(
             tenant_id=tenant_id,
             caller_id=str(caller_id),
             call_sid=(str(call_sid) if call_sid else None),
+            kind=kind_val,
             skill_key=str(skill_key or "unknown"),
             text=body,
             data_json=data_json,
@@ -122,7 +124,8 @@ def write_memory_event(
                 tenant_id, caller_id, call_sid or None, skill_key, len(body), (tags_json or []),
             )
         else:
-            logger.info("MEMORY_WRITE_OK tenant_id=%s caller_id=%s skill=%s chars=%s", tenant_id, caller_id, skill_key, len(body))
+            caller_tail = (str(caller_id)[-4:] if caller_id else "----")
+            logger.info("MEMORY_WRITE_OK tenant_id=%s caller_id=***%s skill=%s chars=%s", tenant_id[:8], caller_tail, skill_key, len(body))
 
         # Probabilistic purge
         if random.random() < _purge_prob():
@@ -131,7 +134,8 @@ def write_memory_event(
         return True
     except Exception as e:
         db.rollback()
-        logger.exception("MEMORY_WRITE_FAIL tenant_id=%s caller_id=%s skill=%s err=%s", tenant_id, caller_id, skill_key, e)
+        caller_tail = (str(caller_id)[-4:] if caller_id else "----")
+        logger.exception("MEMORY_WRITE_FAIL tenant_id=%s caller_id=***%s skill=%s err=%s", tenant_id[:8], caller_tail, skill_key, e)
         return False
 
 
