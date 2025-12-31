@@ -344,17 +344,11 @@ def summarize_gmail_for_assistant(
         return data
 
     try:
+        sys_prompt = get_gmail_summary_llm_prompt(db, current_user)
         resp = _client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Vozlia. Given email metadata (subject, sender, snippet, date), "
-                        "produce a VERY short spoken-style summary (1–3 sentences). "
-                        "Do NOT read email addresses or long codes out loud."
-                    ),
-                },
+                {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": "Recent emails:\n" + json.dumps(messages[:max_results], indent=2)},
             ],
         )
