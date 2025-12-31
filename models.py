@@ -206,6 +206,10 @@ class CallerMemoryEvent(Base):
     caller_id = Column(String, index=True, nullable=False)
     call_sid = Column(String, index=True, nullable=True)
 
+    # kind is required by the existing DB schema (NOT NULL). Used for quick filtering.
+    # Values: "turn" for conversational turns, "skill" for skill outputs, "event" fallback.
+    kind = Column(String, index=True, nullable=False, default="event")
+
     created_at = Column(DateTime, default=_dt.utcnow, index=True, nullable=False)
 
     skill_key = Column(String, index=True, nullable=False)
