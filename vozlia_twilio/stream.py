@@ -6,9 +6,8 @@ import base64
 import json
 import os
 import time
-from contextlib import suppress
 from typing import Optional
-from starlette.websockets import WebSocketState
+from contextlib import suppress
 from db import SessionLocal
 from services.user_service import get_or_create_primary_user
 #from services.settings_service import get_realtime_prompt_addendum
@@ -18,6 +17,7 @@ from services.settings_service import get_realtime_prompt_addendum, get_agent_gr
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from core.logging import logger
 
@@ -257,6 +257,21 @@ async def twilio_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Twilio media stream connected")
 
+    def _ws_can_send() -> bool:
+        """Return True if the Twilio WS is still open for sending."""
+        if twilio_ws_closed:
+            return False
+        try:
+            if getattr(websocket, "client_state", None) != WebSocketState.CONNECTED:
+                return False
+            if getattr(websocket, "application_state", None) != WebSocketState.CONNECTED:
+                return False
+        except Exception:
+            # If we can't read state, be conservative.
+            return False
+        return True
+
+
 
     # --- Call + AI state -----------------------------------------------------
     openai_ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -267,12 +282,6 @@ async def twilio_stream(websocket: WebSocket):
 
     barge_in_enabled: bool = False
     twilio_ws_closed: bool = False
-
-    def _ws_can_send() -> bool:
-        try:
-            return websocket.application_state == WebSocketState.CONNECTED
-        except Exception:
-            return True
     transcript_action_task: Optional[asyncio.Task] = None
     user_speaking_vad: bool = False
 
@@ -293,7 +302,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Helper: send μ-law audio TO Twilio ---------------------------------
     async def send_audio_to_twilio():
-        nonlocal audio_buffer, assistant_last_audio_time, twilio_ws_closed
+        nonlocal audio_buffer, assistant_last_audio_time
 
         if stream_sid is None:
             return
@@ -308,27 +317,21 @@ async def twilio_stream(websocket: WebSocket):
             "event": "media",
             "streamSid": stream_sid,
             "media": {"payload": payload},
-        }        if twilio_ws_closed or not _ws_can_send():
+        }
+        if not _ws_can_send():
             return
         try:
             await websocket.send_text(json.dumps(msg))
-        except RuntimeError as e:
-            # Starlette raises this if we try to send after websocket.close / response completed.
-            if "Unexpected ASGI message" in str(e) or ("websocket.send" in str(e) and "websocket.close" in str(e)):
-                logger.info("Twilio WS send after close (expected during teardown); stopping sender")
-            else:
-                logger.exception("Twilio WS send RuntimeError")
-            twilio_ws_closed = True
+        except RuntimeError:
+            # Can happen if the websocket is closing/closed (send after close).
             return
-        except Exception:
-            logger.exception("Twilio WS send failed; stopping sender")
-            twilio_ws_closed = True
+        except WebSocketDisconnect:
             return
         assistant_last_audio_time = time.monotonic()
 
     # --- Background task: paced audio sender to Twilio ----------------------
     async def twilio_audio_sender():
-        nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled
+        nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled, twilio_ws_closed
 
         send_start_ts: Optional[float] = None
         frame_idx: int = 0
@@ -340,6 +343,8 @@ async def twilio_stream(websocket: WebSocket):
 
         try:
             while True:
+                if twilio_ws_closed:
+                    return
                 if twilio_ws_closed:
                     return
                 if stream_sid is None:
@@ -433,20 +438,19 @@ async def twilio_stream(websocket: WebSocket):
     sender_task = asyncio.create_task(twilio_audio_sender())
 
     async def twilio_clear_buffer():
-        nonlocal twilio_ws_closed
-        if stream_sid is None or twilio_ws_closed or not _ws_can_send():
+        if stream_sid is None:
             return
         try:
-            await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
-        except RuntimeError as e:
-            if "Unexpected ASGI message" in str(e):
-                logger.info("Twilio clear after close (expected during teardown)")
-            else:
-                logger.exception("Twilio clear RuntimeError")
-            twilio_ws_closed = True
+            if not _ws_can_send():
+                return
+            try:
+                await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+            except RuntimeError:
+                return
+            except WebSocketDisconnect:
+                return
         except Exception:
             logger.exception("Failed to send Twilio clear")
-            twilio_ws_closed = True
 
     # --- Barge-in: local mute only ------------------------------------------
     async def handle_barge_in():
@@ -946,7 +950,7 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("SPEECH_CTRL_STOP_ERROR")
 
 
-                try:
+        try:
             sender_task.cancel()
             with suppress(asyncio.CancelledError):
                 await sender_task
