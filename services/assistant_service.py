@@ -521,29 +521,32 @@ def run_assistant_route(
     fsm_result: dict = fsm.handle_utterance(text, context=fsm_context)
 
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
+    backend_call: dict | None = fsm_result.get("backend_call") or None
+    gmail_data: dict | None = None
+
     if debug:
-        bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
+        bc_type = backend_call.get("type") if isinstance(backend_call, dict) else None
         logger.info(
             "ASSISTANT_ROUTE_FSM spoken_len=%s backend_call=%s fsm_keys=%s dt_ms=%s",
-            len(spoken_reply or ''),
+            len(spoken_reply or ""),
             bc_type,
             sorted(list(fsm_result.keys())) if isinstance(fsm_result, dict) else None,
             int((_time.perf_counter() - t0) * 1000),
         )
-    backend_call: dict | None = fsm_result.get("backend_call") or None
-    gmail_data: dict | None = None
+
+    # If user utterance matches configured Gmail phrases, trigger Gmail summary even if FSM didn't.
     if (not backend_call) and force_gmail_summary:
-    backend_call = {
-        "type": "gmail_summary",
-        "params": {"query": "is:unread", "max_results": 20},
-    }
-    # Keep behavior consistent with FSM email intent reply
-    spoken_reply = "Sure, I'll take a quick look at your recent unread emails."
-    try:
-        fsm_result = dict(fsm_result)
-        fsm_result["backend_call"] = backend_call
-    except Exception:
-        pass
+        backend_call = {
+            "type": "gmail_summary",
+            "params": {"query": "is:unread", "max_results": 20},
+        }
+        # Keep behavior consistent with FSM email intent reply
+        spoken_reply = "Sure, I'll take a quick look at your recent unread emails."
+        try:
+            fsm_result = dict(fsm_result)
+            fsm_result["backend_call"] = backend_call
+        except Exception:
+            pass
 
     # ----------------------------
     # (1) Existing FSM backend call behavior (no change)
