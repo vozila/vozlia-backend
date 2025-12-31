@@ -1,6 +1,15 @@
 # services/assistant_service.py
 from skills.engine import skills_engine_enabled, match_skill_id, execute_skill
-from services.settings_service import get_agent_greeting
+from services.settings_service import (
+    get_agent_greeting,
+    gmail_summary_enabled,
+    gmail_summary_add_to_greeting,
+    get_gmail_summary_engagement_phrases,
+    shortterm_memory_enabled,
+    longterm_memory_enabled,
+    get_memory_engagement_phrases,
+)
+
 import os
 import re
 from core.logging import logger
@@ -8,7 +17,6 @@ from skills.registry import skill_registry
 from sqlalchemy.orm import Session
 from models import User
 from vozlia_fsm import VozliaFSM
-from services.settings_service import gmail_summary_enabled
 from services.memory_facade import (
     memory,
     make_skill_cache_key_hash,
@@ -135,6 +143,24 @@ def run_assistant_route(
     t0 = _time.perf_counter()
     if debug:
         text_snip = (text[:200] + "…") if len(text or "") > 200 else (text or "")
+        text_l = (text or "").lower()
+
+        # Skill engagement phrases (Gmail Summary)
+        force_gmail_summary = False
+        try:
+            phrases = get_gmail_summary_engagement_phrases(db, current_user)
+            force_gmail_summary = any((p or "").strip().lower() in text_l for p in phrases)
+        except Exception:
+            force_gmail_summary = False
+
+        # Memory engagement phrases (force memory routing even if heuristics miss)
+        force_memory = False
+        try:
+            mphrases = get_memory_engagement_phrases(db, current_user)
+            force_memory = any((p or "").strip().lower() in text_l for p in mphrases)
+        except Exception:
+            force_memory = False
+
         logger.info("ASSISTANT_ROUTE_START user_id=%s account_id=%s text=%r context_keys=%s", getattr(current_user, "id", None), account_id, text_snip, sorted(list((context or {}).keys())))
 
     # Memory identifiers (used for session caching on transcript turns)
@@ -144,6 +170,12 @@ def run_assistant_route(
     call_id = None
     if isinstance(ctx, dict):
         call_id = ctx.get("call_sid") or ctx.get("stream_sid") or ctx.get("call_id")
+        # Short-term memory toggle: disable session cache without touching hot paths
+        try:
+            if not shortterm_memory_enabled(db, current_user):
+                call_id = None
+        except Exception:
+            pass
 
     # Caller identifier (for Postgres TTL cache across calls)
     from_number = None
@@ -156,9 +188,9 @@ def run_assistant_route(
     # LONGTERM MEMORY: config + context + capture turns (Option A)
     # -------------------------
     memory_context = ""
-    longterm_enabled = False
+    # Longterm memory toggle: DB overrides, env fallback happens inside settings_service
     try:
-        longterm_enabled = longterm_memory_enabled_for_tenant(tenant_id)
+        longterm_enabled = longterm_memory_enabled(db, current_user)
     except Exception as e:
         longterm_enabled = False
         if debug:
@@ -179,7 +211,7 @@ def run_assistant_route(
         # -------------------------
     # AUTO memory question handling (facts-first for MVP)
     # -------------------------
-    if longterm_enabled and caller_id and tenant_uuid and _looks_like_memory_question(text):
+    if longterm_enabled and caller_id and tenant_uuid and (force_memory or _looks_like_memory_question(text)):
         from services.memory_controller import (
             parse_memory_query,
             search_memory_events,
@@ -457,8 +489,27 @@ def run_assistant_route(
         }
 
     fsm = VozliaFSM()
-    # Portal-controlled greeting (admin-configurable)
-    fsm.greeting_text = get_agent_greeting(db, current_user)
+
+    base_greeting = get_agent_greeting(db, current_user)
+    greeting = base_greeting
+
+    # Optional: append the Gmail Summary skill greeting line to the greeting
+    try:
+        if gmail_summary_enabled(db, current_user) and gmail_summary_add_to_greeting(db, current_user):
+            sk = skill_registry.get("gmail_summary")
+            add = (getattr(sk, "greeting", "") or "").strip() if sk else ""
+            if add:
+                # keep spacing clean
+                greeting = (base_greeting or "").strip()
+                if greeting:
+                    greeting = greeting + (" " if not greeting.endswith(("!", ".", "?")) else " ") + add
+                else:
+                    greeting = add
+    except Exception:
+        pass
+
+    fsm.greeting_text = greeting
+
 
     fsm_context = context or {}
     if isinstance(fsm_context, dict) and memory_context:
@@ -481,6 +532,18 @@ def run_assistant_route(
         )
     backend_call: dict | None = fsm_result.get("backend_call") or None
     gmail_data: dict | None = None
+    if (not backend_call) and force_gmail_summary:
+    backend_call = {
+        "type": "gmail_summary",
+        "params": {"query": "is:unread", "max_results": 20},
+    }
+    # Keep behavior consistent with FSM email intent reply
+    spoken_reply = "Sure, I'll take a quick look at your recent unread emails."
+    try:
+        fsm_result = dict(fsm_result)
+        fsm_result["backend_call"] = backend_call
+    except Exception:
+        pass
 
     # ----------------------------
     # (1) Existing FSM backend call behavior (no change)
