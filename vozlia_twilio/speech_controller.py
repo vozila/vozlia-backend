@@ -290,12 +290,23 @@ class SpeechOutputController:
         if et == "error":
             # Attach last tool payload trace for immediate diagnosis.
             err = event.get("error") or {}
+            code = err.get("code")
+            message = err.get("message")
+
+            # Expected cancel race: we may send response.cancel after a response already ended.
+            # Don't page on-call / don't pollute error logs for this.
+            if code == "response_cancel_not_active":
+                logger.info("%s_REALTIME_CANCEL_RACE code=%s message=%s last_tool_trace_id=%s",
+                            self.name, code, message, self._last_tool_trace_id)
+                return
+
             logger.error("%s_REALTIME_ERROR code=%s message=%s last_tool_trace_id=%s",
-                         self.name, err.get("code"), err.get("message"), self._last_tool_trace_id)
+                         self.name, code, message, self._last_tool_trace_id)
             if self._last_tool_payload_trunc:
                 logger.error("%s_LAST_TOOL_PAYLOAD trace_id=%s payload_trunc=%s",
                              self.name, self._last_tool_trace_id, self._last_tool_payload_trunc)
             return
+
 
     def get_last_tool_payload_debug(self) -> Dict[str, Any]:
         return {
