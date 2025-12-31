@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from typing import Any, Dict, Optional
 
+
 import httpx
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -18,6 +19,8 @@ from core.security import decrypt_str, encrypt_str
 from models import EmailAccount, User
 from openai import OpenAI
 from services.settings_service import get_selected_gmail_account_id
+from services.settings_service import get_gmail_summary_llm_prompt
+
 
 # Flags
 GMAIL_DEBUG = os.getenv("GMAIL_DEBUG", "0") == "1"
