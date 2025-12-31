@@ -122,3 +122,91 @@ def search_memory_events(
 
     rows = qq.order_by(CallerMemoryEvent.created_at.desc()).limit(limit).all()
     return rows
+# ----------------------------
+# Facts-first helpers (MVP)
+# ----------------------------
+
+_FACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bfavorite\s+colou?r\b", re.I), "favorite_color"),
+]
+
+def infer_fact_key(text: str) -> Optional[str]:
+    """Map a user question to a durable fact key (MVP: favorite_color)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    for rx, key in _FACT_PATTERNS:
+        if rx.search(raw):
+            return key
+    return None
+
+def fetch_fact_history(
+    db: Any,
+    *,
+    tenant_id: str,
+    caller_id: str,
+    fact_key: str,
+    start_ts: Optional[datetime] = None,
+    end_ts: Optional[datetime] = None,
+    limit: int = 8,
+    scan_limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return most-recent fact values for a caller (deterministic; no LLM).
+
+    Implementation note:
+    - Uses a small scan of recent rows and parses JSON in Python.
+    - Avoids brittle JSON/UUID casting differences across environments.
+    """
+    if not (tenant_id and caller_id and fact_key):
+        return []
+
+    # Use UTC-naive timestamps to match `timestamp without time zone` columns safely.
+    now = _utcnow().replace(tzinfo=None)
+    start = (start_ts or (now - timedelta(days=365))).replace(tzinfo=None)
+    end = (end_ts or now).replace(tzinfo=None)
+
+    try:
+        qq = (
+            db.query(CallerMemoryEvent)
+            .filter(CallerMemoryEvent.tenant_id == tenant_id)
+            .filter(CallerMemoryEvent.caller_id == caller_id)
+            .filter(CallerMemoryEvent.created_at >= start)
+            .filter(CallerMemoryEvent.created_at <= end)
+            .order_by(CallerMemoryEvent.created_at.desc())
+            .limit(int(scan_limit))
+        )
+        rows = list(qq.all())
+    except Exception as e:
+        logger.exception("FACT_HISTORY_QUERY_FAIL tenant_id=%s caller_id=%s key=%s err=%s", tenant_id, caller_id, fact_key, e)
+        return []
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            dj = r.data_json or {}
+            facts = dj.get("facts") if isinstance(dj, dict) else None
+            if not isinstance(facts, dict):
+                continue
+            val = facts.get(fact_key)
+            if not isinstance(val, str) or not val.strip():
+                continue
+            ts = r.created_at
+            ts_iso = ts.isoformat(timespec="seconds") if hasattr(ts, "isoformat") else ""
+            out.append(
+                {
+                    "value": val.strip(),
+                    "created_at": ts,
+                    "created_at_iso": ts_iso,
+                    "skill_key": getattr(r, "skill_key", None),
+                    "text": getattr(r, "text", None),
+                    "call_sid": getattr(r, "call_sid", None),
+                }
+            )
+            if len(out) >= int(limit):
+                break
+        except Exception:
+            continue
+
+    return out
+
+
