@@ -201,7 +201,7 @@ from datetime import datetime as _dt
 class CallerMemoryEvent(Base):
     __tablename__ = "caller_memory_events"
 
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
     tenant_id = Column(String, index=True, nullable=False)
     caller_id = Column(String, index=True, nullable=False)
     call_sid = Column(String, index=True, nullable=True)
