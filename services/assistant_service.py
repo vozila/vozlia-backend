@@ -100,47 +100,62 @@ def run_assistant_route(
     gmail_data_fresh = False  # safe default; set True only when Gmail fetch occurs
 
     # -------------------------
-    # LONGTERM MEMORY: capture every user turn (Option A)
+    # LONGTERM MEMORY: config + context + capture turns (Option A)
     # -------------------------
-    capture_turns = (os.getenv("LONGTERM_MEMORY_CAPTURE_TURNS", "1") or "1").strip().lower() in ("1","true","yes","on")
+    memory_context = ""
+    longterm_enabled = False
+    try:
+        longterm_enabled = longterm_memory_enabled_for_tenant(tenant_id)
+    except Exception as e:
+        longterm_enabled = False
+        if debug:
+            logger.exception("LONGTERM_MEMORY_ENABLED_CHECK_FAIL tenant_id=%s err=%s", tenant_id, e)
+
+    capture_turns = (os.getenv("LONGTERM_MEMORY_CAPTURE_TURNS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    if debug:
+        logger.info(
+            "LONGTERM_MEMORY_CONFIG enabled=%s capture_turns=%s tenant_id=%s caller_id=%s call_sid=%s",
+            longterm_enabled,
+            capture_turns,
+            tenant_id,
+            caller_id,
+            call_id,
+        )
+
+    # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
+    if longterm_enabled and caller_id and tenant_uuid:
+        try:
+            memory_context = fetch_recent_memory_text(
+                db,
+                tenant_uuid=tenant_uuid,
+                caller_id=caller_id,
+                limit=int(os.getenv("LONGTERM_MEMORY_CONTEXT_LIMIT", "8") or 8),
+            )
+            if debug and memory_context:
+                logger.info(
+                    "LONGTERM_MEM_CONTEXT_READY tenant_id=%s caller_id=%s chars=%s",
+                    tenant_id,
+                    caller_id,
+                    len(memory_context),
+                )
+        except Exception as e:
+            memory_context = ""
+            logger.exception("LONGTERM_MEM_CONTEXT_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
+
+    # Capture *every* user turn (best-effort; fail-open)
     if longterm_enabled and capture_turns and caller_id and tenant_uuid:
         ok = record_turn_event(
             db,
             tenant_uuid=str(tenant_uuid),
             caller_id=str(caller_id),
             call_sid=str(call_id) if call_id else None,
+            session_id=str(call_id) if call_id else None,  # stable per-call correlation
             role="user",
             text=text or "",
-            session_id=str(call_id) if call_id else None,
         )
         if debug:
             logger.info("MEMORY_CAPTURE_TURN_USER ok=%s tenant_id=%s caller_id=%s", ok, tenant_id, caller_id)
 
-    # Long-term memory context (durable, per tenant + caller_id)
-    memory_context = ""
-    longterm_enabled = False
-    try:
-        longterm_enabled = longterm_memory_enabled_for_tenant(tenant_id)
-    except Exception:
-        longterm_enabled = False
-
-    if longterm_enabled and caller_id and tenant_uuid:
-        memory_context = fetch_recent_memory_text(
-            db,
-            tenant_uuid=tenant_uuid,
-            caller_id=caller_id,
-            limit=int(os.getenv("LONGTERM_MEMORY_CONTEXT_LIMIT", "8") or 8),
-        )
-        if debug and memory_context:
-            logger.info(
-                "LONGTERM_MEM_CONTEXT_READY tenant_id=%s caller_id=%s chars=%s",
-                tenant_id,
-                caller_id,
-                len(memory_context),
-            )
-
-
-    
     # -------------------------
     # AUTO memory question handling (facts-first for MVP)
     # -------------------------
