@@ -43,7 +43,7 @@ def strip_filler(text: str) -> Tuple[str, List[str]]:
     cleaned = " ".join(out)
     return cleaned, out
 
-_FAV_COLOR_RE = re.compile(r"(?:favorite\s+color\s+(?:is|was)\s+)([A-Za-z]+)", re.I)
+_FAV_COLOR_RE = re.compile(r"\b(?:my\s+)?favorite\s+color\b(?:\s+\w+){0,4}\s+(?:is|was)\s+([A-Za-z]+)\b", re.I)
 
 def enrich_turn(text: str) -> EnrichedTurn:
     cleaned, keywords = strip_filler(text)

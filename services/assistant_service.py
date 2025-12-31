@@ -2,6 +2,7 @@
 from skills.engine import skills_engine_enabled, match_skill_id, execute_skill
 from services.settings_service import get_agent_greeting
 import os
+import re
 from core.logging import logger
 from skills.registry import skill_registry
 from sqlalchemy.orm import Session
@@ -45,18 +46,36 @@ def _looks_like_memory_question(text: str) -> bool:
 
 def _answer_favorite_color(rows) -> str | None:
     # rows are CallerMemoryEvent ordered newest-first
+    # Prefer structured facts, but fall back to parsing raw text to avoid "no hits" for common phrasings.
+    fav_re = re.compile(r"\bfavorite\s+color\b(?:\s+\w+){0,4}\s+(?:is|was)\s+([A-Za-z]+)\b", re.I)
     for r in rows or []:
         try:
+            # 1) Tags
             tags = getattr(r, "tags_json", None) or []
             if isinstance(tags, list):
                 for tag in tags:
                     if isinstance(tag, str) and tag.startswith("fact:favorite_color="):
-                        return tag.split("=", 1)[1].strip() or None
+                        v = tag.split("=", 1)[1].strip()
+                        if v:
+                            return v
+
+            # 2) data_json facts
             data = getattr(r, "data_json", None) or {}
             if isinstance(data, dict):
                 facts = data.get("facts") or {}
                 if isinstance(facts, dict) and facts.get("favorite_color"):
-                    return str(facts["favorite_color"]).strip()
+                    v = str(facts["favorite_color"]).strip()
+                    if v:
+                        return v
+
+            # 3) Fallback: parse the stored text
+            body = getattr(r, "text", None) or ""
+            if isinstance(body, str) and body:
+                m = fav_re.search(body)
+                if m:
+                    v = (m.group(1) or "").strip()
+                    if v:
+                        return v.lower()
         except Exception:
             continue
     return None
@@ -146,7 +165,7 @@ def run_assistant_route(
     if longterm_enabled and capture_turns and caller_id and tenant_uuid:
         ok = record_turn_event(
             db,
-            tenant_uuid=str(tenant_uuid),
+            tenant_id=str(tenant_uuid),
             caller_id=str(caller_id),
             call_sid=str(call_id) if call_id else None,
             session_id=str(call_id) if call_id else None,  # stable per-call correlation
@@ -157,105 +176,67 @@ def run_assistant_route(
             logger.info("MEMORY_CAPTURE_TURN_USER ok=%s tenant_id=%s caller_id=%s", ok, tenant_id, caller_id)
 
     # -------------------------
-    # AUTO memory question handling (LLM planned; broad recall)
+    # AUTO memory question handling (facts-first for MVP)
     # -------------------------
     if longterm_enabled and caller_id and tenant_uuid and _looks_like_memory_question(text):
+        from services.memory_controller import parse_memory_query, search_memory_events
+
         try:
-            from datetime import datetime, timezone
-            from services.memory_llm import (
-                plan_memory_request,
-                execute_memory_query,
-                generate_memory_response,
+            qmem = parse_memory_query(text or "")
+            rows = search_memory_events(
+                db,
+                tenant_id=str(tenant_uuid),
+                caller_id=str(caller_id),
+                q=qmem,
+                limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "50") or 50),
             )
-
-            plan = plan_memory_request(
-                question=text or "",
-                now_utc=datetime.now(timezone.utc),
-                profile={"tenant_id": str(tenant_id), "caller_id": str(caller_id)},
-            )
-
-            # If planner says "normal", fall through (no behavior change for non-memory turns)
-            if plan.intent != "normal":
-                rows = execute_memory_query(
-                    db,
-                    tenant_id=str(tenant_uuid),
-                    caller_id=str(caller_id),
-                    plan=plan,
-                )
-                out = generate_memory_response(
-                    question=text or "",
-                    plan=plan,
-                    evidence_rows=rows,
-                )
-
-                return {
-                    "spoken_reply": out.get("spoken_reply") or "I couldn’t find that just now.",
-                    "fsm": {
-                        "mode": "memory_recall",
-                        "intent": plan.intent,
-                        "scope": plan.scope,
-                        "start_ts": plan.start_ts.isoformat(),
-                        "end_ts": plan.end_ts.isoformat(),
-                        "keywords": plan.keywords,
-                        "entities": plan.entities,
-                        "fact_keys": plan.fact_keys,
-                        "hits": len(rows or []),
-                        "needs_clarification": bool(out.get("needs_clarification")),
-                        "choices": out.get("choices") or [],
-                    },
-                    "gmail": None,
-                }
-
         except Exception as e:
-            logger.exception("AUTO_MEMORY_LLM_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
-            # fall back to previous heuristic-based approach
-            from services.memory_controller import parse_memory_query, search_memory_events
+            logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
+            rows = []
 
-            try:
-                qmem = parse_memory_query(text or "")
-                rows = search_memory_events(
-                    db,
-                    tenant_uuid=str(tenant_uuid),
-                    caller_id=str(caller_id),
-                    q=qmem,
-                    limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "50") or 50),
-                )
-            except Exception as e2:
-                logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e2)
-                rows = []
 
-            if "favorite color" in (text or "").lower():
-                val = _answer_favorite_color(rows)
-                if val:
-                    return {
-                        "spoken_reply": f"You told me your favorite color was {val}.",
-                        "fsm": {"mode": "memory_recall", "fact": "favorite_color", "value": val},
-                        "gmail": None,
-                    }
-
-            if rows:
-                latest = rows[0]
-                raw = None
-                try:
-                    data = getattr(latest, "data_json", None) or {}
-                    if isinstance(data, dict):
-                        raw = data.get("raw")
-                except Exception:
-                    raw = None
-                snippet = (raw or getattr(latest, "text", "") or "").strip()
-                if len(snippet) > 240:
-                    snippet = snippet[:240] + "…"
-                return {
-                    "spoken_reply": f"Here’s what I found from our recent conversation: {snippet}",
-                    "fsm": {"mode": "memory_recall", "hits": len(rows)},
-                    "gmail": None,
-                }
-
+        # If we detected a memory question but could not retrieve any rows, fail-soft WITHOUT guessing.
+        if not rows:
+            if debug:
+                logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (text or "")[:200])
             return {
-                "spoken_reply": "I couldn’t find that in your recent history. Can you tell me roughly when you said it?",
-                "fsm": {"mode": "memory_recall", "hits": 0},
+                "spoken_reply": "I couldn’t find that in my notes from that time window. Can you repeat it, or give me a slightly wider timeframe?",
+                "fsm": {"mode": "memory_recall", "status": "no_hits"},
                 "gmail": None,
             }
+
+        if "favorite color" in (text or "").lower():
+            val = _answer_favorite_color(rows)
+            if val:
+                return {
+                    "spoken_reply": f"You told me your favorite color was {val}.",
+                    "fsm": {"mode": "memory_recall", "fact": "favorite_color", "value": val},
+                    "gmail": None,
+                }
+
+        if rows:
+            latest = rows[0]
+            raw = None
+            try:
+                data = getattr(latest, "data_json", None) or {}
+                if isinstance(data, dict):
+                    raw = data.get("raw")
+            except Exception:
+                raw = None
+            snippet = (raw or getattr(latest, "text", "") or "").strip()
+            if len(snippet) > 240:
+                snippet = snippet[:240] + "…"
+            return {
+                "spoken_reply": f"Here’s what I found from our recent conversation: {snippet}",
+                "fsm": {"mode": "memory_recall", "hits": len(rows)},
+                "gmail": None,
+            }
+
+        return {
+            "spoken_reply": "I couldn’t find that in your recent history. Can you tell me roughly when you said it?",
+            "fsm": {"mode": "memory_recall", "hits": 0},
+            "gmail": None,
+        }
 
     # -------------------------
     # Backend call: memory_recall (Option A: no stream.py changes needed)
@@ -514,7 +495,7 @@ def run_assistant_route(
                 try:
                     record_skill_result(
                         db,
-                        tenant_uuid=tenant_uuid,
+                        tenant_id=tenant_uuid,
                         caller_id=caller_id,
                         skill_key="gmail_summary",
                         input_text=text,

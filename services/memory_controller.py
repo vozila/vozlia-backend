@@ -4,123 +4,121 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Iterable, Optional
 
 from core.logging import logger
 from models import CallerMemoryEvent
-
-# Broad triggers for memory queries
-_MEM_Q_TRIG = (
-    "what did i say", "what did i tell", "remind me", "remember", "last time",
-    "previous call", "yesterday", "last week", "five minutes", "minutes ago", "hours ago",
-    "what were we talking about", "what was i talking about",
-)
-
-_COLOR_WORDS = {
-    "red","orange","yellow","green","blue","purple","violet","pink","brown","black","white","gray","grey",
-    "gold","silver","beige","tan","navy","teal","cyan","magenta","maroon","olive",
-}
 
 
 @dataclass
 class MemoryQuery:
     start_ts: datetime
     end_ts: datetime
-    skill_key: Optional[str] = None
-    keywords: Optional[List[str]] = None
+    skill_key: str | None
+    keywords: list[str]
+    raw_text: str
 
 
-def looks_like_memory_question(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-    if any(x in t for x in _MEM_Q_TRIG):
-        return True
-    if "?" in t and ("ago" in t or "yesterday" in t or "last" in t):
-        return True
-    return False
+_TIME_PATTERNS = [
+    # (regex, days_back)
+    (re.compile(r"\b(yesterday)\b", re.I), 1),
+    (re.compile(r"\b(last\s+week)\b", re.I), 7),
+    (re.compile(r"\b(last\s+month)\b", re.I), 30),
+    (re.compile(r"\b(last\s+\d+)\s+days\b", re.I), None),
+]
 
 
-def parse_memory_query(text: str, *, now_utc: Optional[datetime] = None) -> MemoryQuery:
-    """
-    Heuristic fallback parser (kept for backwards compatibility).
-    The new preferred path is services.memory_llm.plan_memory_request.
-    """
-    now = now_utc or datetime.now(timezone.utc)
-    t = (text or "").strip().lower()
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-    # default 24h
-    lookback = timedelta(hours=24)
 
-    # quick relative matches
-    m = re.search(r"\b(\d+)\s*(minute|minutes)\b", t)
+def parse_memory_query(text: str) -> MemoryQuery:
+    raw = (text or "").strip()
+    now = _utcnow()
+    start = now - timedelta(days=30)
+    end = now
+
+
+    # Minutes / hours parsing (MVP)
+    m = re.search(r"\b(last)\s+(\d+)\s+minutes\b", raw, re.I)
     if m:
-        lookback = timedelta(minutes=int(m.group(1)))
-    m = re.search(r"\b(\d+)\s*(hour|hours)\b", t)
+        n = int(m.group(2))
+        start = now - timedelta(minutes=min(max(n, 1), 60*24*7))
+    else:
+        m = re.search(r"\b(\d+)\s+minutes?\s+ago\b", raw, re.I)
+        if m:
+            n = int(m.group(1))
+            start = now - timedelta(minutes=min(max(n * 3, 10), 60*24*7))
+        else:
+            m = re.search(r"\b(last)\s+(\d+)\s+hours\b", raw, re.I)
+            if m:
+                n = int(m.group(2))
+                start = now - timedelta(hours=min(max(n, 1), 24*30))
+            else:
+                m = re.search(r"\b(\d+)\s+hours?\s+ago\b", raw, re.I)
+                if m:
+                    n = int(m.group(1))
+                    start = now - timedelta(hours=min(max(n * 2, 2), 24*30))
+
+    # Time parsing (MVP)
+    m = re.search(r"\b(last)\s+(\d+)\s+days\b", raw, re.I)
     if m:
-        lookback = timedelta(hours=int(m.group(1)))
-    m = re.search(r"\b(\d+)\s*(day|days)\b", t)
-    if m:
-        lookback = timedelta(days=int(m.group(1)))
+        n = int(m.group(2))
+        start = now - timedelta(days=max(1, min(n, 365)))
+    else:
+        for rx, days in _TIME_PATTERNS:
+            if rx.search(raw):
+                if days is not None:
+                    start = now - timedelta(days=days)
+                break
 
-    if "yesterday" in t:
-        # yesterday midnight->midnight (UTC)
-        end = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        start = end - timedelta(days=1)
-        return MemoryQuery(start_ts=start, end_ts=end, keywords=["yesterday"])
+    # Topic inference (MVP)
+    skill = None
+    low = raw.lower()
+    if any(w in low for w in ["weather", "forecast", "temperature", "rain", "snow"]):
+        skill = "weather"
+    elif any(w in low for w in ["email", "inbox", "gmail"]):
+        skill = "gmail_summary"
 
-    start_ts = now - lookback
-    end_ts = now
+    # Keyword extraction (cheap)
+    tokens = re.findall(r"[a-zA-Z0-9_]{3,}", low)
+    stop = {"what","did","say","about","that","this","last","week","yesterday","remind","me","we","talked","previous","call","report"}
+    kws = [t for t in tokens if t not in stop][:12]
 
-    # keywords: keep broad and include obvious nouns
-    kws: List[str] = []
-    for w in re.findall(r"[a-z0-9_']+", t):
-        if len(w) < 3:
-            continue
-        if w in ("what","did","say","tell","about","that","this","last","time","previous","call","remind","remember"):
-            continue
-        kws.append(w)
-
-    # if mentions a color, include it
-    for c in _COLOR_WORDS:
-        if re.search(rf"\b{re.escape(c)}\b", t):
-            kws.append(c)
-
-    # dedupe
-    seen = set()
-    keywords = []
-    for k in kws:
-        k = k.strip().lower()
-        if k and k not in seen:
-            seen.add(k)
-            keywords.append(k)
-
-    return MemoryQuery(start_ts=start_ts, end_ts=end_ts, keywords=keywords[:12])
+    return MemoryQuery(start_ts=start, end_ts=end, skill_key=skill, keywords=kws, raw_text=raw)
 
 
 def search_memory_events(
-    db,
+    db: Any,
     *,
-    tenant_uuid: str,
+    tenant_id: str,
     caller_id: str,
     q: MemoryQuery,
-    limit: int = 50,
-) -> List[CallerMemoryEvent]:
-    qq = db.query(CallerMemoryEvent).filter(CallerMemoryEvent.tenant_id == str(tenant_uuid))
-    if caller_id:
-        qq = qq.filter(CallerMemoryEvent.caller_id == str(caller_id))
+    limit: int = 12,
+) -> list[CallerMemoryEvent]:
+    # Defensive: if DB missing, return empty
+    if not tenant_id or not caller_id:
+        return []
 
-    qq = qq.filter(CallerMemoryEvent.created_at >= q.start_ts).filter(CallerMemoryEvent.created_at <= q.end_ts)
+    # Base query
+    qq = (
+        db.query(CallerMemoryEvent)
+        .filter(CallerMemoryEvent.tenant_id == tenant_id)
+        .filter(CallerMemoryEvent.caller_id == caller_id)
+        .filter(CallerMemoryEvent.created_at >= q.start_ts.replace(tzinfo=None))
+        .filter(CallerMemoryEvent.created_at <= q.end_ts.replace(tzinfo=None))
+    )
 
     if q.skill_key:
         qq = qq.filter(CallerMemoryEvent.skill_key == q.skill_key)
 
+    # MVP keyword filter: OR over ILIKE
     if q.keywords:
         ors = []
-        from sqlalchemy import or_
-        for kw in q.keywords[:12]:
+        for kw in q.keywords[:8]:
             ors.append(CallerMemoryEvent.text.ilike(f"%{kw}%"))
+        from sqlalchemy import or_
         qq = qq.filter(or_(*ors))
 
     rows = qq.order_by(CallerMemoryEvent.created_at.desc()).limit(limit).all()
-    return rows or []
+    return rows
