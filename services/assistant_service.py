@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 from models import User
 from vozlia_fsm import VozliaFSM
 from services.settings_service import gmail_summary_enabled
-from services.memory_enricher import is_memory_question, parse_fact_query
 from services.memory_facade import (
     memory,
     make_skill_cache_key_hash,
@@ -23,11 +22,10 @@ from services.caller_cache import (
     normalize_caller_id,
 )
 from services.longterm_memory import (
+    record_turn_event,
     longterm_memory_enabled_for_tenant,
     fetch_recent_memory_text,
     record_skill_result,
-    record_turn_event,
-    extract_fact_from_tags,
 )
 
 
@@ -35,6 +33,33 @@ from services.longterm_memory import (
 
 from services.gmail_service import get_default_gmail_account_id, summarize_gmail_for_assistant
 
+
+def _looks_like_memory_question(text: str) -> bool:
+    t = (text or "").lower()
+    if "what did i say" in t or "remind me" in t or "last time" in t or "previous call" in t:
+        return True
+    if "favorite color" in t:
+        return True
+    return False
+
+
+def _answer_favorite_color(rows) -> str | None:
+    # rows are CallerMemoryEvent ordered newest-first
+    for r in rows or []:
+        try:
+            tags = getattr(r, "tags_json", None) or []
+            if isinstance(tags, list):
+                for tag in tags:
+                    if isinstance(tag, str) and tag.startswith("fact:favorite_color="):
+                        return tag.split("=", 1)[1].strip() or None
+            data = getattr(r, "data_json", None) or {}
+            if isinstance(data, dict):
+                facts = data.get("facts") or {}
+                if isinstance(facts, dict) and facts.get("favorite_color"):
+                    return str(facts["favorite_color"]).strip()
+        except Exception:
+            continue
+    return None
 
 def run_assistant_route(
     text: str,
@@ -72,86 +97,24 @@ def run_assistant_route(
     if isinstance(ctx, dict):
         from_number = ctx.get("from_number") or ctx.get("from") or ctx.get("From")
     caller_id = normalize_caller_id(from_number)
-
-    # -------------------------
-    # (0) Durable memory capture: write EVERY user turn (filler stripped + tags)
-    # -------------------------
-    try:
-        if tenant_id and caller_id:
-            record_turn_event(
-                db,
-                tenant_uuid=tenant_id,
-                caller_id=caller_id,
-                call_sid=str(call_id) if call_id else None,
-                role="turn_user",
-                raw_text=text or "",
-                extra={"context_keys": sorted(list((ctx or {}).keys()))[:20]},
-            )
-    except Exception:
-        logger.exception("MEMORY_TURN_WRITE_EXCEPTION role=turn_user tenant_id=%s caller_id=%s", tenant_id, caller_id)
-
-    # -------------------------
-    # (0b) Auto-detect memory questions (no trigger phrase required)
-    # If user asks a memory question, answer from DB evidence and return early.
-    # -------------------------
-    try:
-        if tenant_id and caller_id and is_memory_question(text or ""):
-            from services.memory_controller import parse_memory_query, search_memory_events
-
-            fact_key = parse_fact_query(text or "")
-            qmem = parse_memory_query(text or "")
-
-            rows = search_memory_events(
-                db,
-                tenant_id=tenant_id,
-                caller_id=caller_id,
-                q=qmem,
-                limit=25,
-            )
-
-            spoken = None
-            if fact_key:
-                vals = []
-                for r in rows:
-                    v = extract_fact_from_tags(getattr(r, "tags_json", None), fact_key)
-                    if v:
-                        vals.append((v, getattr(r, "created_at", None)))
-                if vals:
-                    latest_val = vals[0][0]
-                    conflicts = sorted({v for v, _ in vals[1:] if v and v != latest_val})
-                    if conflicts:
-                        spoken = (
-                            f"Most recently you said your {fact_key.replace('_',' ')} was {latest_val}. "
-                            f"Earlier I also saw: {', '.join(conflicts)}."
-                        )
-                    else:
-                        spoken = f"You said your {fact_key.replace('_',' ')} was {latest_val}."
-
-            if spoken is None:
-                if rows:
-                    spoken = f"Here’s what I found from our recent calls: {rows[0].text}"
-                else:
-                    spoken = "I couldn’t find anything relevant in your recent history."
-
-            # Persist the assistant reply turn too
-            try:
-                record_turn_event(
-                    db,
-                    tenant_uuid=tenant_id,
-                    caller_id=caller_id,
-                    call_sid=str(call_id) if call_id else None,
-                    role="turn_assistant",
-                    raw_text=spoken,
-                    extra={"auto_memory_answer": True, "query": qmem.raw_text},
-                )
-            except Exception:
-                logger.exception("MEMORY_TURN_WRITE_EXCEPTION role=turn_assistant tenant_id=%s caller_id=%s", tenant_id, caller_id)
-
-            return {"spoken_reply": spoken, "fsm": {"state": "memory_recall"}, "gmail": None}
-    except Exception:
-        logger.exception("MEMORY_AUTORECALL_EXCEPTION tenant_id=%s caller_id=%s", tenant_id, caller_id)
-
     gmail_data_fresh = False  # safe default; set True only when Gmail fetch occurs
+
+    # -------------------------
+    # LONGTERM MEMORY: capture every user turn (Option A)
+    # -------------------------
+    capture_turns = (os.getenv("LONGTERM_MEMORY_CAPTURE_TURNS", "1") or "1").strip().lower() in ("1","true","yes","on")
+    if longterm_enabled and capture_turns and caller_id and tenant_uuid:
+        ok = record_turn_event(
+            db,
+            tenant_uuid=str(tenant_uuid),
+            caller_id=str(caller_id),
+            call_sid=str(call_id) if call_id else None,
+            role="user",
+            text=text or "",
+            session_id=str(call_id) if call_id else None,
+        )
+        if debug:
+            logger.info("MEMORY_CAPTURE_TURN_USER ok=%s tenant_id=%s caller_id=%s", ok, tenant_id, caller_id)
 
     # Long-term memory context (durable, per tenant + caller_id)
     memory_context = ""
@@ -178,6 +141,58 @@ def run_assistant_route(
 
 
     
+    # -------------------------
+    # AUTO memory question handling (facts-first for MVP)
+    # -------------------------
+    if longterm_enabled and caller_id and tenant_uuid and _looks_like_memory_question(text):
+        from services.memory_controller import parse_memory_query, search_memory_events
+
+        try:
+            qmem = parse_memory_query(text or "")
+            rows = search_memory_events(
+                db,
+                tenant_uuid=str(tenant_uuid),
+                caller_id=str(caller_id),
+                q=qmem,
+                limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "50") or 50),
+            )
+        except Exception as e:
+            logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
+            rows = []
+
+        if "favorite color" in (text or "").lower():
+            val = _answer_favorite_color(rows)
+            if val:
+                return {
+                    "spoken_reply": f"You told me your favorite color was {val}.",
+                    "fsm": {"mode": "memory_recall", "fact": "favorite_color", "value": val},
+                    "gmail": None,
+                }
+
+        if rows:
+            latest = rows[0]
+            raw = None
+            try:
+                data = getattr(latest, "data_json", None) or {}
+                if isinstance(data, dict):
+                    raw = data.get("raw")
+            except Exception:
+                raw = None
+            snippet = (raw or getattr(latest, "text", "") or "").strip()
+            if len(snippet) > 240:
+                snippet = snippet[:240] + "…"
+            return {
+                "spoken_reply": f"Here’s what I found from our recent conversation: {snippet}",
+                "fsm": {"mode": "memory_recall", "hits": len(rows)},
+                "gmail": None,
+            }
+
+        return {
+            "spoken_reply": "I couldn’t find that in your recent history. Can you tell me roughly when you said it?",
+            "fsm": {"mode": "memory_recall", "hits": 0},
+            "gmail": None,
+        }
+
     # -------------------------
     # Backend call: memory_recall (Option A: no stream.py changes needed)
     # -------------------------
@@ -590,21 +605,4 @@ def run_assistant_route(
     # ----------------------------
     # (3) Default: return FSM result (no change)
     # ----------------------------
-    
-    # -------------------------
-    # (4) Durable memory capture: write assistant turn (filler stripped + tags)
-    # -------------------------
-    try:
-        if tenant_id and caller_id and spoken_reply:
-            record_turn_event(
-                db,
-                tenant_uuid=tenant_id,
-                caller_id=caller_id,
-                call_sid=str(call_id) if call_id else None,
-                role="turn_assistant",
-                raw_text=spoken_reply,
-                extra={"fsm_state": (fsm_result or {}).get("state")},
-            )
-    except Exception:
-        logger.exception("MEMORY_TURN_WRITE_EXCEPTION role=turn_assistant tenant_id=%s caller_id=%s", tenant_id, caller_id)
     return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}

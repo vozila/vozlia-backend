@@ -125,39 +125,6 @@ def get_caller_cache(
         .first()
     )
 
-
-    # Enforce *current* TTL even if an old row has a longer stored expires_at.
-    # This prevents stale cache reads when you change TTL env vars without purging rows.
-    try:
-        effective_ttl_s = max(60, int(os.getenv("CALLER_MEMORY_TTL_S", str(CALLER_MEMORY_TTL_S)) or CALLER_MEMORY_TTL_S))
-    except Exception:
-        effective_ttl_s = int(CALLER_MEMORY_TTL_S)
-
-    try:
-        if row is not None:
-            updated = row.updated_at or row.created_at
-            if updated is not None:
-                age_s = (now - updated).total_seconds()
-                if age_s > float(effective_ttl_s):
-                    if CALLER_MEMORY_DEBUG:
-                        logger.info(
-                            "CALLER_MEM_STALE_EXPIRE skill=%s hash=%s age_s=%.0f ttl_s=%s tenant_id=%s caller_id=%s",
-                            skill_key,
-                            cache_key_hash[:8],
-                            age_s,
-                            effective_ttl_s,
-                            str(tenant_id),
-                            caller_id_norm,
-                        )
-                    try:
-                        db.delete(row)
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-                    row = None
-    except Exception:
-        # Don't fail reads on TTL enforcement issues
-        logger.exception("CALLER_MEM_TTL_ENFORCE_FAIL skill=%s hash=%s", skill_key, cache_key_hash[:8])
     if not row:
         if CALLER_MEMORY_DEBUG:
             logger.info(

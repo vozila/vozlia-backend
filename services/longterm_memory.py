@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional, Any as _Any
 
 from core.logging import logger
+from services.memory_enricher import enrich_turn
 
 try:
     from models import CallerMemoryEvent  # type: ignore
@@ -141,10 +142,7 @@ def fetch_recent_memory_text(
     caller_id: str,
     limit: int = 8,
 ) -> str:
-    """Returns a compact memory block for prompt injection.
-
-    Note: We default to excluding assistant turns to keep the injected context high-signal.
-    """
+    """Returns a compact memory block for prompt injection."""
     if CallerMemoryEvent is None:
         return ""
     tenant_id = str(tenant_uuid or "")
@@ -154,26 +152,20 @@ def fetch_recent_memory_text(
         return ""
 
     max_chars = int((os.getenv("LONGTERM_MEMORY_CONTEXT_MAX_CHARS", "1200") or "1200").strip() or 1200)
-    include_assistant = (os.getenv("LONGTERM_MEMORY_CONTEXT_INCLUDE_ASSISTANT", "0") or "0").strip() == "1"
 
     try:
-        q = (
+        rows = (
             db.query(CallerMemoryEvent)
             .filter(CallerMemoryEvent.tenant_id == tenant_id)
             .filter(CallerMemoryEvent.caller_id == str(caller_id))
-        )
-        if not include_assistant:
-            q = q.filter(CallerMemoryEvent.skill_key != "turn_assistant")
-
-        rows = (
-            q.order_by(CallerMemoryEvent.created_at.desc())
+            .order_by(CallerMemoryEvent.created_at.desc())
             .limit(int(limit or 8))
             .all()
         )
 
         lines = []
         for r in rows:
-            ts = r.created_at.isoformat(timespec="seconds") if getattr(r, "created_at", None) else ""
+            ts = r.created_at.isoformat(timespec="seconds")
             lines.append(f"- [{ts}] ({r.skill_key}) {r.text}")
 
         block = "\n".join(lines).strip()
@@ -181,102 +173,13 @@ def fetch_recent_memory_text(
             block = block[:max_chars] + "…"
 
         if (os.getenv("VOZLIA_DEBUG_MEMORY", "0") or "0").strip() == "1" and block:
-            logger.info(
-                "MEMORY_CONTEXT_READY tenant_id=%s caller_id=%s rows=%s chars=%s",
-                tenant_id,
-                caller_id,
-                len(rows),
-                len(block),
-            )
+            logger.info("MEMORY_CONTEXT_READY tenant_id=%s caller_id=%s rows=%s chars=%s", tenant_id, caller_id, len(rows), len(block))
 
         return block
     except Exception as e:
         logger.exception("MEMORY_CONTEXT_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
         return ""
 
-
-# -------------------------
-# Turn capture (Option A: write everything)
-# -------------------------
-def record_turn_event(
-    db: Any,
-    *,
-    tenant_uuid: str,
-    caller_id: str,
-    call_sid: str | None,
-    role: str,
-    raw_text: str,
-    extra: Optional[dict[str, _Any]] = None,
-) -> bool:
-    """Write a *turn* event (user or assistant) with normalized text + meta tags.
-
-    - Stores cleaned text in `text` (filler removed)
-    - Stores original text in data_json['raw_text']
-    """
-    if not (os.getenv("LONGTERM_MEMORY_CAPTURE_TURNS", "1") or "1").strip() == "1":
-        return False
-
-    try:
-        from services.memory_enricher import strip_fillers, extract_facts, build_tags
-    except Exception as e:
-        logger.warning("MEMORY_ENRICHER_IMPORT_FAIL err=%s", e)
-        return False
-
-    raw = (raw_text or "").strip()
-    if not raw:
-        return False
-
-    clean, tokens, keywords = strip_fillers(raw)
-    facts = extract_facts(raw)
-    tags = build_tags(role=role, keywords=keywords, facts=facts)
-
-    data_json = dict(extra or {})
-    data_json.update(
-        {
-            "raw_text": raw,
-            "clean_text": clean,
-            "tokens": tokens[:80],
-            "keywords": keywords[:40],
-            "facts": facts,
-            "role": role,
-        }
-    )
-
-    ok = write_memory_event(
-        db,
-        tenant_uuid=str(tenant_uuid),
-        caller_id=str(caller_id),
-        call_sid=call_sid,
-        skill_key=str(role),
-        text=clean or raw,
-        data_json=data_json,
-        tags_json=tags,
-    )
-
-    if (os.getenv("VOZLIA_DEBUG_MEMORY", "0") or "0").strip() == "1":
-        logger.info(
-            "MEMORY_TURN_WRITE role=%s ok=%s tenant_id=%s caller_id=%s call_sid=%s chars_raw=%s chars_clean=%s facts=%s",
-            role,
-            ok,
-            str(tenant_uuid),
-            str(caller_id),
-            call_sid or None,
-            len(raw),
-            len(clean),
-            facts,
-        )
-    return ok
-
-
-def extract_fact_from_tags(tags: list[str] | None, fact_key: str) -> str | None:
-    """Parse fact value from tags like 'fact:favorite_color=green'."""
-    if not tags or not fact_key:
-        return None
-    prefix = f"fact:{fact_key}="
-    for t in tags:
-        if isinstance(t, str) and t.startswith(prefix):
-            return t[len(prefix):].strip() or None
-    return None
 
 # -------------------------
 # Backwards-compatible API
@@ -305,3 +208,44 @@ def record_skill_result(
         data_json=data_json,
         tags_json=[str(skill_key or "skill")],
     )
+
+
+def record_turn_event(
+    db,
+    *,
+    tenant_uuid: str,
+    caller_id: str,
+    call_sid: str | None,
+    role: str,
+    text: str,
+    session_id: str | None = None,
+) -> bool:
+    """Write a turn-level memory event (user or assistant). Stores cleaned text in `text`,
+    raw text in data_json, and tags_json with kw:* and fact:* tags.
+    """
+    try:
+        enriched = enrich_turn(text or "")
+        skill_key = f"turn_{role}".lower().strip() or "turn_user"
+        data = {
+            "raw": (text or "").strip(),
+            "role": role,
+        }
+        if session_id:
+            data["session_id"] = session_id
+        # include extracted facts (small / structured)
+        if enriched.facts:
+            data["facts"] = enriched.facts
+
+        return write_memory_event(
+            db,
+            tenant_uuid=str(tenant_uuid),
+            caller_id=str(caller_id),
+            call_sid=call_sid,
+            skill_key=skill_key,
+            text=(enriched.cleaned_text or "").strip() or (text or "").strip() or "[empty]",
+            data_json=data,
+            tags_json=enriched.tags,
+        )
+    except Exception as e:
+        logger.exception("MEMORY_TURN_WRITE_FAIL tenant_id=%s caller_id=%s role=%s err=%s", tenant_uuid, caller_id, role, e)
+        return False

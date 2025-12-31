@@ -24,78 +24,69 @@ _TIME_PATTERNS = [
     (re.compile(r"\b(yesterday)\b", re.I), 1),
     (re.compile(r"\b(last\s+week)\b", re.I), 7),
     (re.compile(r"\b(last\s+month)\b", re.I), 30),
+    (re.compile(r"\b(last\s+\d+)\s+days\b", re.I), None),
 ]
 
-_REL_RX = [
-    (re.compile(r"\b(\d+)\s*(minute|minutes|min|mins)\s+ago\b", re.I), "minutes"),
-    (re.compile(r"\b(\d+)\s*(hour|hours|hr|hrs)\s+ago\b", re.I), "hours"),
-    (re.compile(r"\b(\d+)\s*(day|days)\s+ago\b", re.I), "days"),
-]
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-def _parse_time_window(raw: str) -> tuple[datetime, datetime]:
+
+def parse_memory_query(text: str) -> MemoryQuery:
+    raw = (text or "").strip()
     now = _utcnow()
     start = now - timedelta(days=30)
     end = now
 
-    # last N days
+
+    # Minutes / hours parsing (MVP)
+    m = re.search(r"\b(last)\s+(\d+)\s+minutes\b", raw, re.I)
+    if m:
+        n = int(m.group(2))
+        start = now - timedelta(minutes=min(max(n, 1), 60*24*7))
+    else:
+        m = re.search(r"\b(\d+)\s+minutes?\s+ago\b", raw, re.I)
+        if m:
+            n = int(m.group(1))
+            start = now - timedelta(minutes=min(max(n * 3, 10), 60*24*7))
+        else:
+            m = re.search(r"\b(last)\s+(\d+)\s+hours\b", raw, re.I)
+            if m:
+                n = int(m.group(2))
+                start = now - timedelta(hours=min(max(n, 1), 24*30))
+            else:
+                m = re.search(r"\b(\d+)\s+hours?\s+ago\b", raw, re.I)
+                if m:
+                    n = int(m.group(1))
+                    start = now - timedelta(hours=min(max(n * 2, 2), 24*30))
+
+    # Time parsing (MVP)
     m = re.search(r"\b(last)\s+(\d+)\s+days\b", raw, re.I)
     if m:
         n = int(m.group(2))
         start = now - timedelta(days=max(1, min(n, 365)))
-        return start, end
+    else:
+        for rx, days in _TIME_PATTERNS:
+            if rx.search(raw):
+                if days is not None:
+                    start = now - timedelta(days=days)
+                break
 
-    # N minutes/hours/days ago => narrow to that window (± 10% or min 2 minutes)
-    for rx, unit in _REL_RX:
-        mm = rx.search(raw)
-        if not mm:
-            continue
-        n = int(mm.group(1))
-        if unit == "minutes":
-            delta = timedelta(minutes=max(1, min(n, 60 * 24 * 31)))
-        elif unit == "hours":
-            delta = timedelta(hours=max(1, min(n, 24 * 31)))
-        else:
-            delta = timedelta(days=max(1, min(n, 365)))
-        # Window: [now - delta - pad, now - delta + pad]
-        pad = max(timedelta(minutes=2), timedelta(seconds=int(delta.total_seconds() * 0.10)))
-        center = now - delta
-        start = center - pad
-        end = center + pad
-        return start, end
-
-    # Simple patterns
-    for rx, days in _TIME_PATTERNS:
-        if rx.search(raw):
-            start = now - timedelta(days=days)
-            return start, end
-
-    return start, end
-
-def parse_memory_query(text: str) -> MemoryQuery:
-    raw = (text or "").strip()
-    start, end = _parse_time_window(raw)
-    low = raw.lower()
-
-    # Topic/skill inference (expand later)
+    # Topic inference (MVP)
     skill = None
+    low = raw.lower()
     if any(w in low for w in ["weather", "forecast", "temperature", "rain", "snow"]):
         skill = "weather"
     elif any(w in low for w in ["email", "inbox", "gmail"]):
         skill = "gmail_summary"
 
-    # Keyword extraction (cheap) — also remove obvious memory-question filler
+    # Keyword extraction (cheap)
     tokens = re.findall(r"[a-zA-Z0-9_]{3,}", low)
-    stop = {
-        "what","did","say","about","that","this","last","week","month","yesterday","minutes","minute","hours","hour",
-        "remind","me","we","talked","previous","call","report","ago","tell","told","remember",
-        "favorite","color"  # queried explicitly
-    }
-    kws = [t for t in tokens if t not in stop][:16]
+    stop = {"what","did","say","about","that","this","last","week","yesterday","remind","me","we","talked","previous","call","report"}
+    kws = [t for t in tokens if t not in stop][:12]
 
     return MemoryQuery(start_ts=start, end_ts=end, skill_key=skill, keywords=kws, raw_text=raw)
+
 
 def search_memory_events(
     db: Any,
