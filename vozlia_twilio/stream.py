@@ -22,6 +22,41 @@ from starlette.websockets import WebSocketState
 
 from core.logging import logger
 
+# --- Discovery offer resolution (Add-to-greeting) ----------------------------
+# When a skill is announced in the greeting ("Would you like me to ...?"),
+# the next user turn is often just "yes/no". The FSM router can't infer context from that,
+# so we resolve it deterministically here.
+
+AFFIRMATIVE_PREFIXES = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay"}
+NEGATIVE_PREFIXES = {"no", "nope", "nah"}
+
+# Full-phrase matches (after normalization)
+AFFIRMATIVE_WORDS = {
+    "yes please",
+    "yeah please",
+    "sure",
+    "sure thing",
+    "okay",
+    "ok",
+    "please",
+    "do it",
+    "go ahead",
+    "sounds good",
+}
+NEGATIVE_WORDS = {
+    "no",
+    "no thanks",
+    "no thank you",
+    "nope",
+    "nah",
+    "not now",
+    "dont",
+    "don't",
+    "do not",
+    "not really",
+}
+
+
 # Speech output controller (shadow-mode wiring)
 from vozlia_twilio.speech_controller import (
     SpeechOutputController,
