@@ -20,7 +20,8 @@ from models import EmailAccount, User
 from openai import OpenAI
 from services.settings_service import get_selected_gmail_account_id
 from services.settings_service import get_gmail_summary_llm_prompt
-
+from uuid import UUID
+from sqlalchemy import func
 
 # Flags
 GMAIL_DEBUG = os.getenv("GMAIL_DEBUG", "0") == "1"
@@ -58,27 +59,49 @@ def get_gmail_account_or_404(account_id: str, current_user: User, db: Session) -
     return account
 
 
+
+
 def get_default_gmail_account_id(current_user: User, db: Session) -> Optional[str]:
     """
     Determines the default Gmail account for the user.
     Priority:
-      1) Explicit selection (settings_service)
+      1) Explicit selection (settings_service) — accepts either EmailAccount.id (UUID str) OR email_address
       2) Primary Gmail account
       3) First active Gmail account
     """
     selected = get_selected_gmail_account_id(db, current_user)
     if selected:
-        row = (
+        selected = selected.strip()
+
+        base_q = (
             db.query(EmailAccount)
             .filter(
-                EmailAccount.id == selected,
                 EmailAccount.user_id == current_user.id,
                 EmailAccount.provider_type == "gmail",
                 EmailAccount.oauth_provider == "google",
                 EmailAccount.is_active == True,  # noqa: E712
             )
-            .first()
         )
+
+        row = None
+
+        # If the saved value looks like an email address, resolve by email_address (case-insensitive)
+        if "@" in selected:
+            row = (
+                base_q.filter(func.lower(EmailAccount.email_address) == selected.lower())
+                .first()
+            )
+        else:
+            # Otherwise attempt UUID parsing; if invalid, fall back to email lookup as a last resort
+            try:
+                sel_uuid = UUID(selected)
+                row = base_q.filter(EmailAccount.id == sel_uuid).first()
+            except Exception:
+                row = (
+                    base_q.filter(func.lower(EmailAccount.email_address) == selected.lower())
+                    .first()
+                )
+
         if row:
             return str(row.id)
 
@@ -104,6 +127,7 @@ def get_default_gmail_account_id(current_user: User, db: Session) -> Optional[st
 
     first = q.first()
     return str(first.id) if first else None
+
 
 
 def ensure_gmail_access_token(account: EmailAccount, db: Session) -> str:
