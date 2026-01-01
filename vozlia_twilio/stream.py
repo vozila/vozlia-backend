@@ -15,6 +15,46 @@ from services.settings_service import get_realtime_prompt_addendum, get_agent_gr
 from skills.registry import skill_registry
 
 
+# --- Offer follow-up helpers (yes/no after greeting offer) --------------------
+YES_UTTERANCES = {
+    "yes", "yep", "yeah", "ya", "yup", "sure", "ok", "okay", "please",
+    "do it", "go ahead", "sounds good", "that works",
+}
+NO_UTTERANCES = {
+    "no", "nope", "nah", "not now", "later", "don't", "do not", "stop", "cancel",
+}
+
+def _norm_text(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+def _is_affirmative(s: str) -> bool:
+    t = _norm_text(s)
+    if not t:
+        return False
+    if t in YES_UTTERANCES:
+        return True
+    if t.startswith("yes "):
+        return True
+    if t.startswith("sure"):
+        return True
+    if t in {"ok", "okay"}:
+        return True
+    return False
+
+def _is_negative(s: str) -> bool:
+    t = _norm_text(s)
+    if not t:
+        return False
+    if t in NO_UTTERANCES:
+        return True
+    if t.startswith("no "):
+        return True
+    if t.startswith("not now"):
+        return True
+    return False
+
+
+
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
@@ -240,6 +280,7 @@ async def twilio_stream(websocket: WebSocket):
     agent_greeting = ""
     skills_cfg: dict = {}
     auto_execute_skill_id: str | None = None
+    offer_skill_id: str | None = None
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
@@ -272,6 +313,10 @@ async def twilio_stream(websocket: WebSocket):
                         gline = (getattr(sk, "greeting", "") or "").strip() if sk else ""
                         if gline:
                             announce_lines.append(gline)
+
+                            if offer_skill_id is None and "?" in gline:
+
+                                offer_skill_id = sid
 
                     # Execution toggle (auto-execute after greeting): new key
                     if bool(cfg.get("auto_execute_after_greeting", False)):
@@ -590,7 +635,7 @@ async def twilio_stream(websocket: WebSocket):
         return False
 
     # --- FSM router ----------------------------------------------------------
-    async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
+    async def route_to_fsm_and_get_reply(transcript: str, extra_ctx: Optional[dict] = None) -> Optional[str]:
         try:
             ctx = {"channel": "phone"}
             if stream_sid:
@@ -599,6 +644,9 @@ async def twilio_stream(websocket: WebSocket):
                 ctx["call_sid"] = call_sid
             if from_number:
                 ctx["from_number"] = from_number
+
+            if isinstance(extra_ctx, dict):
+                ctx.update(extra_ctx)
 
             data = await call_fsm_router(transcript, context=ctx)
             if isinstance(data, dict):
@@ -731,6 +779,34 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         logger.info("USER Transcript completed: %r", transcript)
+
+        nonlocal pending_offer_skill_id, pending_offer_expires_at
+
+        # If greeting offered a skill ("Would you like... ?"), accept simple yes/no follow-ups.
+        try:
+            if pending_offer_skill_id and pending_offer_expires_at and time.time() <= pending_offer_expires_at:
+                if _is_affirmative(transcript):
+                    sid = pending_offer_skill_id
+                    pending_offer_skill_id = None
+                    pending_offer_expires_at = None
+                    spoken_reply = await route_to_fsm_and_get_reply(
+                        transcript,
+                        extra_ctx={"forced_skill_id": sid, "offer_followup": True},
+                    )
+                    if spoken_reply:
+                        await create_fsm_spoken_reply(spoken_reply)
+                    else:
+                        await create_generic_response()
+                    return
+                if _is_negative(transcript):
+                    pending_offer_skill_id = None
+                    pending_offer_expires_at = None
+                    await create_fsm_spoken_reply("Okay.")
+                    return
+        except Exception:
+            # Never break the hot path due to follow-up logic
+            pass
+
 
         is_email = looks_like_email_intent(transcript)
         feature = "email" if is_email else "chitchat"
@@ -1008,6 +1084,8 @@ async def twilio_stream(websocket: WebSocket):
     try:
         initial_greeting_pending = True
         greeting_response_id: str | None = None
+        pending_offer_skill_id: str | None = offer_skill_id
+        pending_offer_expires_at: float | None = (time.time() + float(os.getenv("SKILLS_OFFER_FOLLOWUP_TTL_S", "20"))) if offer_skill_id else None
         auto_exec_fired = False
         user_spoke_once = False
         openai_ws = await create_realtime_session(prompt_addendum, agent_greeting)
