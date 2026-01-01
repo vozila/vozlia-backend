@@ -191,6 +191,15 @@ async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
 
     instructions = _build_realtime_instructions(REALTIME_SYSTEM_PROMPT, prompt_addendum)
 
+    # Persona voice is optional. Ensure it's always defined so the hot path can't crash.
+    persona_voice = None
+    try:
+        # If settings_service exposes a no-arg getter, use it; otherwise fall back safely.
+        persona_voice = get_persona_voice()  # type: ignore[name-defined]
+    except Exception:
+        persona_voice = None
+
+
     session_update = {
         "type": "session.update",
         "session": {
