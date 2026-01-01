@@ -10,8 +10,14 @@ from typing import Optional
 from contextlib import suppress
 from db import SessionLocal
 from services.user_service import get_or_create_primary_user
+from skills.registry import skill_registry
 #from services.settings_service import get_realtime_prompt_addendum
-from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting
+from services.settings_service import (
+    get_realtime_prompt_addendum,
+    get_agent_greeting,
+    get_skills_config,
+    get_gmail_summary_engagement_phrases,
+)
 
 
 
@@ -237,11 +243,41 @@ async def twilio_stream(websocket: WebSocket):
     # Load portal-controlled Realtime prompt addendum ONCE per call (not in hot path)
     prompt_addendum = ""
     agent_greeting = ""
+    announce_lines: list[str] = []
+    auto_execute_skill_ids: list[str] = []
+    gmail_engagement_phrases: list[str] = []
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
         prompt_addendum = get_realtime_prompt_addendum(db, user)
         agent_greeting = get_agent_greeting(db, user)
+
+        # Skill config (three toggles): enabled, announce in greeting, auto-execute after greeting
+        skills_cfg = get_skills_config(db, user) or {}
+        gmail_engagement_phrases = get_gmail_summary_engagement_phrases(db, user) or []
+
+        # Discovery (announce) + auto-execute list
+        if isinstance(skills_cfg, dict):
+            for sid, cfg in skills_cfg.items():
+                if not isinstance(cfg, dict):
+                    continue
+                if not bool(cfg.get("enabled", True)):
+                    continue
+
+                if bool(cfg.get("add_to_greeting")):
+                    sk = skill_registry.get(str(sid))
+                    g = (getattr(sk, "greeting", None) or "").strip() if sk else ""
+                    if g:
+                        announce_lines.append(g)
+
+                if bool(cfg.get("auto_execute_after_greeting")):
+                    auto_execute_skill_ids.append(str(sid))
+
+        # Apply discovery announcements to the greeting text used by Realtime
+        if announce_lines:
+            agent_greeting = (agent_greeting or "").strip()
+            agent_greeting = (agent_greeting + " " + " ".join([x.strip() for x in announce_lines if str(x).strip()])).strip()
+
 
         logger.info("Realtime prompt addendum loaded (len=%d)", len(prompt_addendum or ""))
         logger.info("Agent greeting loaded (len=%d)", len(agent_greeting or ""))
@@ -256,6 +292,11 @@ async def twilio_stream(websocket: WebSocket):
 
     await websocket.accept()
     logger.info("Twilio media stream connected")
+
+    # Auto-execute after greeting: only runs once, after the *first* assistant response completes.
+    opening_pending = bool((os.getenv("FORCE_REALTIME_OPENING", "1") == "1") and (agent_greeting or "").strip())
+    opening_done = False
+    auto_execute_done = False
 
     def _ws_can_send() -> bool:
         """Return True if the Twilio WS is still open for sending."""
@@ -525,6 +566,12 @@ async def twilio_stream(websocket: WebSocket):
             return False
         normalized = _normalize_text(text)
 
+
+        # Prefer admin-configured engagement phrases (Portal) when present
+        for p in (gmail_engagement_phrases or []):
+            ps = (p or "").strip().lower()
+            if ps and ps in normalized:
+                return True
         for kw in EMAIL_KEYWORDS_LOCAL:
             if kw in normalized:
                 return True
@@ -766,6 +813,32 @@ async def twilio_stream(websocket: WebSocket):
                         barge_in_enabled = True
                         logger.info("First response finished (event=%s, id=%s); barge-in is now ENABLED.", etype, rid)
 
+
+                    # Auto-execute configured skill(s) once, immediately after the greeting finishes.
+                    if opening_pending and not opening_done:
+                        opening_done = True
+                        if auto_execute_skill_ids and (not auto_execute_done) and (not user_speaking_vad):
+                            auto_execute_done = True
+                            sid = auto_execute_skill_ids[0]
+                            logger.info("AUTO_EXECUTE_AFTER_GREETING skill_id=%s", sid)
+                            try:
+                                ctx = {"channel": "phone", "forced_skill_id": sid, "auto_execute": True}
+                                if stream_sid:
+                                    ctx["stream_sid"] = stream_sid
+                                if call_sid:
+                                    ctx["call_sid"] = call_sid
+                                if from_number:
+                                    ctx["from_number"] = from_number
+
+                                data = await call_fsm_router("", context=ctx)
+                                spoken = (data.get("spoken_reply") if isinstance(data, dict) else None) or ""
+                                spoken = spoken.strip() if isinstance(spoken, str) else ""
+                                if spoken:
+                                    await create_fsm_spoken_reply(spoken)
+                                else:
+                                    await create_generic_response()
+                            except Exception:
+                                logger.exception("AUTO_EXECUTE_AFTER_GREETING_FAILED skill_id=%s", sid)
                 elif etype == "response.audio_transcript.delta":
                     if REALTIME_LOG_TEXT:
                         _log_realtime_audio_transcript_delta(event)
