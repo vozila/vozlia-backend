@@ -6,9 +6,6 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-import time
-import httpx
-
 from models import User, UserSetting
 
 DEFAULT_GMAIL_SUMMARY_LLM_PROMPT = (
@@ -35,7 +32,6 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             "gmail_summary": {
                 "enabled": True,
                 "add_to_greeting": False,
-                "auto_execute_after_greeting": False,
                 "engagement_phrases": ["email summaries"],
                 "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
             }
@@ -68,12 +64,6 @@ def set_setting(db: Session, user: User, key: str, value: dict) -> None:
 # Core settings
 # -----------------------------
 def get_agent_greeting(db: Session, user: User) -> str:
-    data = _get_control_plane_settings_cached()
-    if isinstance(data, dict):
-        v = data.get("agent_greeting")
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-
     v = get_setting(db, user, "agent_greeting")
     t = (v or {}).get("text")
     if isinstance(t, str) and t.strip():
@@ -81,17 +71,69 @@ def get_agent_greeting(db: Session, user: User) -> str:
     return str(DEFAULTS["agent_greeting"]["text"])
 
 
-
 def gmail_summary_enabled(db: Session, user: User) -> bool:
-    # Prefer Control Plane (single source of truth for Portal)
-    data = _get_control_plane_settings_cached()
-    if isinstance(data, dict) and "gmail_summary_enabled" in data:
-        return bool(data.get("gmail_summary_enabled"))
-
     v = get_setting(db, user, "gmail_summary_enabled")
     enabled = (v or {}).get("enabled")
     return bool(True if enabled is None else enabled)
 
+
+def get_selected_gmail_account_id(db: Session, user: User) -> Optional[str]:
+    v = get_setting(db, user, "gmail_account_id")
+    account_id = (v or {}).get("account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id.strip()
+    return None
+
+
+def get_realtime_prompt_addendum(db: Session, user: User) -> str:
+    v = get_setting(db, user, "realtime_prompt_addendum")
+    t = (v or {}).get("text")
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    return str(DEFAULTS["realtime_prompt_addendum"]["text"])
+
+
+# -----------------------------
+# NEW: Skill config helpers
+# -----------------------------
+def get_skills_config(db: Session, user: User) -> dict[str, dict]:
+    v = get_setting(db, user, "skills_config")
+    skills = (v or {}).get("skills")
+    if isinstance(skills, dict):
+        out: dict[str, dict] = {}
+        for k, cfg in skills.items():
+            if isinstance(k, str) and isinstance(cfg, dict):
+                out[k] = cfg
+        return out
+    return dict(DEFAULTS["skills_config"]["skills"])
+
+
+def get_skill_config(db: Session, user: User, skill_id: str) -> dict:
+    skills = get_skills_config(db, user)
+    base = dict(DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
+    override = skills.get(skill_id)
+    if isinstance(override, dict):
+        base.update(override)
+    return base
+
+
+def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> dict[str, dict]:
+    current = get_skills_config(db, user)
+    base = dict(current.get(skill_id) or DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
+    for k in ("enabled", "add_to_greeting", "engagement_phrases", "llm_prompt"):
+        if k in patch:
+            base[k] = patch[k]
+    current[skill_id] = base
+    set_setting(db, user, "skills_config", {"skills": current})
+    return current
+
+
+def get_gmail_summary_llm_prompt(db: Session, user: User) -> str:
+    cfg = get_skill_config(db, user, "gmail_summary")
+    p = (cfg or {}).get("llm_prompt")
+    if isinstance(p, str) and p.strip():
+        return p.strip()
+    return DEFAULT_GMAIL_SUMMARY_LLM_PROMPT
 
 
 def get_gmail_summary_engagement_phrases(db: Session, user: User) -> list[str]:
@@ -99,18 +141,12 @@ def get_gmail_summary_engagement_phrases(db: Session, user: User) -> list[str]:
     phrases = (cfg or {}).get("engagement_phrases")
     if isinstance(phrases, list):
         return [str(x).strip() for x in phrases if str(x).strip()]
-    return list(DEFAULTS["skills_config"]["skills"]["gmail_summary"]["engagement_phrases"])
-
+    return []
 
 
 def gmail_summary_add_to_greeting(db: Session, user: User) -> bool:
     cfg = get_skill_config(db, user, "gmail_summary")
     return bool((cfg or {}).get("add_to_greeting") or False)
-
-
-def gmail_summary_auto_execute_after_greeting(db: Session, user: User) -> bool:
-    cfg = get_skill_config(db, user, "gmail_summary")
-    return bool((cfg or {}).get("auto_execute_after_greeting") or False)
 
 
 # -----------------------------
@@ -133,20 +169,11 @@ def longterm_memory_enabled(db: Session, user: User) -> bool:
 
 
 def get_memory_engagement_phrases(db: Session, user: User) -> list[str]:
-    data = _get_control_plane_settings_cached()
-    if isinstance(data, dict):
-        phrases = data.get("memory_engagement_phrases")
-        if isinstance(phrases, list):
-            cleaned = [str(x).strip() for x in phrases if str(x).strip()]
-            return cleaned
-
     v = get_setting(db, user, "memory_engagement_phrases")
     phrases = (v or {}).get("phrases")
     if isinstance(phrases, list):
-        cleaned = [str(x).strip() for x in phrases if str(x).strip()]
-        return cleaned
-    return list(DEFAULTS["memory_engagement_phrases"]["phrases"])
-
+        return [str(x).strip() for x in phrases if str(x).strip()]
+    return []
 
 
 # -----------------------------
@@ -218,53 +245,3 @@ class SettingsService:
 
 
 settings_service = SettingsService()
-# -----------------------------
-# Optional: Control Plane settings bridge (Portal -> Control Plane -> Backend)
-# -----------------------------
-CONTROL_PLANE_URL = (os.getenv("CONTROL_PLANE_URL") or "").strip().rstrip("/")
-CONTROL_PLANE_ADMIN_KEY = (os.getenv("CONTROL_PLANE_ADMIN_KEY") or "").strip()
-CONTROL_PLANE_SETTINGS_TTL_S = float((os.getenv("CONTROL_PLANE_SETTINGS_TTL_S") or "5").strip() or "5")
-
-_cp_cache: dict[str, Any] = {"ts": 0.0, "data": None}
-
-def _get_control_plane_settings_cached() -> Optional[dict]:
-    if not CONTROL_PLANE_URL or not CONTROL_PLANE_ADMIN_KEY:
-        return None
-    now = time.time()
-    ts = float(_cp_cache.get("ts") or 0.0)
-    if _cp_cache.get("data") is not None and (now - ts) < CONTROL_PLANE_SETTINGS_TTL_S:
-        d = _cp_cache.get("data")
-        return d if isinstance(d, dict) else None
-
-    url = f"{CONTROL_PLANE_URL}/admin/settings"
-    headers = {"X-Vozlia-Admin-Key": CONTROL_PLANE_ADMIN_KEY}
-    try:
-        with httpx.Client(timeout=3.0) as client:
-            r = client.get(url, headers=headers)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, dict):
-                    _cp_cache["ts"] = now
-                    _cp_cache["data"] = data
-                    return data
-    except Exception:
-        # Fail closed to local DB/env settings
-        return None
-    return None
-
-def _cp_get_skills_config() -> Optional[dict[str, dict]]:
-    data = _get_control_plane_settings_cached()
-    if not isinstance(data, dict):
-        return None
-    sc = data.get("skills_config")
-    if isinstance(sc, dict):
-        skills = sc.get("skills")
-        if isinstance(skills, dict):
-            out: dict[str, dict] = {}
-            for sid, cfg in skills.items():
-                if isinstance(sid, str) and isinstance(cfg, dict):
-                    out[sid] = cfg
-            return out
-    return None
-
-
