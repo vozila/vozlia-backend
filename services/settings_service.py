@@ -34,10 +34,18 @@ DEFAULTS: dict[str, dict[str, Any]] = {
                 "add_to_greeting": False,
                 "engagement_phrases": ["email summaries"],
                 "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
+                "auto_execute_after_greeting": False,
+                "standby_phrases": [
+                    "Please stand by while I retrieve your email summaries.",
+                    "One moment — I’m pulling up your inbox now.",
+                ],
             }
         }
     },
-    "skills_priority_order": {"order": ["gmail_summary", "memory", "sms", "calendar", "web_search", "weather", "investment_reporting"]},
+    "skills_priority_order": {"order": ["gmail_summary"]},
+    "chitchat_response_delay_sec": {"seconds": 2.0},
+    "persona_voice": {"voice": os.getenv("VOZLIA_PERSONA_VOICE", "alloy")},
+    "logging_toggles": {"toggles": {"REALTIME_LOG_TEXT": False, "REALTIME_LOG_ALL_EVENTS": False}},
 }
 
 
@@ -109,33 +117,6 @@ def get_skills_config(db: Session, user: User) -> dict[str, dict]:
     return dict(DEFAULTS["skills_config"]["skills"])
 
 
-
-def get_skills_priority_order(db: Session, user: User) -> list[str]:
-    """Returns an ordered list of skill_ids used to organize announcement + auto-exec selection."""
-    v = get_setting(db, user, "skills_priority_order")
-    order = (v or {}).get("order")
-    if isinstance(order, list):
-        cleaned: list[str] = []
-        for s in order:
-            if isinstance(s, str) and s.strip():
-                cleaned.append(s.strip())
-        if cleaned:
-            return cleaned
-    # default fallback
-    d = DEFAULTS.get("skills_priority_order", {}).get("order")
-    if isinstance(d, list):
-        return [s for s in d if isinstance(s, str) and s.strip()]
-    return []
-
-
-def set_skills_priority_order(db: Session, user: User, order: list[str]) -> None:
-    cleaned: list[str] = []
-    for s in (order or []):
-        if isinstance(s, str) and s.strip():
-            cleaned.append(s.strip())
-    set_setting(db, user, "skills_priority_order", {"order": cleaned})
-
-
 def get_skill_config(db: Session, user: User, skill_id: str) -> dict:
     skills = get_skills_config(db, user)
     base = dict(DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
@@ -144,11 +125,57 @@ def get_skill_config(db: Session, user: User, skill_id: str) -> dict:
         base.update(override)
     return base
 
+def get_skills_priority_order(db: Session, user: User) -> list[str]:
+    v = get_setting(db, user, "skills_priority_order")
+    order = (v or {}).get("order")
+    if isinstance(order, list):
+        cleaned = [str(x).strip() for x in order if str(x).strip()]
+        return cleaned
+    return list(DEFAULTS["skills_priority_order"]["order"])
+
+
+def get_chitchat_response_delay_sec(db: Session, user: User) -> float:
+    v = get_setting(db, user, "chitchat_response_delay_sec")
+    seconds = (v or {}).get("seconds")
+    try:
+        return float(seconds)
+    except Exception:
+        return float(DEFAULTS["chitchat_response_delay_sec"]["seconds"])
+
+
+def get_persona_voice(db: Session, user: User) -> str:
+    v = get_setting(db, user, "persona_voice")
+    voice = (v or {}).get("voice")
+    if isinstance(voice, str) and voice.strip():
+        return voice.strip()
+    return str(DEFAULTS["persona_voice"]["voice"])
+
+
+def get_logging_toggles(db: Session, user: User) -> dict[str, bool]:
+    v = get_setting(db, user, "logging_toggles")
+    toggles = (v or {}).get("toggles")
+    if isinstance(toggles, dict):
+        out: dict[str, bool] = {}
+        for k, val in toggles.items():
+            if isinstance(k, str):
+                out[k] = bool(val)
+        return out
+    return dict(DEFAULTS["logging_toggles"]["toggles"])
+
+
+def get_gmail_summary_standby_phrases(db: Session, user: User) -> list[str]:
+    cfg = get_skills_config(db, user).get("gmail_summary") or {}
+    phrases = cfg.get("standby_phrases")
+    if isinstance(phrases, list):
+        cleaned = [str(x).strip() for x in phrases if str(x).strip()]
+        return cleaned
+    return list((DEFAULTS["skills_config"]["skills"]["gmail_summary"] or {}).get("standby_phrases") or [])
+
 
 def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> dict[str, dict]:
     current = get_skills_config(db, user)
     base = dict(current.get(skill_id) or DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
-    for k in ("enabled", "add_to_greeting", "engagement_phrases", "llm_prompt"):
+    for k in ("enabled", "add_to_greeting", "auto_execute_after_greeting", "engagement_phrases", "llm_prompt", "standby_phrases"):
         if k in patch:
             base[k] = patch[k]
     current[skill_id] = base
@@ -225,6 +252,10 @@ class SettingsService:
                 "shortterm_memory_enabled": shortterm_memory_enabled(db, user),
                 "longterm_memory_enabled": longterm_memory_enabled(db, user),
                 "memory_engagement_phrases": get_memory_engagement_phrases(db, user),
+                "skills_priority_order": get_skills_priority_order(db, user),
+                "chitchat_response_delay_sec": get_chitchat_response_delay_sec(db, user),
+                "persona_voice": get_persona_voice(db, user),
+                "logging_toggles": get_logging_toggles(db, user),
             }
         finally:
             db.close()
@@ -265,6 +296,25 @@ class SettingsService:
                 phrases = patch.get("memory_engagement_phrases")
                 cleaned = [str(x).strip() for x in phrases if str(x).strip()] if isinstance(phrases, list) else []
                 set_setting(db, user, "memory_engagement_phrases", {"phrases": cleaned})
+
+            if "skills_priority_order" in patch:
+                order = patch.get("skills_priority_order")
+                cleaned = [str(x).strip() for x in order if str(x).strip()] if isinstance(order, list) else []
+                set_setting(db, user, "skills_priority_order", {"order": cleaned})
+
+            if "chitchat_response_delay_sec" in patch and patch["chitchat_response_delay_sec"] is not None:
+                try:
+                    sec = float(patch["chitchat_response_delay_sec"])
+                except Exception:
+                    sec = float(DEFAULTS["chitchat_response_delay_sec"]["seconds"])
+                set_setting(db, user, "chitchat_response_delay_sec", {"seconds": sec})
+
+            if "persona_voice" in patch and patch["persona_voice"] is not None:
+                set_setting(db, user, "persona_voice", {"voice": str(patch["persona_voice"]).strip()})
+
+            if "logging_toggles" in patch and isinstance(patch["logging_toggles"], dict):
+                toggles = {str(k): bool(v) for k, v in patch["logging_toggles"].items()}
+                set_setting(db, user, "logging_toggles", {"toggles": toggles})
 
             db.commit()
             return self.get_settings()
