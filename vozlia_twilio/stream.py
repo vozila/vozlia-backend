@@ -5,13 +5,14 @@ import asyncio
 import base64
 import json
 import os
+import random
 import time
 from typing import Optional
 from contextlib import suppress
 from db import SessionLocal
 from services.user_service import get_or_create_primary_user
 #from services.settings_service import get_realtime_prompt_addendum
-from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting, get_skills_config
+from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting, get_skills_config, get_skills_priority_order
 from skills.registry import skill_registry
 
 
@@ -52,6 +53,21 @@ def _is_negative(s: str) -> bool:
     if t.startswith("not now"):
         return True
     return False
+
+
+# --- Standby / please-wait helper (spoken while backend makes slow API calls) ---
+STANDBY_PHRASES = [
+    "One moment—checking that now.",
+    "Please hold on a second while I pull that up.",
+    "Got it—give me just a moment.",
+    "Okay—stand by for a sec.",
+]
+
+def _pick_standby_phrase() -> str:
+    try:
+        return random.choice(STANDBY_PHRASES)
+    except Exception:
+        return "One moment."
 
 
 
@@ -287,6 +303,7 @@ async def twilio_stream(websocket: WebSocket):
         prompt_addendum = get_realtime_prompt_addendum(db, user)
         agent_greeting = get_agent_greeting(db, user)
         skills_cfg = get_skills_config(db, user) or {}
+        skills_priority_order = get_skills_priority_order(db, user) or []
 
         logger.info("Realtime prompt addendum loaded (len=%d)", len(prompt_addendum or ""))
         logger.info("Agent greeting loaded (len=%d)", len(agent_greeting or ""))
@@ -294,11 +311,20 @@ async def twilio_stream(websocket: WebSocket):
         # ---- Skill announcement + auto-exec selection (computed once per call; NOT in hot path) ----
         try:
             announce_lines: list[str] = []
+            announced_skill_lines: list[tuple[str, str]] = []
             auto_exec_candidates: list[str] = []
 
             if isinstance(skills_cfg, dict):
-                # Deterministic order (stable across runs)
-                for sid in sorted(skills_cfg.keys()):
+                # Deterministic order (admin-configured priority list first; remainder sorted)
+                preferred = []
+                try:
+                    preferred = [s for s in (skills_priority_order or []) if isinstance(s, str) and s.strip()]
+                except Exception:
+                    preferred = []
+                preferred_set = set(preferred)
+                ordered_ids = [sid for sid in preferred if sid in skills_cfg]
+                ordered_ids.extend(sorted([sid for sid in skills_cfg.keys() if sid not in preferred_set]))
+                for sid in ordered_ids:
                     cfg = skills_cfg.get(sid) or {}
                     if not isinstance(cfg, dict):
                         continue
@@ -313,6 +339,7 @@ async def twilio_stream(websocket: WebSocket):
                         gline = (getattr(sk, "greeting", "") or "").strip() if sk else ""
                         if gline:
                             announce_lines.append(gline)
+                            announced_skill_lines.append((sid, gline))
 
                             if offer_skill_id is None and "?" in gline:
 
@@ -664,6 +691,30 @@ async def twilio_stream(websocket: WebSocket):
             return None
 
 
+    async def route_to_fsm_with_standby(
+        transcript: str,
+        extra_ctx: Optional[dict] = None,
+        *,
+        standby_enabled: bool = True,
+    ) -> Optional[str]:
+        """Route to /assistant/route and optionally speak a brief 'please wait' if it takes longer than a short delay."""
+        delay_s = float(os.getenv("SKILLS_STANDBY_DELAY_S", "0.35") or 0.35)
+
+        task = asyncio.create_task(route_to_fsm_and_get_reply(transcript, extra_ctx=extra_ctx))
+        if not standby_enabled:
+            return await task
+
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=delay_s)
+        except asyncio.TimeoutError:
+            # Speak a short filler while backend finishes the slow call (no per-frame work)
+            try:
+                await create_fsm_spoken_reply(_pick_standby_phrase())
+            except Exception:
+                pass
+            return await task
+
+
     # --- Cancel active response & clear audio buffer -------------------------
     async def _cancel_active_and_clear_buffer(reason: str):
         nonlocal active_response_id, prebuffer_active
@@ -789,9 +840,10 @@ async def twilio_stream(websocket: WebSocket):
                     sid = pending_offer_skill_id
                     pending_offer_skill_id = None
                     pending_offer_expires_at = None
-                    spoken_reply = await route_to_fsm_and_get_reply(
+                    spoken_reply = await route_to_fsm_with_standby(
                         transcript,
                         extra_ctx={"forced_skill_id": sid, "offer_followup": True},
+                        standby_enabled=True,
                     )
                     if spoken_reply:
                         await create_fsm_spoken_reply(spoken_reply)
@@ -825,7 +877,7 @@ async def twilio_stream(websocket: WebSocket):
             await create_generic_response()
             return
 
-        spoken_reply = await route_to_fsm_and_get_reply(transcript)
+        spoken_reply = await route_to_fsm_with_standby(transcript, standby_enabled=bool(is_email))
 
         if spoken_reply:
             await create_fsm_spoken_reply(spoken_reply)
@@ -916,7 +968,16 @@ async def twilio_stream(websocket: WebSocket):
                                     if from_number:
                                         ctx["from_number"] = from_number
 
-                                    data = await call_fsm_router("", context=ctx)
+                                    delay_s = float(os.getenv("SKILLS_STANDBY_DELAY_S", "0.35") or 0.35)
+                                    task = asyncio.create_task(call_fsm_router("", context=ctx))
+                                    try:
+                                        data = await asyncio.wait_for(asyncio.shield(task), timeout=delay_s)
+                                    except asyncio.TimeoutError:
+                                        try:
+                                            await create_fsm_spoken_reply(_pick_standby_phrase())
+                                        except Exception:
+                                            pass
+                                        data = await task
                                     spoken = None
                                     if isinstance(data, dict):
                                         spoken = (
