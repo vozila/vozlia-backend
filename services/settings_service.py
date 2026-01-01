@@ -37,6 +37,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             }
         }
     },
+    "skills_priority_order": {"order": ["gmail_summary", "memory", "sms", "calendar", "web_search", "weather", "investment_reporting"]},
 }
 
 
@@ -106,6 +107,33 @@ def get_skills_config(db: Session, user: User) -> dict[str, dict]:
                 out[k] = cfg
         return out
     return dict(DEFAULTS["skills_config"]["skills"])
+
+
+
+def get_skills_priority_order(db: Session, user: User) -> list[str]:
+    """Returns an ordered list of skill_ids used to organize announcement + auto-exec selection."""
+    v = get_setting(db, user, "skills_priority_order")
+    order = (v or {}).get("order")
+    if isinstance(order, list):
+        cleaned: list[str] = []
+        for s in order:
+            if isinstance(s, str) and s.strip():
+                cleaned.append(s.strip())
+        if cleaned:
+            return cleaned
+    # default fallback
+    d = DEFAULTS.get("skills_priority_order", {}).get("order")
+    if isinstance(d, list):
+        return [s for s in d if isinstance(s, str) and s.strip()]
+    return []
+
+
+def set_skills_priority_order(db: Session, user: User, order: list[str]) -> None:
+    cleaned: list[str] = []
+    for s in (order or []):
+        if isinstance(s, str) and s.strip():
+            cleaned.append(s.strip())
+    set_setting(db, user, "skills_priority_order", {"order": cleaned})
 
 
 def get_skill_config(db: Session, user: User, skill_id: str) -> dict:
