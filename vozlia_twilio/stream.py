@@ -842,7 +842,7 @@ async def twilio_stream(websocket: WebSocket):
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
-    async def create_fsm_spoken_reply(spoken_reply: str, *, clear_playback: bool = True):
+    async def create_fsm_spoken_reply(spoken_reply: str, *, clear_playback: bool = True, reason_tag: str = "fsm_spoken_reply", verbatim: bool = False):
         if not spoken_reply:
             logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
             await create_generic_response()
@@ -850,17 +850,31 @@ async def twilio_stream(websocket: WebSocket):
 
         # Cancellation handled in send-path selection (controller vs legacy)
 
-        instructions = (
-            "You are on a live phone call as Vozlia.\n"
-            "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
-            "Here is the summary you must speak to the caller:\n"
-            f"\"{spoken_reply}\"\n\n"
-            "For THIS response only:\n"
-            "- Say this summary naturally.\n"
-            "- You MAY lightly rephrase for flow, but keep all important facts.\n"
-            "- DO NOT mention tools, security, privacy, or inability to access email.\n"
-            "- DO NOT apologize or refuse.\n"
-        )
+        instructions = ""
+        if verbatim:
+            instructions = (
+                "You are Vozlia on a live phone call. This response was auto-executed after the greeting.\n"
+                "Speak the following text exactly as written.\n\n"
+                f"\"{spoken_reply}\"\n\n"
+                "Rules (STRICT):\n"
+                "- Start immediately with the text; do NOT add any preface like 'Sure', 'Okay', 'Of course', 'No problem', etc.\n"
+                "- Do NOT add any extra words before or after the text.\n"
+                "- Do NOT rephrase or paraphrase.\n"
+                "- Do NOT mention tools, security, privacy, or inability to access email.\n"
+            )
+        else:
+            instructions = (
+                "You are on a live phone call as Vozlia.\n"
+                "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
+                "Here is the summary you must speak to the caller:\n"
+                f"\"{spoken_reply}\"\n\n"
+                "For THIS response only:\n"
+                "- Say this summary naturally.\n"
+                "- Do NOT begin with acknowledgements like 'Sure', 'Okay', or 'Of course'.\n"
+                "- You MAY lightly rephrase for flow, but keep all important facts.\n"
+                "- DO NOT mention tools, security, privacy, or inability to access email.\n"
+                "- DO NOT apologize or refuse.\n"
+            )
 
         # Step 3: tool/FSM speech cutover (controller owns response.create) behind flag.
         tool_only = os.getenv("SPEECH_CONTROLLER_TOOL_ONLY", "0") == "1"
@@ -890,7 +904,7 @@ async def twilio_stream(websocket: WebSocket):
 
             req = SpeechRequest(
                 text=spoken_reply,
-                reason="fsm_spoken_reply",
+                reason=reason_tag,
                 ctx=ctx,
                 instructions_override=instructions,  # preserve legacy scaffolding
                 content_text_override=spoken_reply,
@@ -1107,7 +1121,7 @@ async def twilio_stream(websocket: WebSocket):
                                         grace_ms = float(os.getenv("POST_GREETING_GRACE_MS", "150") or 150)
                                         await _wait_for_audio_drain("auto_exec_after_greeting", timeout_s=timeout_s, target_bytes=0, grace_ms=grace_ms)
                                         clean = _strip_ack_preamble(spoken.strip())
-                                        await create_fsm_spoken_reply(clean, clear_playback=False)
+                                        await create_fsm_spoken_reply(clean, clear_playback=False, reason_tag="auto_exec_after_greeting", verbatim=True)
                                     else:
                                         logger.warning("AUTO_EXECUTE_AFTER_GREETING produced no spoken_reply")
                                 except Exception:
