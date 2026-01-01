@@ -148,6 +148,54 @@ def run_assistant_route(
 
     text_l = (text or "").lower()
 
+    # Optional: forced skill execution (e.g., auto-execute after greeting)
+    forced_skill_id = None
+    try:
+        if isinstance(context, dict):
+            forced_skill_id = (context.get("forced_skill_id") or context.get("auto_execute_skill_id") or "").strip() or None
+    except Exception:
+        forced_skill_id = None
+
+    if forced_skill_id:
+        # Gate on per-skill enabled toggle
+        cfg = get_skill_config(db, current_user, forced_skill_id)
+        enabled = bool((cfg or {}).get("enabled", True))
+        # Legacy Gmail toggle should still gate gmail_summary
+        if forced_skill_id == "gmail_summary":
+            enabled = bool(enabled and gmail_summary_enabled(db, current_user))
+
+        if not enabled:
+            return {
+                "spoken_reply": "That feature is currently disabled in your settings.",
+                "fsm": {"mode": "forced_skill", "skill_id": forced_skill_id, "forced": True, "disabled": True},
+                "gmail": None,
+            }
+
+        # Execute via the skills engine registry (gmail_summary supported)
+        try:
+            skill_result = execute_skill(forced_skill_id, text=text, db=db, current_user=current_user, account_id=account_id)
+            if isinstance(skill_result, dict) and skill_result.get("ok"):
+                return {
+                    "spoken_reply": (skill_result.get("spoken_reply") or "").strip(),
+                    "fsm": {"mode": "forced_skill", "skill_id": forced_skill_id, "forced": True, "ok": True},
+                    "gmail": skill_result.get("gmail"),
+                }
+            else:
+                return {
+                    "spoken_reply": "I tried to run that feature, but it didn’t complete successfully.",
+                    "fsm": {"mode": "forced_skill", "skill_id": forced_skill_id, "forced": True, "ok": False},
+                    "gmail": None,
+                }
+        except Exception as e:
+            if debug:
+                logger.exception("FORCED_SKILL_EXEC_FAIL skill_id=%s err=%s", forced_skill_id, e)
+            return {
+                "spoken_reply": "I tried to run that feature, but something went wrong.",
+                "fsm": {"mode": "forced_skill", "skill_id": forced_skill_id, "forced": True, "error": str(e)},
+                "gmail": None,
+            }
+
+
     # Skill engagement phrases (Gmail Summary)
     force_gmail_summary = False
     try:
