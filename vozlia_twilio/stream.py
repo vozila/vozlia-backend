@@ -11,7 +11,15 @@ from contextlib import suppress
 from db import SessionLocal
 from services.user_service import get_or_create_primary_user
 #from services.settings_service import get_realtime_prompt_addendum
-from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting, get_skills_config
+from services.settings_service import (
+    get_realtime_prompt_addendum,
+    get_agent_greeting,
+    get_skills_config,
+    get_skills_priority_order,
+    get_chitchat_response_delay_sec,
+    get_persona_voice,
+    get_logging_toggles,
+)
 from skills.registry import skill_registry
 
 
@@ -196,7 +204,7 @@ async def create_realtime_session(prompt_addendum: str, agent_greeting: str):
             },
             "input_audio_format": REALTIME_INPUT_AUDIO_FORMAT,
             "output_audio_format": REALTIME_OUTPUT_AUDIO_FORMAT,
-            "voice": VOICE_NAME,
+            "voice": (persona_voice or VOICE_NAME),
             "instructions": instructions,
             "input_audio_transcription": {"model": "whisper-1"},
         },
@@ -240,13 +248,30 @@ async def twilio_stream(websocket: WebSocket):
     agent_greeting = ""
     skills_cfg: dict = {}
     auto_execute_skill_id: str | None = None
-    auto_execute_trigger_text: str = ""
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
         prompt_addendum = get_realtime_prompt_addendum(db, user)
         agent_greeting = get_agent_greeting(db, user)
         skills_cfg = get_skills_config(db, user) or {}
+        skills_priority_order = get_skills_priority_order(db, user) or []
+        chitchat_delay_sec = get_chitchat_response_delay_sec(db, user)
+        persona_voice = get_persona_voice(db, user)
+        logging_toggles = get_logging_toggles(db, user) or {}
+
+        rt_log_text = bool(logging_toggles.get("REALTIME_LOG_TEXT", REALTIME_LOG_TEXT))
+        rt_log_all_events = bool(logging_toggles.get("REALTIME_LOG_ALL_EVENTS", REALTIME_LOG_ALL_EVENTS))
+
+        # Stable ordering for all skill-related decisions:
+        # priority list first, then remaining skills (deterministic).
+        ordered_skill_ids: list[str] = []
+        seen: set[str] = set()
+        for sid in skills_priority_order:
+            if isinstance(sid, str) and sid in skills_cfg and sid not in seen:
+                ordered_skill_ids.append(sid); seen.add(sid)
+        for sid in skills_cfg.keys():
+            if isinstance(sid, str) and sid not in seen:
+                ordered_skill_ids.append(sid); seen.add(sid)
 
         logger.info("Realtime prompt addendum loaded (len=%d)", len(prompt_addendum or ""))
         logger.info("Agent greeting loaded (len=%d)", len(agent_greeting or ""))
@@ -258,7 +283,7 @@ async def twilio_stream(websocket: WebSocket):
 
             if isinstance(skills_cfg, dict):
                 # Deterministic order (stable across runs)
-                for sid in sorted(skills_cfg.keys()):
+                for sid in ordered_skill_ids:
                     cfg = skills_cfg.get(sid) or {}
                     if not isinstance(cfg, dict):
                         continue
@@ -287,38 +312,6 @@ async def twilio_stream(websocket: WebSocket):
             # Choose ONE auto-exec skill deterministically to avoid surprise cascades
             auto_execute_skill_id = auto_exec_candidates[0] if auto_exec_candidates else None
 
-
-            # Pick a trigger phrase so auto-exec uses the same routing path as voice intent (FSM),
-            # instead of sending an empty utterance.
-            try:
-                if auto_execute_skill_id and isinstance(skills_cfg, dict):
-                    cfg0 = skills_cfg.get(auto_execute_skill_id) or {}
-                    phrases0 = cfg0.get("engagement_phrases") or cfg0.get("engagementPrompt") or []
-                    trig = ""
-                    if isinstance(phrases0, list):
-                        for p in phrases0:
-                            if isinstance(p, str) and p.strip():
-                                trig = p.strip()
-                                break
-                    elif isinstance(phrases0, str) and phrases0.strip():
-                        # If portal/CP returned a multiline string, use the first non-empty line
-                        for line in phrases0.splitlines():
-                            if line.strip():
-                                trig = line.strip()
-                                break
-
-                    # Fallback per-skill defaults
-                    if not trig:
-                        if auto_execute_skill_id == "gmail_summary":
-                            trig = "email summaries"
-                        elif auto_execute_skill_id == "memory":
-                            trig = "memory"
-                        else:
-                            trig = auto_execute_skill_id.replace("_", " ")
-
-                    auto_execute_trigger_text = trig
-            except Exception:
-                auto_execute_trigger_text = ""
             # Kill-switch: disable auto-exec globally without rollback (still allow announcements)
             if os.getenv("SKILLS_AUTO_EXEC_KILL_SWITCH", "0") == "1":
                 auto_execute_skill_id = None
@@ -641,6 +634,19 @@ async def twilio_stream(websocket: WebSocket):
                     or (data.get("result") or {}).get("spoken_reply")
                     or (data.get("skill_result") or {}).get("spoken_reply")
                 )
+                # Apply Chit-Chat response delay ONLY for pure chitchat (no backend_call).
+                try:
+                    fsm = data.get("fsm") or (data.get("result") or {}).get("fsm") or {}
+                    backend_call = fsm.get("backend_call") if isinstance(fsm, dict) else None
+                    route = None
+                    if isinstance(fsm, dict):
+                        route = fsm.get("route") or fsm.get("intent") or fsm.get("mode")
+                    is_chitchat = isinstance(route, str) and "chit" in route.lower()
+                    if (backend_call is None) and is_chitchat and (chitchat_delay_sec or 0) > 0:
+                        await asyncio.sleep(float(chitchat_delay_sec))
+                except Exception:
+                    pass
+
                 if isinstance(spoken, str) and spoken.strip():
                     return spoken.strip()
             return None
@@ -829,7 +835,7 @@ async def twilio_stream(websocket: WebSocket):
 
                 etype = event.get("type")
 
-                if REALTIME_LOG_ALL_EVENTS:
+                if rt_log_all_events:
                     logger.info("Realtime event: type=%s keys=%s", etype, list(event.keys()))
 
                 if etype == "response.created":
@@ -844,7 +850,7 @@ async def twilio_stream(websocket: WebSocket):
                             initial_greeting_pending = False
                             logger.info("Greeting response_id captured: %s", greeting_response_id)
 
-                elif etype in ("response.done", "response.completed", "response.failed", "response.canceled"):
+                elif etype in ("response.completed", "response.failed", "response.canceled"):
                     resp = event.get("response", {}) or {}
                     rid = resp.get("id")
                     if active_response_id is not None and rid == active_response_id:
@@ -873,7 +879,20 @@ async def twilio_stream(websocket: WebSocket):
                                     if from_number:
                                         ctx["from_number"] = from_number
 
-                                    data = await call_fsm_router((auto_execute_trigger_text or ""), context=ctx)
+                                    # Use the FIRST engagement phrase configured in the portal as the trigger text.
+                                    trigger_text = ""
+                                    try:
+                                        cfg = (skills_cfg or {}).get(auto_execute_skill_id) or {}
+                                        phrases = cfg.get("engagement_phrases")
+                                        if isinstance(phrases, list) and phrases:
+                                            trigger_text = str(phrases[0]).strip()
+                                        elif isinstance(phrases, str):
+                                            trigger_text = phrases.strip()
+                                    except Exception:
+                                        pass
+                                    if not trigger_text:
+                                        trigger_text = auto_execute_skill_id  # fallback (should still work via forced_skill_id)
+                                    data = await call_fsm_router(trigger_text, context=ctx)
                                     spoken = None
                                     if isinstance(data, dict):
                                         spoken = (
@@ -896,21 +915,21 @@ async def twilio_stream(websocket: WebSocket):
                         logger.info("First response finished (event=%s, id=%s); barge-in is now ENABLED.", etype, rid)
 
                 elif etype == "response.audio_transcript.delta":
-                    if REALTIME_LOG_TEXT:
+                    if rt_log_text:
                         _log_realtime_audio_transcript_delta(event)
 
                 elif etype == "response.audio_transcript.done":
-                    if REALTIME_LOG_TEXT:
+                    if rt_log_text:
                         transcript = event.get("transcript")
                         if transcript:
                             logger.info("Realtime assistant said (final): %r", transcript)
 
                 elif etype in ("response.output_text.delta", "response.text.delta", "response.output_text"):
-                    if REALTIME_LOG_TEXT:
+                    if rt_log_text:
                         _log_realtime_text_delta(event)
 
                 elif etype in ("response.output_text.done", "response.text.done"):
-                    if REALTIME_LOG_TEXT:
+                    if rt_log_text:
                         logger.info("Realtime text done")
 
                 elif etype == "response.audio.delta":
