@@ -240,6 +240,7 @@ async def twilio_stream(websocket: WebSocket):
     agent_greeting = ""
     skills_cfg: dict = {}
     auto_execute_skill_id: str | None = None
+    auto_execute_trigger_text: str = ""
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
@@ -286,6 +287,38 @@ async def twilio_stream(websocket: WebSocket):
             # Choose ONE auto-exec skill deterministically to avoid surprise cascades
             auto_execute_skill_id = auto_exec_candidates[0] if auto_exec_candidates else None
 
+
+            # Pick a trigger phrase so auto-exec uses the same routing path as voice intent (FSM),
+            # instead of sending an empty utterance.
+            try:
+                if auto_execute_skill_id and isinstance(skills_cfg, dict):
+                    cfg0 = skills_cfg.get(auto_execute_skill_id) or {}
+                    phrases0 = cfg0.get("engagement_phrases") or cfg0.get("engagementPrompt") or []
+                    trig = ""
+                    if isinstance(phrases0, list):
+                        for p in phrases0:
+                            if isinstance(p, str) and p.strip():
+                                trig = p.strip()
+                                break
+                    elif isinstance(phrases0, str) and phrases0.strip():
+                        # If portal/CP returned a multiline string, use the first non-empty line
+                        for line in phrases0.splitlines():
+                            if line.strip():
+                                trig = line.strip()
+                                break
+
+                    # Fallback per-skill defaults
+                    if not trig:
+                        if auto_execute_skill_id == "gmail_summary":
+                            trig = "email summaries"
+                        elif auto_execute_skill_id == "memory":
+                            trig = "memory"
+                        else:
+                            trig = auto_execute_skill_id.replace("_", " ")
+
+                    auto_execute_trigger_text = trig
+            except Exception:
+                auto_execute_trigger_text = ""
             # Kill-switch: disable auto-exec globally without rollback (still allow announcements)
             if os.getenv("SKILLS_AUTO_EXEC_KILL_SWITCH", "0") == "1":
                 auto_execute_skill_id = None
@@ -840,7 +873,7 @@ async def twilio_stream(websocket: WebSocket):
                                     if from_number:
                                         ctx["from_number"] = from_number
 
-                                    data = await call_fsm_router("", context=ctx)
+                                    data = await call_fsm_router((auto_execute_trigger_text or ""), context=ctx)
                                     spoken = None
                                     if isinstance(data, dict):
                                         spoken = (
