@@ -276,6 +276,10 @@ async def twilio_stream(websocket: WebSocket):
     skills_cfg: dict = {}
     auto_execute_skill_id: str | None = None
     auto_execute_trigger_text: str = ""
+    discovery_offer_skill_id: str | None = None
+    discovery_offer_trigger_text: str = ""
+    pending_discovery_skill_id: str | None = None
+    pending_discovery_trigger_text: str = ""
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
@@ -288,6 +292,9 @@ async def twilio_stream(websocket: WebSocket):
 
         # ---- Skill announcement + auto-exec selection (computed once per call; NOT in hot path) ----
         try:
+            discovery_offer_skill_id = None
+            discovery_offer_trigger_text = ""
+
             announce_lines: list[str] = []
             auto_exec_candidates: list[str] = []
 
@@ -308,6 +315,39 @@ async def twilio_stream(websocket: WebSocket):
                         gline = (getattr(sk, "greeting", "") or "").strip() if sk else ""
                         if gline:
                             announce_lines.append(gline)
+
+                            # Keep ONE pending discovery offer so a bare "yes/no" can be resolved.
+                            if discovery_offer_skill_id is None:
+                                discovery_offer_skill_id = sid
+
+                                # Choose a trigger phrase (portal engagement_phrases > manifest trigger phrases > fallback)
+                                trig = ""
+                                phrases = cfg.get("engagement_phrases") or cfg.get("engagementPrompt")
+                                if isinstance(phrases, list) and phrases:
+                                    trig = str(phrases[0]).strip()
+                                elif isinstance(phrases, str) and phrases.strip():
+                                    for line in phrases.splitlines():
+                                        if line.strip():
+                                            trig = line.strip()
+                                            break
+
+                                if not trig and sk is not None:
+                                    try:
+                                        tphr = getattr(getattr(sk, "trigger", None), "phrases", None)
+                                        if isinstance(tphr, list) and tphr:
+                                            trig = str(tphr[0]).strip()
+                                    except Exception:
+                                        pass
+
+                                if not trig:
+                                    if sid == "gmail_summary":
+                                        trig = "email summaries"
+                                    elif sid == "memory":
+                                        trig = "memory"
+                                    else:
+                                        trig = sid.replace("_", " ")
+
+                                discovery_offer_trigger_text = trig
 
                     # Execution toggle (auto-execute after greeting): new key
                     if bool(cfg.get("auto_execute_after_greeting", False)):
@@ -800,6 +840,43 @@ async def twilio_stream(websocket: WebSocket):
 
         logger.info("USER Transcript completed: %r", transcript)
 
+        # Resolve a pending discovery offer (Add-to-greeting) deterministically.
+        nonlocal pending_discovery_skill_id, pending_discovery_trigger_text
+        if pending_discovery_skill_id:
+            norm = _normalize_text(transcript)
+            first = norm.split(" ", 1)[0] if norm else ""
+
+            is_yes = (norm in AFFIRMATIVE_WORDS) or (first in AFFIRMATIVE_PREFIXES)
+            is_no = (norm in NEGATIVE_WORDS) or (first in NEGATIVE_PREFIXES)
+
+            if is_yes:
+                sid = pending_discovery_skill_id
+                trig = pending_discovery_trigger_text or sid.replace("_", " ")
+                pending_discovery_skill_id = None
+                pending_discovery_trigger_text = ""
+                logger.info("DISCOVERY_OFFER_ACCEPTED skill_id=%s trigger=%r", sid, trig)
+
+                spoken_reply = await route_to_fsm_and_get_reply(trig)
+                if spoken_reply:
+                    await create_fsm_spoken_reply(spoken_reply)
+                else:
+                    await create_generic_response()
+                return
+
+            if is_no:
+                sid = pending_discovery_skill_id
+                pending_discovery_skill_id = None
+                pending_discovery_trigger_text = ""
+                logger.info("DISCOVERY_OFFER_DECLINED skill_id=%s", sid)
+                await create_fsm_spoken_reply("No problem. What can I help you with today?")
+                return
+
+            # If the user says something other than a clear yes/no, do not keep the offer around
+            # (prevents a later unrelated "yes" from triggering the skill unexpectedly).
+            logger.info("DISCOVERY_OFFER_UNCLEAR clearing pending offer; user said: %r", transcript)
+            pending_discovery_skill_id = None
+            pending_discovery_trigger_text = ""
+
         is_email = looks_like_email_intent(transcript)
         feature = "email" if is_email else "chitchat"
         style = get_style_for_feature(feature)
@@ -1078,6 +1155,14 @@ async def twilio_stream(websocket: WebSocket):
         greeting_response_id: str | None = None
         auto_exec_fired = False
         user_spoke_once = False
+
+        # If we announced a skill in the opening greeting, keep it as a pending offer.
+        # (Do not keep a pending offer if auto-exec is enabled — auto-exec will handle it.)
+        pending_discovery_skill_id = (
+            discovery_offer_skill_id if (discovery_offer_skill_id and not auto_execute_skill_id) else None
+        )
+        pending_discovery_trigger_text = discovery_offer_trigger_text
+
         openai_ws = await create_realtime_session(prompt_addendum, agent_greeting)
         logger.info("connection open")
 
