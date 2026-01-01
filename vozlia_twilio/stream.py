@@ -782,6 +782,7 @@ async def twilio_stream(websocket: WebSocket):
     # --- OpenAI event loop ---------------------------------------------------
     async def openai_loop():
         nonlocal active_response_id, barge_in_enabled, user_speaking_vad, transcript_action_task, prebuffer_active
+        nonlocal initial_greeting_pending, greeting_response_id, auto_exec_fired, user_spoke_once
 
         try:
             async for raw in openai_ws:
