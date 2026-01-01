@@ -148,6 +148,21 @@ def run_assistant_route(
 
     text_l = (text or "").lower()
 
+    ctx_flags = context if isinstance(context, dict) else {}
+    is_auto_execute = bool(ctx_flags.get("auto_execute") or ctx_flags.get("auto_exec") or ctx_flags.get("autoExecute"))
+    is_offer_followup = bool(ctx_flags.get("offer_followup") or ctx_flags.get("offerFollowup"))
+    wants_standby_ack = bool(is_auto_execute or is_offer_followup or bool(ctx_flags.get("forced_skill_id")))
+
+    def _standby_phrase() -> str:
+        import random as _random
+        choices = [
+            "One moment — I'm pulling up your email summaries now.",
+            "Sure — please hold while I retrieve your latest emails.",
+            "Okay — give me a second to fetch your email summaries.",
+            "Please stand by while I check your inbox.",
+        ]
+        return _random.choice(choices)
+
     # Skill engagement phrases (Gmail Summary)
     force_gmail_summary = False
     try:
@@ -155,16 +170,6 @@ def run_assistant_route(
         force_gmail_summary = any((p or "").strip().lower() in text_l for p in phrases)
     except Exception:
         force_gmail_summary = False
-
-    # Forced skill execution (e.g., auto-execute after greeting)
-    try:
-        forced_skill_id = None
-        if isinstance(context, dict):
-            forced_skill_id = context.get("forced_skill_id")
-        if isinstance(forced_skill_id, str) and forced_skill_id.strip().lower() == "gmail_summary":
-            force_gmail_summary = True
-    except Exception:
-        pass
 
     # Memory engagement phrases (force memory routing even if heuristics miss)
     force_memory = False
@@ -541,8 +546,6 @@ def run_assistant_route(
     fsm_result: dict = fsm.handle_utterance(text, context=fsm_context)
 
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
-    backend_call: dict | None = fsm_result.get("backend_call") or None
-    gmail_data: dict | None = None
     if debug:
         bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
         logger.info(
@@ -552,13 +555,15 @@ def run_assistant_route(
             sorted(list(fsm_result.keys())) if isinstance(fsm_result, dict) else None,
             int((_time.perf_counter() - t0) * 1000),
         )
+    backend_call: dict | None = fsm_result.get("backend_call") or None
+    gmail_data: dict | None = None
     if (not backend_call) and force_gmail_summary:
         backend_call = {
             "type": "gmail_summary",
             "params": {"query": "is:unread", "max_results": 20},
         }
         # Keep behavior consistent with FSM email intent reply
-        spoken_reply = "Sure, I'll take a quick look at your recent unread emails."
+        spoken_reply = _standby_phrase() if wants_standby_ack else "Sure, I'll take a quick look at your recent unread emails."
         try:
             fsm_result = dict(fsm_result)
             fsm_result["backend_call"] = backend_call
@@ -577,6 +582,10 @@ def run_assistant_route(
                 "fsm": fsm_result,
                 "gmail": None,
             }
+
+        # If this was initiated via auto-exec/offer-followup, use a neutral standby phrase instead of a confirmation.
+        if wants_standby_ack:
+            spoken_reply = _standby_phrase()
 
         params = backend_call.get("params") or {}
         account_id_effective = params.get("account_id") or account_id or get_default_gmail_account_id(current_user, db)
