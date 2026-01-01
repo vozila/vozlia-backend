@@ -13,6 +13,7 @@ from db import SessionLocal
 from services.user_service import get_or_create_primary_user
 #from services.settings_service import get_realtime_prompt_addendum
 from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting, get_skills_config
+from services.gmail_service import get_default_gmail_account_id
 from skills.registry import skill_registry
 
 
@@ -301,6 +302,14 @@ async def twilio_stream(websocket: WebSocket):
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
+        # Resolve effective default Gmail account once per call.
+        # Used for proactive flows (auto-exec + add-to-greeting) so the intended inbox is explicit.
+        default_gmail_account_id: str | None = None
+        try:
+            default_gmail_account_id = get_default_gmail_account_id(user, db)
+        except Exception:
+            default_gmail_account_id = None
+        logger.info("GMAIL_DEFAULT_ACCOUNT_EFFECTIVE account_id=%s", default_gmail_account_id)
         prompt_addendum = get_realtime_prompt_addendum(db, user)
         agent_greeting = get_agent_greeting(db, user)
         skills_cfg = get_skills_config(db, user) or {}
@@ -766,7 +775,7 @@ async def twilio_stream(websocket: WebSocket):
         return False
 
     # --- FSM router ----------------------------------------------------------
-    async def route_to_fsm_and_get_reply(transcript: str) -> Optional[str]:
+    async def route_to_fsm_and_get_reply(transcript: str, account_id: str | None = None) -> Optional[str]:
         try:
             ctx = {"channel": "phone"}
             if stream_sid:
@@ -776,7 +785,7 @@ async def twilio_stream(websocket: WebSocket):
             if from_number:
                 ctx["from_number"] = from_number
 
-            data = await call_fsm_router(transcript, context=ctx)
+            data = await call_fsm_router(transcript, context=ctx, account_id=account_id)
             if isinstance(data, dict):
                 # Common patterns we’ve used across codepaths
                 spoken = (
@@ -969,7 +978,7 @@ async def twilio_stream(websocket: WebSocket):
                 pending_discovery_trigger_text = ""
                 logger.info("DISCOVERY_OFFER_ACCEPTED skill_id=%s trigger=%r", sid, trig)
 
-                spoken_reply = await route_to_fsm_and_get_reply(trig)
+                spoken_reply = await route_to_fsm_and_get_reply(trig, account_id=default_gmail_account_id if sid == "gmail_summary" else None)
                 if spoken_reply:
                     await create_fsm_spoken_reply(spoken_reply, clear_playback=False)
                 else:
@@ -1105,7 +1114,7 @@ async def twilio_stream(websocket: WebSocket):
                                     if from_number:
                                         ctx["from_number"] = from_number
 
-                                    data = await call_fsm_router((auto_execute_trigger_text or ""), context=ctx)
+                                    data = await call_fsm_router((auto_execute_trigger_text or ""), context=ctx, account_id=(default_gmail_account_id if auto_execute_skill_id == "gmail_summary" else None))
                                     spoken = None
                                     if isinstance(data, dict):
                                         spoken = (
