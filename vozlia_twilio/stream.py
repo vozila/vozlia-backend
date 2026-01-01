@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import time
+import re
 from typing import Optional
 from contextlib import suppress
 from db import SessionLocal
@@ -124,6 +125,27 @@ def _normalize_text(s: str) -> str:
     for ch in t:
         out.append(ch if (ch.isalnum() or ch.isspace()) else " ")
     return " ".join("".join(out).split())
+
+_ACK_RE = re.compile(
+    r"""^\s*(?:"""
+    r"""sure|of\s+course|okay|ok|alright|certainly|absolutely|no\s+problem|"""
+    r"""right\s+away|got\s+it|sounds\s+good|happy\s+to"""
+    r""")\s*[,!.:-]*\s*""",
+    re.IGNORECASE,
+)
+
+def _strip_ack_preamble(text: str) -> str:
+    """Remove leading conversational acknowledgements (esp. for auto-exec)."""
+    if not isinstance(text, str):
+        return ""
+    t = text.strip()
+    for _ in range(3):
+        new_t = _ACK_RE.sub("", t).strip()
+        if new_t == t:
+            break
+        t = new_t
+    return t
+
 
 
 def get_style_for_feature(feature: str) -> str:
@@ -287,6 +309,8 @@ async def twilio_stream(websocket: WebSocket):
         logger.info("Agent greeting loaded (len=%d)", len(agent_greeting or ""))
 
         # ---- Skill announcement + auto-exec selection (computed once per call; NOT in hot path) ----
+        discovery_offer_skill_id: str | None = None
+        discovery_offer_trigger_text: str = ""
         try:
             announce_lines: list[str] = []
             auto_exec_candidates: list[str] = []
@@ -308,6 +332,29 @@ async def twilio_stream(websocket: WebSocket):
                         gline = (getattr(sk, "greeting", "") or "").strip() if sk else ""
                         if gline:
                             announce_lines.append(gline)
+
+                            # Keep ONE pending discovery offer so a bare "yes/no" can be resolved.
+                            if discovery_offer_skill_id is None:
+                                discovery_offer_skill_id = sid
+
+                                # Choose a trigger phrase (portal engagement_phrases > manifest trigger phrases > fallback)
+                                trig = ""
+                                phrases = cfg.get("engagement_phrases") or cfg.get("engagementPrompt") or []
+                                if isinstance(phrases, list) and phrases:
+                                    trig = str(phrases[0]).strip()
+
+                                if not trig and sk is not None:
+                                    try:
+                                        tphr = getattr(getattr(sk, "trigger", None), "phrases", None)
+                                        if isinstance(tphr, list) and tphr:
+                                            trig = str(tphr[0]).strip()
+                                    except Exception:
+                                        pass
+
+                                if not trig:
+                                    trig = sid.replace("_", " ")
+
+                                discovery_offer_trigger_text = trig
 
                     # Execution toggle (auto-execute after greeting): new key
                     if bool(cfg.get("auto_execute_after_greeting", False)):
@@ -562,7 +609,7 @@ async def twilio_stream(websocket: WebSocket):
     sender_task = asyncio.create_task(twilio_audio_sender())
 
 
-    async def _wait_for_audio_drain(label: str, timeout_s: float = 2.5, target_bytes: int = 0) -> bool:
+    async def _wait_for_audio_drain(label: str, timeout_s: float = 2.5, target_bytes: int = 0, grace_ms: float = 0.0) -> bool:
         """Wait until the outbound Twilio audio buffer drains.
 
         This prevents cutting off the end of the greeting when we enqueue an immediate follow-on response
@@ -574,6 +621,8 @@ async def twilio_stream(websocket: WebSocket):
                 return False
             # We consider 'drained' when there's essentially nothing left queued for Twilio.
             if len(audio_buffer) <= target_bytes:
+                if grace_ms and grace_ms > 0:
+                    await asyncio.sleep(float(grace_ms) / 1000.0)
                 return True
             if (time.monotonic() - start) >= timeout_s:
                 logger.warning(
@@ -744,19 +793,28 @@ async def twilio_stream(websocket: WebSocket):
 
 
     # --- Cancel active response & clear audio buffer -------------------------
-    async def _cancel_active_and_clear_buffer(reason: str):
+    
+    async def _cancel_active_and_clear_buffer(
+        reason: str,
+        *,
+        clear_twilio_playback: bool = False,
+        clear_local_audio_buffer: bool = True,
+    ):
+        """Cancel the active OpenAI response.
+
+        Critical rule:
+        - If there is NO active_response_id, do NOT clear local buffers or Twilio playback.
+          Clearing local audio_buffer at that point can clip the tail end of the greeting (or any finished response)
+          because Twilio may not have received/sent all frames yet.
+        """
         nonlocal active_response_id, prebuffer_active
 
         if not openai_ws:
             logger.info("_cancel_active_and_clear_buffer: no openai_ws (reason=%s)", reason)
-            audio_buffer.clear()
-            prebuffer_active = True
             return
 
         if not active_response_id:
             logger.info("_cancel_active_and_clear_buffer: no active response (reason=%s)", reason)
-            audio_buffer.clear()
-            prebuffer_active = True
             return
 
         rid = active_response_id
@@ -768,16 +826,23 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Error sending response.cancel for %s", rid)
 
         active_response_id = None
-        audio_buffer.clear()
+
+        if clear_twilio_playback:
+            await twilio_clear_buffer()
+
+        if clear_local_audio_buffer:
+            audio_buffer.clear()
+
         prebuffer_active = True
 
-    # --- Create responses ----------------------------------------------------
+
+# --- Create responses ----------------------------------------------------
     async def create_generic_response():
         await _cancel_active_and_clear_buffer("create_generic_response")
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
-    async def create_fsm_spoken_reply(spoken_reply: str):
+    async def create_fsm_spoken_reply(spoken_reply: str, *, clear_playback: bool = True):
         if not spoken_reply:
             logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
             await create_generic_response()
@@ -810,7 +875,10 @@ async def twilio_stream(websocket: WebSocket):
 
         if use_ctrl:
             # Preserve existing behavior: cancel any active response first (same as legacy path).
-            await _cancel_active_and_clear_buffer("create_fsm_spoken_reply_ctrl")
+            if clear_playback:
+                await _cancel_active_and_clear_buffer(
+                    "create_fsm_spoken_reply_ctrl", clear_twilio_playback=False, clear_local_audio_buffer=True
+                )
 
             tenant_id = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
             ctx = ExecutionContext(
@@ -839,7 +907,12 @@ async def twilio_stream(websocket: WebSocket):
             logger.warning("FSM_SPEECH_CONTROLLER_FALLBACK_LEGACY")
 
         # Legacy path (unchanged)
-        await _cancel_active_and_clear_buffer("create_fsm_spoken_reply")
+        if clear_playback:
+            await _cancel_active_and_clear_buffer(
+                "create_fsm_spoken_reply", clear_twilio_playback=False, clear_local_audio_buffer=True
+            )
+        else:
+            logger.info("SPEAK_NO_CLEAR len=%d", len(spoken_reply))
 
         await openai_ws.send(
             json.dumps(
@@ -865,6 +938,41 @@ async def twilio_stream(websocket: WebSocket):
             pending_transcript_during_greeting = transcript
             logger.info("DEFER_TRANSCRIPT_DURING_GREETING: %r", transcript)
             return
+
+        # Resolve a pending discovery offer (Add-to-greeting) deterministically.
+        nonlocal pending_discovery_skill_id, pending_discovery_trigger_text
+        if pending_discovery_skill_id:
+            norm = _normalize_text(transcript)
+            first = norm.split(" ", 1)[0] if norm else ""
+
+            is_yes = (norm in AFFIRMATIVE_WORDS) or (first in AFFIRMATIVE_PREFIXES)
+            is_no = (norm in NEGATIVE_WORDS) or (first in NEGATIVE_PREFIXES)
+
+            if is_yes:
+                sid = pending_discovery_skill_id
+                trig = pending_discovery_trigger_text or sid.replace("_", " ")
+                pending_discovery_skill_id = None
+                pending_discovery_trigger_text = ""
+                logger.info("DISCOVERY_OFFER_ACCEPTED skill_id=%s trigger=%r", sid, trig)
+
+                spoken_reply = await route_to_fsm_and_get_reply(trig)
+                if spoken_reply:
+                    await create_fsm_spoken_reply(spoken_reply, clear_playback=False)
+                else:
+                    await create_generic_response()
+                return
+
+            if is_no:
+                sid = pending_discovery_skill_id
+                pending_discovery_skill_id = None
+                pending_discovery_trigger_text = ""
+                logger.info("DISCOVERY_OFFER_DECLINED skill_id=%s", sid)
+                await create_fsm_spoken_reply("No problem. What can I help you with today?", clear_playback=False)
+                return
+
+            logger.info("DISCOVERY_OFFER_UNCLEAR clearing pending offer; user said: %r", transcript)
+            pending_discovery_skill_id = None
+            pending_discovery_trigger_text = ""
 
 
         is_email = looks_like_email_intent(transcript)
@@ -996,8 +1104,10 @@ async def twilio_stream(websocket: WebSocket):
                                         # Wait for any remaining greeting audio to finish sending before
                                         # enqueuing the auto-exec reply (create_fsm_spoken_reply clears the buffer).
                                         timeout_s = float(os.getenv("AUTO_EXEC_POST_GREETING_DRAIN_TIMEOUT_S", "2.5"))
-                                        await _wait_for_audio_drain("auto_exec_after_greeting", timeout_s=timeout_s, target_bytes=0)
-                                        await create_fsm_spoken_reply(spoken.strip())
+                                        grace_ms = float(os.getenv("POST_GREETING_GRACE_MS", "150") or 150)
+                                        await _wait_for_audio_drain("auto_exec_after_greeting", timeout_s=timeout_s, target_bytes=0, grace_ms=grace_ms)
+                                        clean = _strip_ack_preamble(spoken.strip())
+                                        await create_fsm_spoken_reply(clean, clear_playback=False)
                                     else:
                                         logger.warning("AUTO_EXECUTE_AFTER_GREETING produced no spoken_reply")
                                 except Exception:
@@ -1157,6 +1267,10 @@ async def twilio_stream(websocket: WebSocket):
         greeting_response_id: str | None = None
         auto_exec_fired = False
         user_spoke_once = False
+        pending_discovery_skill_id: str | None = (
+            discovery_offer_skill_id if (discovery_offer_skill_id and not auto_execute_skill_id) else None
+        )
+        pending_discovery_trigger_text: str = discovery_offer_trigger_text
         openai_ws = await create_realtime_session(prompt_addendum, agent_greeting)
         logger.info("connection open")
 
