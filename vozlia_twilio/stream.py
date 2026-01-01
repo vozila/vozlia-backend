@@ -276,10 +276,6 @@ async def twilio_stream(websocket: WebSocket):
     skills_cfg: dict = {}
     auto_execute_skill_id: str | None = None
     auto_execute_trigger_text: str = ""
-    discovery_offer_skill_id: str | None = None
-    discovery_offer_trigger_text: str = ""
-    pending_discovery_skill_id: str | None = None
-    pending_discovery_trigger_text: str = ""
     db = SessionLocal()
     try:
         user = get_or_create_primary_user(db)
@@ -292,9 +288,6 @@ async def twilio_stream(websocket: WebSocket):
 
         # ---- Skill announcement + auto-exec selection (computed once per call; NOT in hot path) ----
         try:
-            discovery_offer_skill_id = None
-            discovery_offer_trigger_text = ""
-
             announce_lines: list[str] = []
             auto_exec_candidates: list[str] = []
 
@@ -315,39 +308,6 @@ async def twilio_stream(websocket: WebSocket):
                         gline = (getattr(sk, "greeting", "") or "").strip() if sk else ""
                         if gline:
                             announce_lines.append(gline)
-
-                            # Keep ONE pending discovery offer so a bare "yes/no" can be resolved.
-                            if discovery_offer_skill_id is None:
-                                discovery_offer_skill_id = sid
-
-                                # Choose a trigger phrase (portal engagement_phrases > manifest trigger phrases > fallback)
-                                trig = ""
-                                phrases = cfg.get("engagement_phrases") or cfg.get("engagementPrompt")
-                                if isinstance(phrases, list) and phrases:
-                                    trig = str(phrases[0]).strip()
-                                elif isinstance(phrases, str) and phrases.strip():
-                                    for line in phrases.splitlines():
-                                        if line.strip():
-                                            trig = line.strip()
-                                            break
-
-                                if not trig and sk is not None:
-                                    try:
-                                        tphr = getattr(getattr(sk, "trigger", None), "phrases", None)
-                                        if isinstance(tphr, list) and tphr:
-                                            trig = str(tphr[0]).strip()
-                                    except Exception:
-                                        pass
-
-                                if not trig:
-                                    if sid == "gmail_summary":
-                                        trig = "email summaries"
-                                    elif sid == "memory":
-                                        trig = "memory"
-                                    else:
-                                        trig = sid.replace("_", " ")
-
-                                discovery_offer_trigger_text = trig
 
                     # Execution toggle (auto-execute after greeting): new key
                     if bool(cfg.get("auto_execute_after_greeting", False)):
@@ -438,6 +398,11 @@ async def twilio_stream(websocket: WebSocket):
     stream_sid: Optional[str] = None
     call_sid: Optional[str] = None
     from_number: Optional[str] = None
+
+    # Greeting protection: barge-in should never clip or cancel the opening greeting.
+    greeting_audio_protected: bool = True
+    greeting_drain_task: Optional[asyncio.Task] = None
+    pending_transcript_during_greeting: Optional[str] = None
 
     barge_in_enabled: bool = False
     twilio_ws_closed: bool = False
@@ -596,6 +561,55 @@ async def twilio_stream(websocket: WebSocket):
 
     sender_task = asyncio.create_task(twilio_audio_sender())
 
+
+    async def _wait_for_audio_drain(label: str, timeout_s: float = 2.5, target_bytes: int = 0) -> bool:
+        """Wait until the outbound Twilio audio buffer drains.
+
+        This prevents cutting off the end of the greeting when we enqueue an immediate follow-on response
+        (e.g., AUTO_EXECUTE_AFTER_GREETING), because create_fsm_spoken_reply cancels/clears the buffer.
+        """
+        start = time.monotonic()
+        while True:
+            if twilio_ws_closed:
+                return False
+            # We consider 'drained' when there's essentially nothing left queued for Twilio.
+            if len(audio_buffer) <= target_bytes:
+                return True
+            if (time.monotonic() - start) >= timeout_s:
+                logger.warning(
+                    "AUDIO_DRAIN_TIMEOUT label=%s q_bytes=%d prebuf=%s",
+                    label,
+                    len(audio_buffer),
+                    prebuffer_active,
+                )
+                return False
+            await asyncio.sleep(0.02)
+
+
+
+    async def _after_greeting_drain():
+        """Release greeting protection once all greeting audio has been sent to Twilio.
+
+        Also processes any transcript that arrived during the greeting, so the caller doesn't lose input.
+        """
+        nonlocal greeting_audio_protected, pending_transcript_during_greeting
+
+        timeout_s = float(os.getenv("GREETING_DRAIN_TIMEOUT_S", "4.0") or 4.0)
+        await _wait_for_audio_drain("greeting_protect", timeout_s=timeout_s, target_bytes=0)
+
+        greeting_audio_protected = False
+        logger.info("GREETING_PROTECT: released (audio drained or timeout)")
+
+        # Process the latest transcript captured during the greeting (if any).
+        if pending_transcript_during_greeting:
+            t = pending_transcript_during_greeting
+            pending_transcript_during_greeting = None
+            logger.info("GREETING_PROTECT: processing deferred transcript: %r", t)
+            try:
+                await handle_transcript_event({"transcript": t})
+            except Exception:
+                logger.exception("DEFERRED_TRANSCRIPT_PROCESS_ERROR")
+
     async def twilio_clear_buffer():
         if stream_sid is None:
             return
@@ -617,6 +631,11 @@ async def twilio_stream(websocket: WebSocket):
         Cancel the active OpenAI response on barge-in and clear Twilio audio.
         """
         nonlocal active_response_id, prebuffer_active
+        nonlocal greeting_audio_protected
+        if greeting_audio_protected:
+            logger.info("BARGE-IN: ignored (greeting protected)")
+            return
+
         if not barge_in_enabled:
             logger.info("BARGE-IN: ignored (not yet enabled)")
             return
@@ -840,42 +859,13 @@ async def twilio_stream(websocket: WebSocket):
 
         logger.info("USER Transcript completed: %r", transcript)
 
-        # Resolve a pending discovery offer (Add-to-greeting) deterministically.
-        nonlocal pending_discovery_skill_id, pending_discovery_trigger_text
-        if pending_discovery_skill_id:
-            norm = _normalize_text(transcript)
-            first = norm.split(" ", 1)[0] if norm else ""
+        # Greeting protection: never let early caller speech cancel/clip the greeting.
+        nonlocal pending_transcript_during_greeting
+        if greeting_audio_protected:
+            pending_transcript_during_greeting = transcript
+            logger.info("DEFER_TRANSCRIPT_DURING_GREETING: %r", transcript)
+            return
 
-            is_yes = (norm in AFFIRMATIVE_WORDS) or (first in AFFIRMATIVE_PREFIXES)
-            is_no = (norm in NEGATIVE_WORDS) or (first in NEGATIVE_PREFIXES)
-
-            if is_yes:
-                sid = pending_discovery_skill_id
-                trig = pending_discovery_trigger_text or sid.replace("_", " ")
-                pending_discovery_skill_id = None
-                pending_discovery_trigger_text = ""
-                logger.info("DISCOVERY_OFFER_ACCEPTED skill_id=%s trigger=%r", sid, trig)
-
-                spoken_reply = await route_to_fsm_and_get_reply(trig)
-                if spoken_reply:
-                    await create_fsm_spoken_reply(spoken_reply)
-                else:
-                    await create_generic_response()
-                return
-
-            if is_no:
-                sid = pending_discovery_skill_id
-                pending_discovery_skill_id = None
-                pending_discovery_trigger_text = ""
-                logger.info("DISCOVERY_OFFER_DECLINED skill_id=%s", sid)
-                await create_fsm_spoken_reply("No problem. What can I help you with today?")
-                return
-
-            # If the user says something other than a clear yes/no, do not keep the offer around
-            # (prevents a later unrelated "yes" from triggering the skill unexpectedly).
-            logger.info("DISCOVERY_OFFER_UNCLEAR clearing pending offer; user said: %r", transcript)
-            pending_discovery_skill_id = None
-            pending_discovery_trigger_text = ""
 
         is_email = looks_like_email_intent(transcript)
         feature = "email" if is_email else "chitchat"
@@ -927,7 +917,7 @@ async def twilio_stream(websocket: WebSocket):
     # --- OpenAI event loop ---------------------------------------------------
     async def openai_loop():
         nonlocal active_response_id, barge_in_enabled, user_speaking_vad, transcript_action_task, prebuffer_active
-        nonlocal initial_greeting_pending, greeting_response_id, auto_exec_fired, user_spoke_once
+        nonlocal initial_greeting_pending, greeting_response_id, auto_exec_fired, user_spoke_once, greeting_audio_protected, greeting_drain_task
 
         try:
             async for raw in openai_ws:
@@ -964,6 +954,14 @@ async def twilio_stream(websocket: WebSocket):
                         active_response_id = None
                         prebuffer_active = True
 
+
+                        # Greeting protection: don't allow barge-in or user transcripts to cancel/clip
+                        # the opening greeting. We keep a lock until the outbound Twilio audio buffer drains.
+                        if greeting_response_id and rid == greeting_response_id and greeting_audio_protected:
+                            if greeting_drain_task is None or greeting_drain_task.done():
+                                greeting_drain_task = asyncio.create_task(_after_greeting_drain())
+                                logger.info("GREETING_PROTECT: drain task scheduled")
+
                         # Auto-execute a configured skill after the greeting finishes (once per call).
                         if (
                             (not auto_exec_fired)
@@ -995,6 +993,10 @@ async def twilio_stream(websocket: WebSocket):
                                         )
                                     if isinstance(spoken, str) and spoken.strip():
                                         # Use the existing "backend-produced speech" path
+                                        # Wait for any remaining greeting audio to finish sending before
+                                        # enqueuing the auto-exec reply (create_fsm_spoken_reply clears the buffer).
+                                        timeout_s = float(os.getenv("AUTO_EXEC_POST_GREETING_DRAIN_TIMEOUT_S", "2.5"))
+                                        await _wait_for_audio_drain("auto_exec_after_greeting", timeout_s=timeout_s, target_bytes=0)
                                         await create_fsm_spoken_reply(spoken.strip())
                                     else:
                                         logger.warning("AUTO_EXECUTE_AFTER_GREETING produced no spoken_reply")
@@ -1155,14 +1157,6 @@ async def twilio_stream(websocket: WebSocket):
         greeting_response_id: str | None = None
         auto_exec_fired = False
         user_spoke_once = False
-
-        # If we announced a skill in the opening greeting, keep it as a pending offer.
-        # (Do not keep a pending offer if auto-exec is enabled — auto-exec will handle it.)
-        pending_discovery_skill_id = (
-            discovery_offer_skill_id if (discovery_offer_skill_id and not auto_execute_skill_id) else None
-        )
-        pending_discovery_trigger_text = discovery_offer_trigger_text
-
         openai_ws = await create_realtime_session(prompt_addendum, agent_greeting)
         logger.info("connection open")
 
