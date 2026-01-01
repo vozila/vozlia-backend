@@ -541,6 +541,8 @@ def run_assistant_route(
     fsm_result: dict = fsm.handle_utterance(text, context=fsm_context)
 
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
+    backend_call: dict | None = fsm_result.get("backend_call") or None
+    gmail_data: dict | None = None
     if debug:
         bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
         logger.info(
@@ -550,8 +552,6 @@ def run_assistant_route(
             sorted(list(fsm_result.keys())) if isinstance(fsm_result, dict) else None,
             int((_time.perf_counter() - t0) * 1000),
         )
-    backend_call: dict | None = fsm_result.get("backend_call") or None
-    gmail_data: dict | None = None
     if (not backend_call) and force_gmail_summary:
         backend_call = {
             "type": "gmail_summary",
