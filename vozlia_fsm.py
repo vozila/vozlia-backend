@@ -18,6 +18,8 @@ FastAPI backend, not here.
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -121,14 +123,11 @@ class VozliaFSM:
         lowered = cleaned.lower()
 
         if not lowered:
-            # Blank / noise
+            # Blank / noise – keep it simple
             intent = INTENT_UNKNOWN
+            spoken_reply = "I didn’t quite catch that. Could you please repeat?"
             backend_call = None
-            # Global conversational policy: never ask clarifying questions when enabled.
-            if os.getenv("NO_CLARIFY_QUESTIONS", "0") == "1":
-                spoken_reply = ""
-            else:
-                spoken_reply = "I didn’t quite catch that. Could you please repeat?"
+            # No need to change state
             return {
                 "intent": intent,
                 "previous_state": original_state,
@@ -177,37 +176,10 @@ class VozliaFSM:
         else:  # INTENT_UNKNOWN
             # For unknowns, keep state simple: go back to idle
             self.reset_to_idle()
-
-            no_clarify = os.getenv("NO_CLARIFY_QUESTIONS", "0") == "1"
-            if not no_clarify:
-                spoken_reply = (
-                    "I’m not entirely sure what you meant. "
-                    "Could you rephrase that or give me a bit more detail?"
-                )
-            else:
-                # In no-clarify mode:
-                # - If it looks like a question and we can't route it -> default to silence
-                # - If it looks like a statement -> acknowledge (optionally restate)
-                q_prefixes = (
-                    "what", "why", "how", "when", "where", "who",
-                    "can you", "could you", "would you", "do you", "did you",
-                    "is it", "are you", "am i", "should i",
-                )
-                is_question = cleaned.endswith("?") or lowered.startswith(q_prefixes)
-
-                if is_question and os.getenv("SILENCE_ON_UNKNOWN_QUESTION", "1") == "1":
-                    spoken_reply = ""
-                else:
-                    restated = cleaned
-                    if lowered.startswith("i'm "):
-                        restated = "you're " + cleaned[4:]
-                    elif lowered.startswith("i am "):
-                        restated = "you're " + cleaned[5:]
-
-                    if os.getenv("ACK_RESTATE_STATEMENTS", "1") == "1" and restated:
-                        spoken_reply = f"Got it — {restated.rstrip('.') }."
-                    else:
-                        spoken_reply = "Got it."
+            spoken_reply = (
+                "I’m not entirely sure what you meant. "
+                "Could you rephrase that or give me a bit more detail?"
+            )
 
         # 3) Build result payload
         result = {
