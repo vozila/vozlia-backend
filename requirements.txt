@@ -13,3 +13,6 @@ google-api-python-client
 twilio
 transitions
 cryptography>=42.0.0
+yfinance==1.0
+pandas>=2.2.3
+numpy>=2.1.0
