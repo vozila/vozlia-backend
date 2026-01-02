@@ -1085,6 +1085,20 @@ async def twilio_stream(websocket: WebSocket):
                         active_response_id = None
                         prebuffer_active = True
 
+                        # Prevent Twilio sender deadlock on partial frames.
+                        # Twilio expects fixed 20ms μ-law frames (BYTES_PER_FRAME=160 at 8kHz).
+                        # If the response ends with a remainder (e.g. 80 bytes), the sender loop will
+                        # never send it (buffer < BYTES_PER_FRAME) and will underrun indefinitely.
+                        rem = len(audio_buffer) % BYTES_PER_FRAME
+                        if rem:
+                            pad = BYTES_PER_FRAME - rem
+                            # μ-law "silence" sample is 0xFF
+                            audio_buffer.extend(b"\xff" * pad)
+                            logger.info(
+                                "twilio_send: padded trailing audio to frame boundary rem=%d pad=%d total=%d",
+                                rem, pad, len(audio_buffer),
+                            )
+
 
                         # Greeting protection: don't allow barge-in or user transcripts to cancel/clip
                         # the opening greeting. We keep a lock until the outbound Twilio audio buffer drains.
