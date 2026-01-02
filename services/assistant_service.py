@@ -8,7 +8,10 @@ from services.settings_service import (
     shortterm_memory_enabled,
     longterm_memory_enabled,
     get_memory_engagement_phrases,
+    get_investment_reporting_config,
+    get_investment_reporting_tickers,
 )
+
 
 import os
 import re
@@ -155,12 +158,22 @@ def run_assistant_route(
 
     def _standby_phrase() -> str:
         import random as _random
-        choices = [
-            "One moment — I'm pulling up your email summaries now.",
-            "Sure — please hold while I retrieve your latest emails.",
-            "Okay — give me a second to fetch your email summaries.",
-            "Please stand by while I check your inbox.",
-        ]
+        forced = (ctx_flags.get("forced_skill_id") if isinstance(ctx_flags, dict) else None) or ""
+        import random as _random
+        if forced == "investment_reporting":
+            choices = [
+                "One moment — I'm pulling up your stock report now.",
+                "Sure — please hold while I fetch the latest prices and news.",
+                "Okay — give me a second to pull the market update.",
+            ]
+        else:
+            choices = [
+                "One moment — I'm pulling up your email summaries now.",
+                "Sure — please hold while I retrieve your latest emails.",
+                "Okay — give me a second to fetch your email summaries.",
+                "Please stand by while I check your inbox.",
+            ]
+        return _random.choice(choices)
         return _random.choice(choices)
 
     # Skill engagement phrases (Gmail Summary)
@@ -172,6 +185,18 @@ def run_assistant_route(
         force_gmail_summary = False
 
     # Memory engagement phrases (force memory routing even if heuristics miss)
+
+    # Skill engagement phrases (Investment Reporting)
+    force_investment_reporting = False
+    try:
+        inv_cfg = get_investment_reporting_config(db, current_user) or {}
+        inv_enabled = bool(inv_cfg.get("enabled", False))
+        inv_phrases = inv_cfg.get("engagement_phrases") or []
+        if inv_enabled and isinstance(inv_phrases, list):
+            force_investment_reporting = any((p or "").strip().lower() in text_l for p in inv_phrases if isinstance(p, str))
+    except Exception:
+        force_investment_reporting = False
+
     force_memory = False
     try:
         mphrases = get_memory_engagement_phrases(db, current_user)
@@ -571,6 +596,19 @@ def run_assistant_route(
             pass
 
 
+
+    if (not backend_call) and force_investment_reporting:
+        backend_call = {
+            "type": "investment_reporting",
+            "params": {},
+        }
+        spoken_reply = _standby_phrase() if wants_standby_ack else "Sure — I can give you a stock report."
+        try:
+            fsm_result = dict(fsm_result)
+            fsm_result["backend_call"] = backend_call
+        except Exception:
+            pass
+
     # ----------------------------
     # (1) Existing FSM backend call behavior (no change)
     # ----------------------------
@@ -885,4 +923,21 @@ def run_assistant_route(
     # ----------------------------
     # (3) Default: return FSM result (no change)
     # ----------------------------
+
+    # -----------------------------
+    # Backend Call: Investment Reporting (wiring validation)
+    # -----------------------------
+    if backend_call and backend_call.get("type") == "investment_reporting":
+        cfg = get_investment_reporting_config(db, current_user) or {}
+        if not bool(cfg.get("enabled", False)):
+            return {"spoken_reply": "Investment reporting is currently turned off in your settings.", "fsm": fsm_result, "gmail": None}
+
+        tickers = get_investment_reporting_tickers(db, current_user)
+        if not tickers:
+            return {"spoken_reply": "Investment reporting is enabled, but no tickers are configured yet.", "fsm": fsm_result, "gmail": None}
+
+        # NOTE: Full Yahoo Finance fetch+news summarization will be added after wiring is confirmed stable.
+        msg = "Your stock report is enabled for: " + ", ".join(tickers) + "."
+        return {"spoken_reply": msg, "fsm": fsm_result, "gmail": None}
+
     return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}

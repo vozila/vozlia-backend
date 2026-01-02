@@ -35,18 +35,20 @@ DEFAULTS: dict[str, dict[str, Any]] = {
                 "add_to_greeting": False,
                 "engagement_phrases": ["email summaries"],
                 "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
+            },
+            "investment_reporting": {
+                "enabled": False,
+                "add_to_greeting": False,
+                "auto_execute_after_greeting": False,
+                "engagement_phrases": ["stock report"],
+                "llm_prompt": "",
+                "tickers": [],
+                "tickers_raw": None,
             }
         }
     },
     "skills_priority_order": {"order": ["gmail_summary", "memory", "sms", "calendar", "web_search", "weather", "investment_reporting"]},
 }
-DEFAULT_INVESTMENT_REPORTING_LLM_PROMPT = (
-    "Summarize stock news in plain language for a caller. "
-    "If there is no major news in the last 24 hours, say so. "
-    "If an analyst upgrade/downgrade is provided, mention it briefly. "
-    "Never mention URLs."
-)
-
 
 
 def _get_setting_row(db: Session, user: User, key: str) -> Optional[UserSetting]:
@@ -106,16 +108,37 @@ def get_realtime_prompt_addendum(db: Session, user: User) -> str:
 # NEW: Skill config helpers
 # -----------------------------
 def get_skills_config(db: Session, user: User) -> dict[str, dict]:
-    v = get_setting(db, user, "skills_config")
-    skills = (v or {}).get("skills")
-    if isinstance(skills, dict):
-        out: dict[str, dict] = {}
-        for k, cfg in skills.items():
-            if isinstance(k, str) and isinstance(cfg, dict):
-                out[k] = cfg
-        return out
-    return dict(DEFAULTS["skills_config"]["skills"])
+    """Return per-skill configuration.
 
+    Back-compat note:
+      - Older versions stored skills under skills_config.skills.{skill_id}
+      - Current control plane returns skills_config.{skill_id} (flat mapping)
+
+    This function accepts both shapes and falls back to DEFAULTS.
+    """
+    v = get_setting(db, user, "skills_config")
+    if isinstance(v, dict):
+        # Shape A: {"skills": {...}}
+        skills = v.get("skills")
+        if isinstance(skills, dict):
+            out: dict[str, dict] = {}
+            for k, cfg in skills.items():
+                if isinstance(k, str) and isinstance(cfg, dict):
+                    out[k] = cfg
+            if out:
+                return out
+
+        # Shape B (current CP): { "<skill_id>": {..}, ... }
+        out2: dict[str, dict] = {}
+        for k, cfg in v.items():
+            if k == "skills":
+                continue
+            if isinstance(k, str) and isinstance(cfg, dict):
+                out2[k] = cfg
+        if out2:
+            return out2
+
+    return dict(DEFAULTS["skills_config"]["skills"])
 
 
 def get_skills_priority_order(db: Session, user: User) -> list[str]:
@@ -153,83 +176,15 @@ def get_skill_config(db: Session, user: User, skill_id: str) -> dict:
     return base
 
 
-
-def get_investment_reporting_config(db: Session, user: User) -> dict:
-    cfg = get_skill_config(db, user, "investment_reporting")
-    return cfg if isinstance(cfg, dict) else {}
-
-
-def get_investment_reporting_tickers(db: Session, user: User) -> list[str]:
-    cfg = get_investment_reporting_config(db, user)
-    raw = cfg.get("tickers") or cfg.get("tickers_csv") or ""
-    if isinstance(raw, list):
-        out = []
-        for t in raw:
-            s = str(t).strip().upper()
-            if s:
-                out.append(s)
-        return out
-    parts = []
-    for chunk in str(raw).replace("\n", ",").split(","):
-        s = chunk.strip().upper()
-        if s:
-            parts.append(s)
-    seen=set()
-    out=[]
-    for s in parts:
-        if s not in seen:
-            seen.add(s); out.append(s)
-    return out
 def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> dict[str, dict]:
-    """Patch a single skill's config. Accepts both snake_case and portal camelCase keys."""
     current = get_skills_config(db, user)
     base = dict(current.get(skill_id) or DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
-
-    # Normalize engagement prompt
-    if "engagementPrompt" in patch and "engagement_phrases" not in patch:
-        raw = patch.get("engagementPrompt")
-        if isinstance(raw, str):
-            phrases = []
-            for chunk in raw.replace(",", "\n").splitlines():
-                s = chunk.strip()
-                if s:
-                    phrases.append(s)
-            patch["engagement_phrases"] = phrases
-
-    # Normalize tickers
-    if "tickers" in patch:
-        raw = patch.get("tickers")
-        if isinstance(raw, str):
-            parts = []
-            for chunk in raw.replace("\n", ",").split(","):
-                s = chunk.strip().upper()
-                if s:
-                    parts.append(s)
-            # de-dupe preserve order
-            seen=set()
-            tickers=[]
-            for s in parts:
-                if s not in seen:
-                    seen.add(s); tickers.append(s)
-            patch["tickers"] = tickers
-    if "tickersCsv" in patch and "tickers" not in patch:
-        patch["tickers"] = patch.get("tickersCsv")
-
-    for k in (
-        "enabled",
-        "add_to_greeting",
-        "auto_execute_after_greeting",
-        "engagement_phrases",
-        "llm_prompt",
-        "tickers",
-    ):
+    for k in ("enabled", "add_to_greeting", "engagement_phrases", "llm_prompt"):
         if k in patch:
             base[k] = patch[k]
-
     current[skill_id] = base
     set_setting(db, user, "skills_config", {"skills": current})
     return current
-
 
 
 def get_gmail_summary_llm_prompt(db: Session, user: User) -> str:
