@@ -167,10 +167,26 @@ def get_gmail_summary_llm_prompt(db: Session, user: User) -> str:
 
 def get_gmail_summary_engagement_phrases(db: Session, user: User) -> list[str]:
     cfg = get_skill_config(db, user, "gmail_summary")
+
     phrases = (cfg or {}).get("engagement_phrases")
+    if not phrases:
+        # Back-compat: admin portal uses camelCase string
+        phrases = (cfg or {}).get("engagementPrompt") or (cfg or {}).get("engagement_prompt")
+
     if isinstance(phrases, list):
         return [str(x).strip() for x in phrases if str(x).strip()]
+
+    if isinstance(phrases, str) and phrases.strip():
+        # Accept multiline or comma-separated strings
+        out: list[str] = []
+        for line in phrases.replace(",", "\n").splitlines():
+            s = line.strip()
+            if s:
+                out.append(s)
+        return out
+
     return []
+
 
 
 def gmail_summary_add_to_greeting(db: Session, user: User) -> bool:
