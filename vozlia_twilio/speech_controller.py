@@ -182,7 +182,7 @@ class SpeechOutputController:
         self.deduper = TranscriptDeduper(window_s=float(os.getenv("TRANSCRIPT_DEDUPE_WINDOW_S", "1.5") or 1.5))
 
         logger.info(
-            "%s_INIT version=%s enabled=%s shadow=%s fail_open=%s payload_trace=%s metadata_trace=%s file=%s",
+            "%s_INIT version=%s enabled=%s shadow=%s fail_open=%s payload_trace=%s metadata_trace=%s auto_exec_force_verbatim=%s file=%s",
             self.name,
             SPEECH_CTRL_VERSION,
             self.enabled,
@@ -190,6 +190,7 @@ class SpeechOutputController:
             self.fail_open,
             self.payload_trace,
             self.metadata_trace,
+            os.getenv("AUTO_EXEC_FORCE_VERBATIM", "0"),
             __file__,
         )
 
@@ -403,7 +404,7 @@ class SpeechOutputController:
             self._last_tool_payload_trunc = payload_trunc
 
             logger.info(
-                "%s_PAYLOAD_SHAPE trace_id=%s conversation=%s has_input=%s has_metadata=%s instr_len=%s keys=%s",
+                "%s_PAYLOAD_SHAPE trace_id=%s conversation=%s speech_mode=%s has_input=%s has_metadata=%s instr_len=%s keys=%s",
                 self.name, req.trace_id, conv_val, has_input, has_metadata, instr_len, keys
             )
             if payload_trunc:
@@ -437,6 +438,11 @@ class SpeechOutputController:
 
         # Determine policy knobs
         speech_mode = policy.speech_mode or defaults.speech_mode_default
+        # Feature-flag: make auto-exec deterministic by forcing "verbatim" wrapper.
+        # This reduces cases where Realtime ignores raw instructions and replies generically.
+        if req.reason == "auto_exec_after_greeting":
+            if os.getenv("AUTO_EXEC_FORCE_VERBATIM", "0").lower() in ("1", "true", "yes", "on"):
+                speech_mode = "verbatim"
         conversation_mode = policy.conversation_mode or defaults.conversation_mode_default
         max_chars = policy.max_chars if policy.max_chars is not None else defaults.max_chars_default
 
