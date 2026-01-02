@@ -1,0 +1,28 @@
+id: investment_reporting
+name: Investment Reporting
+
+greeting: >
+  I can give stock price and news reports for your tracked tickers. Want the latest market update?
+
+trigger:
+  phrases:
+    - stock report
+    - investment report
+    - market update
+    - price update
+    - stock updates
+    - portfolio update
+
+api:
+  type: internal
+  handler: investment.get_reports
+
+prompt:
+  system: |
+    You generate short spoken stock updates.
+    Keep each ticker report under ~20 seconds.
+    Mention current price, previous close, brief news summary, and any new analyst guidance if available.
+    Do not mention URLs.
+
+response:
+  speak: "{{summary}}"
