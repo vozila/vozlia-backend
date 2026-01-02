@@ -2,21 +2,14 @@
 from __future__ import annotations
 
 import os
-import random
-import threading
 import time
+import random
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from core.logging import logger
-
-
-# In-process quote cache to reduce Yahoo throttling (429).
-# Key: sorted comma-joined tickers; Value: (ts_epoch, quotes_by_symbol)
-_INVREP_QUOTES_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
-_INVREP_QUOTES_CACHE_LOCK = threading.Lock()
 from openai import OpenAI
 from core import config as cfg
 
@@ -35,6 +28,17 @@ YF_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
 YF_QUOTESUMMARY_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
 
 DEFAULT_NEWS_COUNT = 5
+
+# Investment Reporting market-data provider:
+# - yfinance: use yfinance library (cookie/crumb/session handling). Requires dependency install.
+# - httpx: direct Yahoo endpoints (more likely to be rate-limited / blocked).
+# Default is yfinance.
+INVREP_DATA_PROVIDER = os.getenv("INVREP_DATA_PROVIDER", "yfinance").lower().strip()
+
+# In-process caches to reduce throttling (Yahoo often returns 429 from server IP ranges).
+_QUOTE_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
+_NEWS_CACHE: dict[str, tuple[float, list[dict]]] = {}
+
 
 
 def _split_tickers(raw: str | list[str] | None) -> list[str]:
@@ -70,6 +74,53 @@ _YAHOO_UA = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 
+def _cache_key(symbols: list[str]) -> str:
+    return ",".join(sorted([s.strip().upper() for s in symbols if s and s.strip()]))
+
+def _cache_ttl_seconds(env_name: str, default: int) -> int:
+    try:
+        v = int(os.getenv(env_name, str(default)))
+        return max(1, v)
+    except Exception:
+        return default
+
+def _cache_get_quotes(key: str) -> dict[str, dict] | None:
+    ttl = _cache_ttl_seconds("YF_QUOTE_CACHE_TTL_S", 60)
+    hit = _QUOTE_CACHE.get(key)
+    if not hit:
+        return None
+    ts, data = hit
+    if (time.time() - ts) <= ttl:
+        return data
+    return None
+
+def _cache_get_quotes_stale(key: str) -> dict[str, dict] | None:
+    ttl = _cache_ttl_seconds("YF_QUOTE_CACHE_STALE_TTL_S", 600)
+    hit = _QUOTE_CACHE.get(key)
+    if not hit:
+        return None
+    ts, data = hit
+    if (time.time() - ts) <= ttl:
+        return data
+    return None
+
+def _cache_set_quotes(key: str, data: dict[str, dict]) -> None:
+    _QUOTE_CACHE[key] = (time.time(), data)
+
+def _cache_get_news(symbol: str) -> list[dict] | None:
+    ttl = _cache_ttl_seconds("YF_NEWS_CACHE_TTL_S", 300)
+    hit = _NEWS_CACHE.get(symbol)
+    if not hit:
+        return None
+    ts, data = hit
+    if (time.time() - ts) <= ttl:
+        return data
+    return None
+
+def _cache_set_news(symbol: str, data: list[dict]) -> None:
+    _NEWS_CACHE[symbol] = (time.time(), data)
+
+
 def _yahoo_client() -> httpx.Client:
     return httpx.Client(
         headers={
@@ -85,176 +136,262 @@ def _yahoo_client() -> httpx.Client:
     )
 
 def _prime_yahoo_cookies(client: httpx.Client) -> None:
-    """Optionally prime Yahoo cookies.
-
-    Historically we used `https://fc.yahoo.com` to set a `B` cookie, but on some edges this returns
-    `404 Not Found on Accelerator` and it adds extra requests that can trigger 429 throttling.
-    If you see 401/403 again, enable priming via `YF_COOKIE_PRIME=1` and we will hit the main site.
-    """
-    if os.getenv("YF_COOKIE_PRIME", "0") not in ("1", "true", "True", "yes"):
-        return
+    # This typically sets the `B` cookie and helps avoid 401/403.
     try:
-        # A lightweight HTML request to establish cookies. Avoid calling quote endpoints here.
-        client.get("https://finance.yahoo.com/quote/AAPL")
+        client.get("https://fc.yahoo.com")
     except Exception:
         pass
 
+def fetch_quotes(tickers: List[str]) -> dict[str, dict]:
+    """Fetch quote snapshot keyed by symbol.
 
+    Prefer yfinance (handles cookie/crumb/session) to reduce bot-blocking issues.
+    Fallback to direct Yahoo endpoints if yfinance is unavailable or fails.
 
-def fetch_quotes(tickers: List[str]) -> Dict[str, Dict]:
-    """Fetch quote snapshots for the provided tickers.
-
-    Returns a mapping: {SYMBOL: quote_dict_from_yahoo}.
-
-    Reliability notes:
-    - Yahoo often rate-limits server IPs (429). We therefore:
-      1) Use an in-process TTL cache (default 60s).
-      2) Implement 429-aware backoff with jitter and *avoid hammering* query1/query2.
-      3) Prefer `query2` over `query1`.
-    - Cookie priming is OFF by default to reduce request volume; enable with `YF_COOKIE_PRIME=1` if 401/403 returns.
+    Returns mapping:
+      { 'AAPL': {'regularMarketPrice': ..., 'regularMarketPreviousClose': ..., 'currency': ..., 'longName': ...}, ... }
     """
-    # Normalize symbols
+    tickers = _split_tickers(tickers)
+    if not tickers:
+        return {}
+
+    key = _cache_key(tickers)
+    cached = _cache_get_quotes(key)
+    if cached is not None:
+        return cached
+
+    provider = os.getenv("INVREP_DATA_PROVIDER", "yfinance").lower().strip()
+    last_err: Exception | None = None
+
+    if provider in ("yfinance", "yf"):
+        try:
+            data = _fetch_quotes_yfinance(tickers)
+            if data:
+                _cache_set_quotes(key, data)
+                return data
+        except Exception as e:
+            last_err = e
+            logger.warning("INVREP_YFINANCE_QUOTES_FAIL tickers=%s err=%s", tickers, type(e).__name__)
+
+    try:
+        data = _fetch_quotes_httpx_with_backoff(tickers)
+        if data:
+            _cache_set_quotes(key, data)
+            return data
+    except Exception as e:
+        last_err = e
+
+    stale = _cache_get_quotes_stale(key)
+    if stale is not None:
+        logger.warning("INVREP_QUOTES_STALE_CACHE_HIT tickers=%s", tickers)
+        return stale
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("Quote fetch failed")
+
+
+def _fetch_quotes_yfinance(tickers: list[str]) -> dict[str, dict]:
+    """Fetch quotes via yfinance.
+
+    Requires: yfinance + pandas + numpy installed in the runtime.
+    """
+    import yfinance as yf
+
     syms = [t.strip().upper() for t in tickers if t and t.strip()]
     if not syms:
         return {}
 
-    # Cache key is sorted symbols so AAPL,MSFT equals MSFT,AAPL
-    cache_key = ",".join(sorted(syms))
-    now = time.time()
-    ttl_s = float(os.getenv("YF_QUOTE_CACHE_TTL_S", "60"))
-    stale_ttl_s = float(os.getenv("YF_QUOTE_CACHE_STALE_TTL_S", "600"))  # allow stale on 429
+    tks = yf.Tickers(" ".join(syms))
 
-    with _INVREP_QUOTES_CACHE_LOCK:
-        hit = _INVREP_QUOTES_CACHE.get(cache_key)
-        if hit and (now - hit[0]) < ttl_s:
-            return hit[1]
+    out: dict[str, dict] = {}
+    for sym in syms:
+        t = tks.tickers.get(sym) or yf.Ticker(sym)
 
-    params = {
-        "symbols": ",".join(syms),
-        "formatted": "false",
-        "region": "US",
-        "lang": "en-US",
-    }
+        info: dict = {}
+        try:
+            info = t.info or {}
+        except Exception:
+            info = {}
 
-    bases = [
-        "https://query2.finance.yahoo.com",
-        "https://query1.finance.yahoo.com",
-    ]
+        price = info.get("regularMarketPrice")
+        prev = info.get("regularMarketPreviousClose")
+        currency = info.get("currency")
+        long_name = info.get("longName") or info.get("shortName")
 
-    def _parse_quotes(payload: dict) -> Dict[str, Dict]:
-        results = (((payload.get("quoteResponse") or {}).get("result")) or [])
-        out: Dict[str, Dict] = {}
-        if isinstance(results, list):
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                sym = str(item.get("symbol") or "").strip().upper()
-                if sym:
-                    out[sym] = item
-        return out
+        if price is None or prev is None:
+            fi = getattr(t, "fast_info", None) or {}
+            price = price if price is not None else fi.get("last_price") or fi.get("lastPrice")
+            prev = prev if prev is not None else fi.get("previous_close") or fi.get("previousClose")
 
-    max_attempts = int(os.getenv("YF_QUOTE_MAX_ATTEMPTS", "3"))
-    last_err: Exception | None = None
+        if price is None or prev is None:
+            hist = t.history(period="2d", interval="1d")
+            if len(hist.index) >= 2:
+                prev = float(hist["Close"].iloc[-2])
+                price = float(hist["Close"].iloc[-1])
+            elif len(hist.index) == 1:
+                price = float(hist["Close"].iloc[-1])
+
+        out[sym] = {
+            "symbol": sym,
+            "regularMarketPrice": price,
+            "regularMarketPreviousClose": prev,
+            "currency": currency,
+            "longName": long_name,
+        }
+
+        time.sleep(0.05)
+
+    logger.info("INVREP_YFINANCE_QUOTES_OK tickers=%s", syms)
+    return out
+
+
+def _fetch_quotes_httpx_with_backoff(tickers: list[str]) -> dict[str, dict]:
+    """Fallback quote fetch using direct Yahoo endpoints with 429-aware backoff."""
+    symbols = ",".join([t.strip().upper() for t in tickers if t.strip()])
+    if not symbols:
+        return {}
+
+    params = {"symbols": symbols, "formatted": "false", "region": "US", "lang": "en-US"}
+    bases = ["https://query2.finance.yahoo.com", "https://query1.finance.yahoo.com"]
+
+    max_attempts = _cache_ttl_seconds("YF_QUOTE_MAX_ATTEMPTS", 3)
 
     with _yahoo_client() as client:
-        _prime_yahoo_cookies(client)
-
-        for attempt in range(max_attempts):
-            url = f"{bases[0]}/v7/finance/quote"  # query2 preferred
-            try:
-                r = client.get(url, params=params)
-
-                if r.status_code == 429:
-                    # Throttled: backoff + retry query2 only (query1 is usually also throttled).
-                    ra = r.headers.get("Retry-After")
-                    try:
-                        base_sleep = float(ra) if ra else (1.0 * (2 ** attempt))
-                    except Exception:
-                        base_sleep = 1.0 * (2 ** attempt)
-                    sleep_s = min(8.0, max(0.5, base_sleep)) + random.random() * 0.35
-                    logger.info("INVREP_YF_THROTTLED status=429 sleep_s=%.2f attempt=%d", sleep_s, attempt + 1)
-
-                    # If we have any cached value (even stale), return it rather than failing the call.
-                    with _INVREP_QUOTES_CACHE_LOCK:
-                        hit2 = _INVREP_QUOTES_CACHE.get(cache_key)
-                        if hit2 and (now - hit2[0]) < stale_ttl_s:
-                            logger.info("INVREP_QUOTES_STALE_CACHE_HIT key=%s age_s=%.1f", cache_key, now - hit2[0])
-                            return hit2[1]
-
-                    time.sleep(sleep_s)
+        last_err: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            for base in bases:
+                url = f"{base}/v7/finance/quote"
+                try:
+                    r = client.get(url, params=params)
+                    if r.status_code == 429:
+                        ra = r.headers.get("Retry-After")
+                        sleep_s = float(ra) if ra and ra.isdigit() else min(8.0, 0.75 * (2 ** (attempt - 1)))
+                        sleep_s = sleep_s + random.random() * 0.35
+                        logger.info("INVREP_YF_THROTTLED status=429 sleep_s=%.2f attempt=%d", sleep_s, attempt)
+                        time.sleep(sleep_s)
+                        last_err = httpx.HTTPStatusError("429 Too Many Requests", request=r.request, response=r)
+                        continue
+                    if r.status_code in (401, 403):
+                        last_err = httpx.HTTPStatusError(f"{r.status_code} Unauthorized/Forbidden", request=r.request, response=r)
+                        continue
+                    r.raise_for_status()
+                    data = r.json() or {}
+                    results = (((data.get("quoteResponse") or {}).get("result")) or [])
+                    out: dict[str, dict] = {}
+                    if isinstance(results, list):
+                        for item in results:
+                            if not isinstance(item, dict):
+                                continue
+                            sym = (item.get("symbol") or "").strip().upper()
+                            if sym:
+                                out[sym] = item
+                    if out:
+                        logger.info("INVREP_HTTPX_QUOTES_OK tickers=%s", tickers)
+                        return out
+                except Exception as e:
+                    last_err = e
                     continue
 
-                if r.status_code in (401, 403):
-                    # Try query1 as a fallback *once per attempt*.
-                    last_err = httpx.HTTPStatusError(f"{r.status_code} from {url}", request=r.request, response=r)
-                    url2 = f"{bases[1]}/v7/finance/quote"
-                    r2 = client.get(url2, params=params)
-                    if r2.status_code == 429:
-                        ra = r2.headers.get("Retry-After")
-                        base_sleep = float(ra) if ra and ra.replace('.', '', 1).isdigit() else (1.0 * (2 ** attempt))
-                        sleep_s = min(8.0, max(0.5, base_sleep)) + random.random() * 0.35
-                        logger.info("INVREP_YF_THROTTLED status=429 base=query1 sleep_s=%.2f attempt=%d", sleep_s, attempt + 1)
-                        with _INVREP_QUOTES_CACHE_LOCK:
-                            hit3 = _INVREP_QUOTES_CACHE.get(cache_key)
-                            if hit3 and (now - hit3[0]) < stale_ttl_s:
-                                logger.info("INVREP_QUOTES_STALE_CACHE_HIT key=%s age_s=%.1f", cache_key, now - hit3[0])
-                                return hit3[1]
-                        time.sleep(sleep_s)
-                        continue
-                    r2.raise_for_status()
-                    payload = r2.json() or {}
-                    out = _parse_quotes(payload)
-                    with _INVREP_QUOTES_CACHE_LOCK:
-                        _INVREP_QUOTES_CACHE[cache_key] = (time.time(), out)
-                    return out
+        if last_err:
+            raise last_err
+        raise RuntimeError("Yahoo Finance quote fetch failed unexpectedly")
 
-                r.raise_for_status()
-                payload = r.json() or {}
-                out = _parse_quotes(payload)
-                with _INVREP_QUOTES_CACHE_LOCK:
-                    _INVREP_QUOTES_CACHE[cache_key] = (time.time(), out)
-                return out
-
-            except Exception as e:
-                last_err = e
-                # backoff on transient errors too
-                sleep_s = min(4.0, 0.5 * (attempt + 1)) + random.random() * 0.2
-                time.sleep(sleep_s)
-                continue
-
-    # Final: return stale cache if we have it, otherwise raise
-    with _INVREP_QUOTES_CACHE_LOCK:
-        hit4 = _INVREP_QUOTES_CACHE.get(cache_key)
-        if hit4 and (now - hit4[0]) < stale_ttl_s:
-            logger.info("INVREP_QUOTES_STALE_CACHE_HIT key=%s age_s=%.1f", cache_key, now - hit4[0])
-            return hit4[1]
-
-    if last_err:
-        raise last_err
-    raise RuntimeError("Yahoo Finance quote fetch failed unexpectedly")
 
 
 def fetch_news(symbol: str, news_count: int = DEFAULT_NEWS_COUNT, timeout_s: float = 8.0) -> list[dict]:
-    """Fetch recent news items for a ticker using Yahoo Finance search endpoint."""
+    """Fetch recent news for a ticker.
+
+    Prefer yfinance (Ticker.news) to reduce bot-blocking and rate-limit issues.
+    Falls back to Yahoo search endpoint if yfinance fails.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return []
+
+    cached = _cache_get_news(sym)
+    if cached is not None:
+        return cached
+
+    provider = os.getenv("INVREP_DATA_PROVIDER", "yfinance").lower().strip()
+
+    if provider in ("yfinance", "yf"):
+        try:
+            import yfinance as yf
+            tkr = yf.Ticker(sym)
+            news = tkr.news or []
+            out: list[dict] = []
+            for n in news[: int(news_count)]:
+                if not isinstance(n, dict):
+                    continue
+                out.append({
+                    "title": n.get("title"),
+                    "publisher": n.get("publisher"),
+                    "link": n.get("link"),
+                    "providerPublishTime": n.get("providerPublishTime"),
+                })
+            _cache_set_news(sym, out)
+            logger.info("INVREP_YFINANCE_NEWS_OK symbol=%s n=%d", sym, len(out))
+            return out
+        except Exception as e:
+            logger.info("INVREP_YFINANCE_NEWS_FAIL symbol=%s err=%s", sym, type(e).__name__)
+
     headers = {"User-Agent": "Mozilla/5.0 (Vozlia)"}
-    params = {"q": symbol, "newsCount": str(int(news_count)), "quotesCount": "0"}
+    params = {"q": sym, "newsCount": str(int(news_count)), "quotesCount": "0"}
     with httpx.Client(timeout=timeout_s, headers=headers) as client:
         r = client.get(YF_SEARCH_URL, params=params)
         r.raise_for_status()
         data = r.json() or {}
-    news = data.get("news") or []
-    out: list[dict] = []
-    if isinstance(news, list):
-        for n in news:
-            if isinstance(n, dict):
-                out.append(n)
+    news = data.get("news", [])
+    out = _normalize_news_items(news)
+    _cache_set_news(sym, out)
     return out
 
 
 def fetch_analyst_guidance(symbol: str, timeout_s: float = 8.0) -> dict:
-    """Best-effort analyst signals from quoteSummary. If Yahoo blocks, return {}."""
+    """Best-effort analyst signals.
+
+    Prefer yfinance upgrades/downgrades if available; fallback to Yahoo quoteSummary.
+    Return {} if unavailable.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return {}
+
+    provider = os.getenv("INVREP_DATA_PROVIDER", "yfinance").lower().strip()
+
+    if provider in ("yfinance", "yf"):
+        try:
+            import yfinance as yf
+            tkr = yf.Ticker(sym)
+            ud = getattr(tkr, "upgrades_downgrades", None)
+            if ud is not None and hasattr(ud, "empty") and not ud.empty:
+                last = ud.tail(1)
+                row = last.iloc[0].to_dict()
+                ts = None
+                try:
+                    idx = last.index[-1]
+                    ts = int(idx.timestamp())
+                except Exception:
+                    ts = None
+                return {
+                    "upgradeDowngradeHistory": {
+                        "history": [
+                            {
+                                "epochGradeDate": ts,
+                                "firm": row.get("Firm") or row.get("firm"),
+                                "fromGrade": row.get("From Grade") or row.get("fromGrade"),
+                                "toGrade": row.get("To Grade") or row.get("toGrade"),
+                                "action": row.get("Action") or row.get("action"),
+                            }
+                        ]
+                    }
+                }
+        except Exception as e:
+            logger.info("INVREP_YFINANCE_ANALYST_FAIL symbol=%s err=%s", sym, type(e).__name__)
+
     headers = {"User-Agent": "Mozilla/5.0 (Vozlia)"}
-    url = YF_QUOTESUMMARY_URL.format(symbol=symbol)
+    url = YF_QUOTESUMMARY_URL.format(symbol=sym)
     params = {"modules": "upgradeDowngradeHistory,recommendationTrend"}
     try:
         with httpx.Client(timeout=timeout_s, headers=headers) as client:
@@ -265,7 +402,7 @@ def fetch_analyst_guidance(symbol: str, timeout_s: float = 8.0) -> dict:
         if isinstance(result, list) and result:
             return result[0] if isinstance(result[0], dict) else {}
     except Exception as e:
-        logger.info("INVREP analyst fetch skipped symbol=%s err=%s", symbol, type(e).__name__)
+        logger.info("INVREP analyst fetch skipped symbol=%s err=%s", sym, type(e).__name__)
     return {}
 
 
@@ -278,6 +415,24 @@ def _epoch_to_dt(ts: Any) -> Optional[datetime]:
     except Exception:
         return None
 
+
+def _normalize_news_items(items: Any) -> list[dict]:
+    """Normalize Yahoo-style news items into the stable shape used by _filter_news_last_24h."""
+    if not isinstance(items, list):
+        return []
+    out: list[dict] = []
+    for n in items:
+        if not isinstance(n, dict):
+            continue
+        out.append(
+            {
+                "title": n.get("title"),
+                "publisher": n.get("publisher") or (n.get("provider") or ""),
+                "link": n.get("link") or n.get("url"),
+                "providerPublishTime": n.get("providerPublishTime") or n.get("published_at"),
+            }
+        )
+    return out
 
 def _filter_news_last_24h(items: list[dict]) -> list[dict]:
     now = datetime.now(tz=timezone.utc)
