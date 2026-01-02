@@ -364,6 +364,21 @@ def register_flow_a(
                         rid = (event.get("response") or {}).get("id")
                         if active_response_id and rid == active_response_id:
                             active_response_id = None
+
+                            # Prevent Twilio sender deadlock on partial frames.
+                            # Twilio expects fixed 20ms μ-law frames (BYTES_PER_FRAME=160 at 8kHz).
+                            # If the response ends with a remainder (e.g. 80 bytes), the sender loop will
+                            # never send it (buffer < BYTES_PER_FRAME) and will underrun indefinitely.
+                            rem = len(audio_buffer) % BYTES_PER_FRAME
+                            if rem:
+                                pad = BYTES_PER_FRAME - rem
+                                # μ-law "silence" sample is 0xFF
+                                audio_buffer.extend(b"\xff" * pad)
+                                logger.info(
+                                    "twilio_send: padded trailing audio to frame boundary rem=%d pad=%d total=%d",
+                                    rem, pad, len(audio_buffer),
+                                )
+
                         if not barge_in_enabled:
                             barge_in_enabled = True
 
