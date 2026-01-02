@@ -88,7 +88,6 @@ def execute_skill(
 
     # Handler: Gmail Summary
     # Use existing Gmail summary code (no behavior change beyond routing to it)
- (no behavior change beyond routing to it)
     account_id_effective = account_id or get_default_gmail_account_id(current_user, db)
     if not account_id_effective:
         return {
