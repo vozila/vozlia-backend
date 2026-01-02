@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import random
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,6 +11,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from core.logging import logger
+
+
+# In-process quote cache to reduce Yahoo throttling (429).
+# Key: sorted comma-joined tickers; Value: (ts_epoch, quotes_by_symbol)
+_INVREP_QUOTES_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
+_INVREP_QUOTES_CACHE_LOCK = threading.Lock()
 from openai import OpenAI
 from core import config as cfg
 
@@ -77,19 +85,52 @@ def _yahoo_client() -> httpx.Client:
     )
 
 def _prime_yahoo_cookies(client: httpx.Client) -> None:
-    # This typically sets the `B` cookie and helps avoid 401/403.
+    """Optionally prime Yahoo cookies.
+
+    Historically we used `https://fc.yahoo.com` to set a `B` cookie, but on some edges this returns
+    `404 Not Found on Accelerator` and it adds extra requests that can trigger 429 throttling.
+    If you see 401/403 again, enable priming via `YF_COOKIE_PRIME=1` and we will hit the main site.
+    """
+    if os.getenv("YF_COOKIE_PRIME", "0") not in ("1", "true", "True", "yes"):
+        return
     try:
-        client.get("https://fc.yahoo.com")
+        # A lightweight HTML request to establish cookies. Avoid calling quote endpoints here.
+        client.get("https://finance.yahoo.com/quote/AAPL")
     except Exception:
         pass
 
-def fetch_quotes(tickers: List[str]) -> Dict[str, Any]:
-    symbols = ",".join([t.strip().upper() for t in tickers if t.strip()])
-    if not symbols:
+
+
+def fetch_quotes(tickers: List[str]) -> Dict[str, Dict]:
+    """Fetch quote snapshots for the provided tickers.
+
+    Returns a mapping: {SYMBOL: quote_dict_from_yahoo}.
+
+    Reliability notes:
+    - Yahoo often rate-limits server IPs (429). We therefore:
+      1) Use an in-process TTL cache (default 60s).
+      2) Implement 429-aware backoff with jitter and *avoid hammering* query1/query2.
+      3) Prefer `query2` over `query1`.
+    - Cookie priming is OFF by default to reduce request volume; enable with `YF_COOKIE_PRIME=1` if 401/403 returns.
+    """
+    # Normalize symbols
+    syms = [t.strip().upper() for t in tickers if t and t.strip()]
+    if not syms:
         return {}
 
+    # Cache key is sorted symbols so AAPL,MSFT equals MSFT,AAPL
+    cache_key = ",".join(sorted(syms))
+    now = time.time()
+    ttl_s = float(os.getenv("YF_QUOTE_CACHE_TTL_S", "60"))
+    stale_ttl_s = float(os.getenv("YF_QUOTE_CACHE_STALE_TTL_S", "600"))  # allow stale on 429
+
+    with _INVREP_QUOTES_CACHE_LOCK:
+        hit = _INVREP_QUOTES_CACHE.get(cache_key)
+        if hit and (now - hit[0]) < ttl_s:
+            return hit[1]
+
     params = {
-        "symbols": symbols,
+        "symbols": ",".join(syms),
         "formatted": "false",
         "region": "US",
         "lang": "en-US",
@@ -100,37 +141,97 @@ def fetch_quotes(tickers: List[str]) -> Dict[str, Any]:
         "https://query1.finance.yahoo.com",
     ]
 
+    def _parse_quotes(payload: dict) -> Dict[str, Dict]:
+        results = (((payload.get("quoteResponse") or {}).get("result")) or [])
+        out: Dict[str, Dict] = {}
+        if isinstance(results, list):
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                sym = str(item.get("symbol") or "").strip().upper()
+                if sym:
+                    out[sym] = item
+        return out
+
+    max_attempts = int(os.getenv("YF_QUOTE_MAX_ATTEMPTS", "3"))
+    last_err: Exception | None = None
+
     with _yahoo_client() as client:
         _prime_yahoo_cookies(client)
 
-        last_err = None
-        # small retry loop: try query2 then query1; repeat once with a short backoff
-        for attempt in range(2):
-            for base in bases:
-                url = f"{base}/v7/finance/quote"
-                try:
-                    r = client.get(url, params=params)
-                    if r.status_code in (401, 403):
-                        # try alternate base / retry after priming
-                        last_err = httpx.HTTPStatusError(
-                            f"{r.status_code} from {url}", request=r.request, response=r
-                        )
-                        continue
-                    r.raise_for_status()
-                    return r.json()
-                except Exception as e:
-                    last_err = e
+        for attempt in range(max_attempts):
+            url = f"{bases[0]}/v7/finance/quote"  # query2 preferred
+            try:
+                r = client.get(url, params=params)
+
+                if r.status_code == 429:
+                    # Throttled: backoff + retry query2 only (query1 is usually also throttled).
+                    ra = r.headers.get("Retry-After")
+                    try:
+                        base_sleep = float(ra) if ra else (1.0 * (2 ** attempt))
+                    except Exception:
+                        base_sleep = 1.0 * (2 ** attempt)
+                    sleep_s = min(8.0, max(0.5, base_sleep)) + random.random() * 0.35
+                    logger.info("INVREP_YF_THROTTLED status=429 sleep_s=%.2f attempt=%d", sleep_s, attempt + 1)
+
+                    # If we have any cached value (even stale), return it rather than failing the call.
+                    with _INVREP_QUOTES_CACHE_LOCK:
+                        hit2 = _INVREP_QUOTES_CACHE.get(cache_key)
+                        if hit2 and (now - hit2[0]) < stale_ttl_s:
+                            logger.info("INVREP_QUOTES_STALE_CACHE_HIT key=%s age_s=%.1f", cache_key, now - hit2[0])
+                            return hit2[1]
+
+                    time.sleep(sleep_s)
                     continue
 
-            # backoff then re-prime cookies once
-            time.sleep(0.5 + attempt * 0.5)
-            _prime_yahoo_cookies(client)
+                if r.status_code in (401, 403):
+                    # Try query1 as a fallback *once per attempt*.
+                    last_err = httpx.HTTPStatusError(f"{r.status_code} from {url}", request=r.request, response=r)
+                    url2 = f"{bases[1]}/v7/finance/quote"
+                    r2 = client.get(url2, params=params)
+                    if r2.status_code == 429:
+                        ra = r2.headers.get("Retry-After")
+                        base_sleep = float(ra) if ra and ra.replace('.', '', 1).isdigit() else (1.0 * (2 ** attempt))
+                        sleep_s = min(8.0, max(0.5, base_sleep)) + random.random() * 0.35
+                        logger.info("INVREP_YF_THROTTLED status=429 base=query1 sleep_s=%.2f attempt=%d", sleep_s, attempt + 1)
+                        with _INVREP_QUOTES_CACHE_LOCK:
+                            hit3 = _INVREP_QUOTES_CACHE.get(cache_key)
+                            if hit3 and (now - hit3[0]) < stale_ttl_s:
+                                logger.info("INVREP_QUOTES_STALE_CACHE_HIT key=%s age_s=%.1f", cache_key, now - hit3[0])
+                                return hit3[1]
+                        time.sleep(sleep_s)
+                        continue
+                    r2.raise_for_status()
+                    payload = r2.json() or {}
+                    out = _parse_quotes(payload)
+                    with _INVREP_QUOTES_CACHE_LOCK:
+                        _INVREP_QUOTES_CACHE[cache_key] = (time.time(), out)
+                    return out
 
-        # If still blocked, raise the last error so caller can fail-open
-        if last_err:
-            raise last_err
-        raise RuntimeError("Yahoo Finance quote fetch failed unexpectedly")
+                r.raise_for_status()
+                payload = r.json() or {}
+                out = _parse_quotes(payload)
+                with _INVREP_QUOTES_CACHE_LOCK:
+                    _INVREP_QUOTES_CACHE[cache_key] = (time.time(), out)
+                return out
 
+            except Exception as e:
+                last_err = e
+                # backoff on transient errors too
+                sleep_s = min(4.0, 0.5 * (attempt + 1)) + random.random() * 0.2
+                time.sleep(sleep_s)
+                continue
+
+    # Final: return stale cache if we have it, otherwise raise
+    with _INVREP_QUOTES_CACHE_LOCK:
+        hit4 = _INVREP_QUOTES_CACHE.get(cache_key)
+        if hit4 and (now - hit4[0]) < stale_ttl_s:
+            logger.info("INVREP_QUOTES_STALE_CACHE_HIT key=%s age_s=%.1f", cache_key, now - hit4[0])
+            return hit4[1]
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("Yahoo Finance quote fetch failed unexpectedly")
 
 
 def fetch_news(symbol: str, news_count: int = DEFAULT_NEWS_COUNT, timeout_s: float = 8.0) -> list[dict]:
