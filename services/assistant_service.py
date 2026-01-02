@@ -13,6 +13,8 @@ from services.settings_service import (
 )
 
 
+from services.investment_service import get_investment_reports
+
 import os
 import re
 from core.logging import logger
@@ -51,6 +53,31 @@ def _looks_like_memory_question(text: str) -> bool:
     if not t:
         return False
 
+
+# -----------------------------
+# Investment report navigation
+# -----------------------------
+_NEXT_PHRASES = {
+    "next", "skip", "continue", "go on", "next stock", "next ticker", "next one",
+}
+_STOP_PHRASES = {
+    "stop", "cancel", "done", "end", "that's all", "thats all", "quit", "exit",
+}
+
+def _normalize_cmd(text: str) -> str:
+    t = (text or "").strip().lower()
+    # strip common punctuation
+    t = re.sub(r"[^a-z0-9\s']", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def _is_next_cmd(text: str) -> bool:
+    t = _normalize_cmd(text)
+    return t in _NEXT_PHRASES
+
+def _is_stop_cmd(text: str) -> bool:
+    t = _normalize_cmd(text)
+    return t in _STOP_PHRASES
     # Strong recall phrasing
     if any(p in t for p in [
         "what did i say",
@@ -233,6 +260,50 @@ def run_assistant_route(
         from_number = ctx.get("from_number") or ctx.get("from") or ctx.get("From")
     caller_id = normalize_caller_id(from_number)
     gmail_data_fresh = False  # safe default; set True only when Gmail fetch occurs
+
+    # --------------------------------------------
+    # Investment Reporting: next/stop navigation
+    # If a stock report is in progress, allow the caller to say
+    # “next/skip/continue” to advance, or “stop/done” to end.
+    # --------------------------------------------
+    if call_id and tenant_id:
+        try:
+            inv_queue = memory.get_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_spoken_queue", default=None)
+            inv_idx = memory.get_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_index", default=0)
+        except Exception:
+            inv_queue, inv_idx = None, 0
+
+        if isinstance(inv_queue, list) and inv_queue:
+            if _is_stop_cmd(text):
+                # Clear queue
+                try:
+                    memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_spoken_queue", value=[], ttl_s=SESSION_MEMORY_TTL_S)
+                    memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_index", value=0, ttl_s=SESSION_MEMORY_TTL_S)
+                except Exception:
+                    pass
+                return {"spoken_reply": "Okay — ending the stock report.", "fsm": {"mode": "investment_reporting", "action": "stop"}, "gmail": None}
+
+            if _is_next_cmd(text):
+                try:
+                    i2 = int(inv_idx or 0) + 1
+                except Exception:
+                    i2 = 1
+                if i2 >= len(inv_queue):
+                    # End of queue
+                    try:
+                        memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_spoken_queue", value=[], ttl_s=SESSION_MEMORY_TTL_S)
+                        memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_index", value=0, ttl_s=SESSION_MEMORY_TTL_S)
+                    except Exception:
+                        pass
+                    return {"spoken_reply": "That’s the end of your stock report.", "fsm": {"mode": "investment_reporting", "action": "done"}, "gmail": None}
+
+                # Advance
+                try:
+                    memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_index", value=i2, ttl_s=SESSION_MEMORY_TTL_S)
+                except Exception:
+                    pass
+                nxt = inv_queue[i2]
+                return {"spoken_reply": str(nxt), "fsm": {"mode": "investment_reporting", "action": "next", "index": i2}, "gmail": None}
 
     # -------------------------
     # LONGTERM MEMORY: config + context + capture turns (Option A)
@@ -936,8 +1007,49 @@ def run_assistant_route(
         if not tickers:
             return {"spoken_reply": "Investment reporting is enabled, but no tickers are configured yet.", "fsm": fsm_result, "gmail": None}
 
-        # NOTE: Full Yahoo Finance fetch+news summarization will be added after wiring is confirmed stable.
-        msg = "Your stock report is enabled for: " + ", ".join(tickers) + "."
-        return {"spoken_reply": msg, "fsm": fsm_result, "gmail": None}
+        llm_prompt = (cfg.get("llm_prompt") or "").strip()
+        if not llm_prompt:
+            llm_prompt = (
+                "You are Vozlia, a concise voice assistant delivering a stock report. "
+                "For each ticker: current price, previous close, percent change, 1–3 key news items from the last 24 hours, "
+                "and any analyst upgrades/downgrades or new price targets if available. "
+                "Keep each ticker under 20 seconds. After each ticker say: 'Say next to continue, or stop to end.'"
+            )
+
+        try:
+            rep = get_investment_reports(tickers, llm_prompt=llm_prompt)
+        logger.info("INVREP_FETCH_OK tickers=%s", tickers)
+        except Exception as e:
+            logger.exception("INVREP_FETCH_FAIL tickers=%s err=%s", tickers, e)
+            return {"spoken_reply": "Sorry — I couldn’t fetch stock data right now.", "fsm": fsm_result, "gmail": None}
+
+        spoken_list = rep.get("spoken_reports") or []
+        if not isinstance(spoken_list, list) or not spoken_list:
+            return {"spoken_reply": "Sorry — I couldn’t generate a stock report right now.", "fsm": fsm_result, "gmail": None}
+
+        # Seed session queue so the caller can say “next” to advance tickers.
+        if call_id and tenant_id:
+            try:
+                memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_spoken_queue", value=spoken_list, ttl_s=SESSION_MEMORY_TTL_S)
+                memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_index", value=0, ttl_s=SESSION_MEMORY_TTL_S)
+            except Exception:
+                pass
+
+        # Persist skill outcome (summary + structured items) to DB/memory like other skills
+        try:
+            if tenant_uuid and caller_id:
+                record_skill_result(
+                    db,
+                    tenant_uuid=str(tenant_uuid),
+                    caller_id=str(caller_id),
+                    skill_key="investment_reporting",
+                    input_text=text,
+                    memory_text=str(spoken_list[0]),
+                    data_json={"tickers": tickers, "report": rep},
+                )
+        except Exception:
+            pass
+
+        return {"spoken_reply": str(spoken_list[0]), "fsm": fsm_result, "gmail": None}
 
     return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
