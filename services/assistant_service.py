@@ -1018,7 +1018,7 @@ def run_assistant_route(
 
         try:
             rep = get_investment_reports(tickers, llm_prompt=llm_prompt)
-        logger.info("INVREP_FETCH_OK tickers=%s", tickers)
+            logger.info("INVREP_FETCH_OK tickers=%s", tickers)
         except Exception as e:
             logger.exception("INVREP_FETCH_FAIL tickers=%s err=%s", tickers, e)
             return {"spoken_reply": "Sorry — I couldn’t fetch stock data right now.", "fsm": fsm_result, "gmail": None}
