@@ -404,7 +404,7 @@ class SpeechOutputController:
             self._last_tool_payload_trunc = payload_trunc
 
             logger.info(
-                "%s_PAYLOAD_SHAPE trace_id=%s conversation=%s speech_mode=%s has_input=%s has_metadata=%s instr_len=%s keys=%s",
+                "%s_PAYLOAD_SHAPE trace_id=%s conversation=%s has_input=%s has_metadata=%s instr_len=%s keys=%s",
                 self.name, req.trace_id, conv_val, has_input, has_metadata, instr_len, keys
             )
             if payload_trunc:
