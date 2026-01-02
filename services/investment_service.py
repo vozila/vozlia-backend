@@ -12,6 +12,9 @@ from core.logging import logger
 from openai import OpenAI
 from core import config as cfg
 
+#from typing import List, Dict, Any
+
+
 _client: OpenAI | None = OpenAI(api_key=cfg.OPENAI_API_KEY) if getattr(cfg, 'OPENAI_API_KEY', None) else None
 
 def _get_openai_client() -> OpenAI:
@@ -52,27 +55,82 @@ def _split_tickers(raw: str | list[str] | None) -> list[str]:
     return out
 
 
-def fetch_quotes(symbols: list[str], timeout_s: float = 8.0) -> dict[str, dict]:
-    """Fetch quote snapshot (price + prev close) from Yahoo Finance quote endpoint."""
+
+_YAHOO_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+def _yahoo_client() -> httpx.Client:
+    return httpx.Client(
+        headers={
+            "User-Agent": _YAHOO_UA,
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://finance.yahoo.com",
+            "Referer": "https://finance.yahoo.com/",
+            "Connection": "keep-alive",
+        },
+        timeout=httpx.Timeout(10.0, connect=5.0),
+        follow_redirects=True,
+    )
+
+def _prime_yahoo_cookies(client: httpx.Client) -> None:
+    # This typically sets the `B` cookie and helps avoid 401/403.
+    try:
+        client.get("https://fc.yahoo.com")
+    except Exception:
+        pass
+
+def fetch_quotes(tickers: List[str]) -> Dict[str, Any]:
+    symbols = ",".join([t.strip().upper() for t in tickers if t.strip()])
     if not symbols:
         return {}
-    params = {"symbols": ",".join(symbols)}
-    headers = {"User-Agent": "Mozilla/5.0 (Vozlia)"}
-    with httpx.Client(timeout=timeout_s, headers=headers) as client:
-        r = client.get(YF_QUOTE_URL, params=params)
-        r.raise_for_status()
-        data = r.json() or {}
-    results = (((data.get("quoteResponse") or {}).get("result")) or [])
-    out: dict[str, dict] = {}
-    if isinstance(results, list):
-        for item in results:
-            if not isinstance(item, dict):
-                continue
-            sym = (item.get("symbol") or "").strip().upper()
-            if not sym:
-                continue
-            out[sym] = item
-    return out
+
+    params = {
+        "symbols": symbols,
+        "formatted": "false",
+        "region": "US",
+        "lang": "en-US",
+    }
+
+    bases = [
+        "https://query2.finance.yahoo.com",
+        "https://query1.finance.yahoo.com",
+    ]
+
+    with _yahoo_client() as client:
+        _prime_yahoo_cookies(client)
+
+        last_err = None
+        # small retry loop: try query2 then query1; repeat once with a short backoff
+        for attempt in range(2):
+            for base in bases:
+                url = f"{base}/v7/finance/quote"
+                try:
+                    r = client.get(url, params=params)
+                    if r.status_code in (401, 403):
+                        # try alternate base / retry after priming
+                        last_err = httpx.HTTPStatusError(
+                            f"{r.status_code} from {url}", request=r.request, response=r
+                        )
+                        continue
+                    r.raise_for_status()
+                    return r.json()
+                except Exception as e:
+                    last_err = e
+                    continue
+
+            # backoff then re-prime cookies once
+            time.sleep(0.5 + attempt * 0.5)
+            _prime_yahoo_cookies(client)
+
+        # If still blocked, raise the last error so caller can fail-open
+        if last_err:
+            raise last_err
+        raise RuntimeError("Yahoo Finance quote fetch failed unexpectedly")
+
 
 
 def fetch_news(symbol: str, news_count: int = DEFAULT_NEWS_COUNT, timeout_s: float = 8.0) -> list[dict]:
