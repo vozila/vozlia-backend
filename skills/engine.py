@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional
 from core.logging import logger
 from skills.registry import skill_registry
 from services.gmail_service import get_default_gmail_account_id, summarize_gmail_for_assistant
+from services.investment_service import get_investment_reports
+from services.settings_service import get_skills_config
 
 
 def skills_engine_enabled() -> bool:
@@ -55,16 +57,38 @@ def execute_skill(
       - handler == "gmail.get_summaries"
     """
     skill = skill_registry.get(skill_id)
+    skills_cfg = get_skills_config(db, current_user) or {}
+    skill_cfg = skills_cfg.get(skill_id) if isinstance(skills_cfg, dict) else {}
     if not skill:
         return {"ok": False, "error": f"Unknown skill: {skill_id}"}
 
     if skill.api.type != "internal":
         return {"ok": False, "error": f"Unsupported api.type: {skill.api.type}"}
 
-    if skill.api.handler != "gmail.get_summaries":
+    if skill.api.handler not in ("gmail.get_summaries", "investment.get_reports"):
         return {"ok": False, "error": f"Unsupported handler: {skill.api.handler}"}
 
+    # Handler: Investment Reporting (Yahoo Finance)
+    if skill.api.handler == "investment.get_reports":
+        # tickers come from params first, else from per-skill config
+        params = (context or {}).get("params") if isinstance(context, dict) else None
+        if not isinstance(params, dict):
+            params = {}
+        tickers = params.get("tickers") or (skill_cfg or {}).get("tickers") or (skill_cfg or {}).get("tickers_csv") or ""
+        llm_prompt = (skill_cfg or {}).get("llm_prompt") or ""
+        report = get_investment_reports(tickers=tickers, llm_prompt=str(llm_prompt))
+        spoken_reports = report.get("spoken_reports") or []
+        # combine or return first, letting caller route manage pagination
+        combined = " ".join([s for s in spoken_reports if isinstance(s, str) and s.strip()])
+        return {
+            "ok": True,
+            "spoken_reply": combined or "I couldn't fetch stock data right now.",
+            "investment_reporting": report,
+        }
+
+    # Handler: Gmail Summary
     # Use existing Gmail summary code (no behavior change beyond routing to it)
+ (no behavior change beyond routing to it)
     account_id_effective = account_id or get_default_gmail_account_id(current_user, db)
     if not account_id_effective:
         return {
