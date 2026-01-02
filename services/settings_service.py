@@ -207,6 +207,50 @@ def gmail_summary_add_to_greeting(db: Session, user: User) -> bool:
     cfg = get_skill_config(db, user, "gmail_summary")
     return bool((cfg or {}).get("add_to_greeting") or False)
 
+# -----------------------------
+# Investment Reporting helpers
+# -----------------------------
+def get_investment_reporting_config(db: Session, user: User) -> dict:
+    """Return the investment_reporting skill config (merged defaults + overrides)."""
+    return get_skill_config(db, user, "investment_reporting")
+
+
+def get_investment_reporting_tickers(db: Session, user: User) -> list[str]:
+    """Return normalized tickers for investment_reporting.
+
+    Accepts either:
+      - cfg.tickers: list[str]
+      - cfg.tickers_raw: comma-separated string
+
+    Normalizes to uppercase, strips whitespace, removes empties, dedupes preserving order.
+    """
+    cfg = get_investment_reporting_config(db, user) or {}
+    tickers: list[str] = []
+
+    raw_list = cfg.get("tickers")
+    raw_str = cfg.get("tickers_raw")
+
+    if isinstance(raw_list, list):
+        for t in raw_list:
+            s = str(t or "").strip().upper()
+            if s:
+                tickers.append(s)
+
+    if not tickers and isinstance(raw_str, str) and raw_str.strip():
+        for part in raw_str.split(","):
+            s = part.strip().upper()
+            if s:
+                tickers.append(s)
+
+    # Dedupe while preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tickers:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+
+    return out
 
 # -----------------------------
 # NEW: Memory toggles (DB overrides, env fallback when unset)
