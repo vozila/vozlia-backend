@@ -23,7 +23,6 @@ from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from core.logging import logger
-from vozlia_twilio.audio_gate import SpeechGate, GateConfig
 
 # --- Discovery offer resolution (Add-to-greeting) ----------------------------
 # When a skill is announced in the greeting ("Would you like me to ...?"),
@@ -466,55 +465,6 @@ async def twilio_stream(websocket: WebSocket):
     transcript_action_task: Optional[asyncio.Task] = None
     user_speaking_vad: bool = False
 
-    # --- Local speech gate (dBFS) ------------------------------------------
-    # Purpose: reduce noise-triggered barge-in and ignore background-noise transcripts.
-    # Hot-path safe: one RMS calculation per 20ms frame; NO per-frame logging.
-    LOCAL_SPEECH_GATE_ENABLED = os.getenv("LOCAL_SPEECH_GATE_ENABLED", "0") == "1"
-    LOCAL_SPEECH_GATE_BARGE = os.getenv("LOCAL_SPEECH_GATE_BARGE", "0") == "1"
-    LOCAL_SPEECH_GATE_ROUTE = os.getenv("LOCAL_SPEECH_GATE_ROUTE", "0") == "1"
-
-    _gate_recent_window_s = float(os.getenv("LOCAL_SPEECH_GATE_RECENT_S", "1.2"))
-    _gate: Optional[SpeechGate] = None
-    _last_real_speech_ts: float = 0.0
-
-    # Rate-limit logs that could spam in noisy environments.
-    _last_gate_log_ts: float = 0.0
-
-    if LOCAL_SPEECH_GATE_ENABLED:
-        _gate = SpeechGate(
-            GateConfig(
-                threshold_dbfs=float(os.getenv("LOCAL_SPEECH_GATE_DBFS_THRESHOLD", "-32")),
-                min_open_ms=int(os.getenv("LOCAL_SPEECH_GATE_MIN_OPEN_MS", "160")),
-                hangover_ms=int(os.getenv("LOCAL_SPEECH_GATE_HANGOVER_MS", "400")),
-                frame_ms=20,
-            )
-        )
-        logger.info(
-            "LocalSpeechGate enabled thr=%s min_open_ms=%s hangover_ms=%s recent_s=%s barge=%s route=%s",
-            os.getenv("LOCAL_SPEECH_GATE_DBFS_THRESHOLD", "-32"),
-            os.getenv("LOCAL_SPEECH_GATE_MIN_OPEN_MS", "160"),
-            os.getenv("LOCAL_SPEECH_GATE_HANGOVER_MS", "400"),
-            os.getenv("LOCAL_SPEECH_GATE_RECENT_S", "1.2"),
-            LOCAL_SPEECH_GATE_BARGE,
-            LOCAL_SPEECH_GATE_ROUTE,
-        )
-
-    def _mark_real_speech():
-        nonlocal _last_real_speech_ts
-        _last_real_speech_ts = time.time()
-
-    def _recent_real_speech() -> bool:
-        if not LOCAL_SPEECH_GATE_ENABLED:
-            return True
-        return (time.time() - _last_real_speech_ts) <= _gate_recent_window_s
-
-    def _gate_log_throttled(msg: str):
-        nonlocal _last_gate_log_ts
-        now = time.time()
-        if now - _last_gate_log_ts >= 5.0:
-            _last_gate_log_ts = now
-            logger.info(msg)
-
     audio_buffer = bytearray()
     assistant_last_audio_time: float = 0.0
     prebuffer_active: bool = True
@@ -769,6 +719,24 @@ async def twilio_stream(websocket: WebSocket):
         await twilio_clear_buffer()
         audio_buffer.clear()
 
+        # Optionally inform the Realtime conversation that the assistant output was interrupted.
+        # This helps the model avoid "reset" replies when the caller says "continue/go on".
+        if openai_ws is not None and os.getenv("BARGE_IN_CONTEXT_NOTE", "1") == "1":
+            try:
+                await openai_ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "system",
+                        "content": [
+                            {"type": "input_text", "text": "Caller barged in. Your previous response audio was interrupted and may not have been heard. Do NOT restart the conversation. If the caller says continue/go on, continue the interrupted thought rather than greeting again."}
+                        ],
+                    },
+                }))
+            except Exception:
+                logger.exception("BARGE_IN_CONTEXT_NOTE send failed (non-fatal)")
+
+
         # Reset playback state
         prebuffer_active = True
         active_response_id = None
@@ -897,24 +865,13 @@ async def twilio_stream(websocket: WebSocket):
 
 # --- Create responses ----------------------------------------------------
     async def create_generic_response():
-        # Global conversational policy: do not let Realtime "freestyle" on unrouted turns.
-        # When enabled, this prevents clarifying questions like "Could you rephrase...?"
-        if os.getenv("SILENCE_ON_UNROUTED", "0") == "1" or os.getenv("NO_CLARIFY_QUESTIONS", "0") == "1":
-            logger.info("SilencePolicy: skipping generic response.create (unrouted)")
-            return
-
         await _cancel_active_and_clear_buffer("create_generic_response")
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
     async def create_fsm_spoken_reply(spoken_reply: str, *, clear_playback: bool = True, reason_tag: str = "fsm_spoken_reply", verbatim: bool = False):
         if not spoken_reply:
-            # Global conversational policy:
-            # - If FSM/skills produced no speech, default is SILENCE (no fallback to Realtime freestyle).
-            if os.getenv("SILENCE_ON_EMPTY_SPOKEN_REPLY", "1") == "1" or os.getenv("NO_CLARIFY_QUESTIONS", "0") == "1":
-                logger.info("SilencePolicy: empty spoken_reply suppressed (no TTS)")
-                return
-            logger.warning("create_fsm_spoken_reply empty spoken_reply (fallback generic response enabled)")
+            logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
             await create_generic_response()
             return
 
@@ -1012,12 +969,6 @@ async def twilio_stream(websocket: WebSocket):
     async def handle_transcript_event(event: dict):
         transcript: str = (event.get("transcript") or "").strip()
         if not transcript:
-            return
-
-        # If enabled: ignore transcripts unless we recently detected real caller speech
-        # via local dBFS gate. This prevents background noise from triggering FSM routing.
-        if LOCAL_SPEECH_GATE_ENABLED and LOCAL_SPEECH_GATE_ROUTE and not _recent_real_speech():
-            _gate_log_throttled("LocalSpeechGate: dropping transcript (gate closed)")
             return
 
         logger.info("USER Transcript completed: %r", transcript)
@@ -1253,13 +1204,6 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif etype == "input_audio_buffer.speech_started":
                     user_speaking_vad = True
-
-                    # OpenAI server VAD can fire on background noise.
-                    # If enabled, only treat this as "real" speech/barge-in when local dBFS gate is open/recent.
-                    if LOCAL_SPEECH_GATE_ENABLED and LOCAL_SPEECH_GATE_BARGE and not _recent_real_speech():
-                        _gate_log_throttled("LocalSpeechGate: ignoring VAD speech_started (gate closed)")
-                        continue
-
                     logger.info("OpenAI VAD: user speech START")
                     if not user_spoke_once:
                         user_spoke_once = True
@@ -1280,6 +1224,15 @@ async def twilio_stream(websocket: WebSocket):
                     code = err.get("code")
                     if code == "response_cancel_not_active":
                         logger.info("OpenAI cancel race (expected): %s", event)
+                    elif code == "session_expired":
+                        # Realtime sessions have a max lifetime; treat as recoverable.
+                        logger.error("speech_ctrl_REALTIME_ERROR code=session_expired message=%s", err.get("message"))
+                        # Break out so the outer logic can close/reconnect cleanly.
+                        try:
+                            await openai_ws.close()
+                        except Exception:
+                            pass
+                        break
                     else:
                         logger.error("OpenAI error event: %s", event)
                         # Attach last tool payload trace (if controller is wired) for immediate diagnosis.
@@ -1333,18 +1286,10 @@ async def twilio_stream(websocket: WebSocket):
                         continue
 
                     try:
-                        ulaw_bytes = base64.b64decode(payload)
+                        base64.b64decode(payload)
                     except Exception:
                         logger.exception("Failed to base64-decode Twilio payload")
                         continue
-
-                    # Local dBFS speech gate update (hot path safe: no logging here).
-                    if LOCAL_SPEECH_GATE_ENABLED and _gate is not None:
-                        try:
-                            if _gate.update_ulaw(ulaw_bytes):
-                                _mark_real_speech()
-                        except Exception:
-                            logger.exception("LocalSpeechGate update failed (non-fatal)")
 
                     try:
                         await openai_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": payload}))
