@@ -40,6 +40,13 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "skills_priority_order": {"order": ["gmail_summary", "memory", "sms", "calendar", "web_search", "weather", "investment_reporting"]},
 }
+DEFAULT_INVESTMENT_REPORTING_LLM_PROMPT = (
+    "Summarize stock news in plain language for a caller. "
+    "If there is no major news in the last 24 hours, say so. "
+    "If an analyst upgrade/downgrade is provided, mention it briefly. "
+    "Never mention URLs."
+)
+
 
 
 def _get_setting_row(db: Session, user: User, key: str) -> Optional[UserSetting]:
@@ -146,15 +153,83 @@ def get_skill_config(db: Session, user: User, skill_id: str) -> dict:
     return base
 
 
+
+def get_investment_reporting_config(db: Session, user: User) -> dict:
+    cfg = get_skill_config(db, user, "investment_reporting")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def get_investment_reporting_tickers(db: Session, user: User) -> list[str]:
+    cfg = get_investment_reporting_config(db, user)
+    raw = cfg.get("tickers") or cfg.get("tickers_csv") or ""
+    if isinstance(raw, list):
+        out = []
+        for t in raw:
+            s = str(t).strip().upper()
+            if s:
+                out.append(s)
+        return out
+    parts = []
+    for chunk in str(raw).replace("\n", ",").split(","):
+        s = chunk.strip().upper()
+        if s:
+            parts.append(s)
+    seen=set()
+    out=[]
+    for s in parts:
+        if s not in seen:
+            seen.add(s); out.append(s)
+    return out
 def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> dict[str, dict]:
+    """Patch a single skill's config. Accepts both snake_case and portal camelCase keys."""
     current = get_skills_config(db, user)
     base = dict(current.get(skill_id) or DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
-    for k in ("enabled", "add_to_greeting", "engagement_phrases", "llm_prompt"):
+
+    # Normalize engagement prompt
+    if "engagementPrompt" in patch and "engagement_phrases" not in patch:
+        raw = patch.get("engagementPrompt")
+        if isinstance(raw, str):
+            phrases = []
+            for chunk in raw.replace(",", "\n").splitlines():
+                s = chunk.strip()
+                if s:
+                    phrases.append(s)
+            patch["engagement_phrases"] = phrases
+
+    # Normalize tickers
+    if "tickers" in patch:
+        raw = patch.get("tickers")
+        if isinstance(raw, str):
+            parts = []
+            for chunk in raw.replace("\n", ",").split(","):
+                s = chunk.strip().upper()
+                if s:
+                    parts.append(s)
+            # de-dupe preserve order
+            seen=set()
+            tickers=[]
+            for s in parts:
+                if s not in seen:
+                    seen.add(s); tickers.append(s)
+            patch["tickers"] = tickers
+    if "tickersCsv" in patch and "tickers" not in patch:
+        patch["tickers"] = patch.get("tickersCsv")
+
+    for k in (
+        "enabled",
+        "add_to_greeting",
+        "auto_execute_after_greeting",
+        "engagement_phrases",
+        "llm_prompt",
+        "tickers",
+    ):
         if k in patch:
             base[k] = patch[k]
+
     current[skill_id] = base
     set_setting(db, user, "skills_config", {"skills": current})
     return current
+
 
 
 def get_gmail_summary_llm_prompt(db: Session, user: User) -> str:
@@ -167,26 +242,10 @@ def get_gmail_summary_llm_prompt(db: Session, user: User) -> str:
 
 def get_gmail_summary_engagement_phrases(db: Session, user: User) -> list[str]:
     cfg = get_skill_config(db, user, "gmail_summary")
-
     phrases = (cfg or {}).get("engagement_phrases")
-    if not phrases:
-        # Back-compat: admin portal uses camelCase string
-        phrases = (cfg or {}).get("engagementPrompt") or (cfg or {}).get("engagement_prompt")
-
     if isinstance(phrases, list):
         return [str(x).strip() for x in phrases if str(x).strip()]
-
-    if isinstance(phrases, str) and phrases.strip():
-        # Accept multiline or comma-separated strings
-        out: list[str] = []
-        for line in phrases.replace(",", "\n").splitlines():
-            s = line.strip()
-            if s:
-                out.append(s)
-        return out
-
     return []
-
 
 
 def gmail_summary_add_to_greeting(db: Session, user: User) -> bool:
