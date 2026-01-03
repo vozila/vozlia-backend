@@ -8,6 +8,7 @@ from typing import Any, Iterable, Optional
 
 from core.logging import logger
 from models import CallerMemoryEvent
+from sqlalchemy import text
 
 
 @dataclass
@@ -95,7 +96,6 @@ def search_memory_events(
     caller_id: str,
     q: MemoryQuery,
     limit: int = 12,
-    include_turns: bool = False,
 ) -> list[CallerMemoryEvent]:
     """Search caller memory events within a time window.
 
@@ -120,14 +120,15 @@ def search_memory_events(
         .filter(CallerMemoryEvent.text.isnot(None))
         .filter(CallerMemoryEvent.text != "")
     )
-    include_turn_rows = bool(include_turns)
+
+    include_turns = False
     if q.skill_key:
         qq = qq.filter(CallerMemoryEvent.skill_key == q.skill_key)
         if str(q.skill_key).lower().startswith("turn_"):
-            include_turn_rows = True
+            include_turns = True
 
     # Default: exclude conversational turn spam from "memory recall" lookups
-    if not include_turn_rows:
+    if not include_turns:
         qq = qq.filter(CallerMemoryEvent.kind != "turn")
 
     # MVP keyword filter: OR over ILIKE
@@ -221,3 +222,56 @@ def fetch_fact_history(
     return out
 
 
+
+
+def _vector_literal(v: list[float]) -> str:
+    return "[" + ",".join(f"{x:.8f}" for x in v) + "]"
+
+
+def vector_search_call_summaries(
+    db: Any,
+    *,
+    tenant_id: str,
+    caller_id: str,
+    q_embedding: list[float],
+    start_ts: datetime,
+    end_ts: datetime,
+    limit: int = 6,
+) -> list[CallerMemoryEvent]:
+    """Vector search over call_summary rows using pgvector if available."""
+    if not tenant_id or not caller_id or not q_embedding:
+        return []
+
+    qv = _vector_literal(q_embedding)
+    sql = """
+    SELECT id
+    FROM caller_memory_events
+    WHERE tenant_id = :tenant_id
+      AND caller_id = :caller_id
+      AND skill_key = 'call_summary'
+      AND embedding IS NOT NULL
+      AND created_at >= :start_ts
+      AND created_at <= :end_ts
+    ORDER BY embedding <=> (:qv)::vector
+    LIMIT :limit
+    """
+    try:
+        ids = [r[0] for r in db.execute(text(sql), {
+            "tenant_id": tenant_id,
+            "caller_id": caller_id,
+            "qv": qv,
+            "start_ts": start_ts.replace(tzinfo=None),
+            "end_ts": end_ts.replace(tzinfo=None),
+            "limit": limit,
+        }).fetchall()]
+        if not ids:
+            return []
+        return (
+            db.query(CallerMemoryEvent)
+            .filter(CallerMemoryEvent.id.in_(ids))
+            .order_by(CallerMemoryEvent.created_at.desc())
+            .all()
+        )
+    except Exception:
+        logger.exception("VECTOR_SEARCH_SQL_FAIL")
+        return []
