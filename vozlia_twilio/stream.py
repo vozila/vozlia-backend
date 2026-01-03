@@ -10,6 +10,7 @@ import re
 from typing import Optional
 from contextlib import suppress
 from db import SessionLocal
+from models import CallerMemoryEvent
 from services.user_service import get_or_create_primary_user
 #from services.settings_service import get_realtime_prompt_addendum
 from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting, get_skills_config
@@ -1273,6 +1274,7 @@ async def twilio_stream(websocket: WebSocket):
                     call_sid = start.get("callSid") or start.get("call_sid")
                     custom = start.get("customParameters") or {}
                     from_number = custom.get("from") or custom.get("From") or start.get("from") or start.get("From")
+                    logger.info("Stream start call_sid=%s from_number=%s", call_sid, from_number)
 
                     prebuffer_active = True
                     logger.info("Twilio stream event: start")
@@ -1384,10 +1386,27 @@ async def twilio_stream(websocket: WebSocket):
 
         # --- Call summary (end-of-call) ----------------------------------------
         try:
-            if os.getenv("CALL_SUMMARY_ENABLED", "0").strip() == "1" and call_sid and from_number:
+            if os.getenv("CALL_SUMMARY_ENABLED", "0").strip() == "1" and call_sid:
                 db2 = SessionLocal()
                 try:
-                    ensure_call_summary_for_call(db2, call_sid=str(call_sid), caller_id=str(from_number))
+                    caller_id_for_summary = from_number
+                    # Twilio 'start' event often omits the caller number unless you pass it via customParameters.
+                    # Fallback: infer caller_id from the first stored memory event for this call_sid.
+                    if not caller_id_for_summary:
+                        row = (
+                            db2.query(CallerMemoryEvent.caller_id)
+                            .filter(CallerMemoryEvent.call_sid == str(call_sid))
+                            .filter(CallerMemoryEvent.caller_id.isnot(None))
+                            .order_by(CallerMemoryEvent.created_at.asc())
+                            .first()
+                        )
+                        if row and row[0]:
+                            caller_id_for_summary = row[0]
+
+                    if not caller_id_for_summary:
+                        logger.warning("CALL_SUMMARY_SKIP_MISSING_CALLER_ID call_sid=%s from_number=%s", call_sid, from_number)
+                    else:
+                        ensure_call_summary_for_call(db2, call_sid=str(call_sid), caller_id=str(caller_id_for_summary))
                 finally:
                     db2.close()
         except Exception:
