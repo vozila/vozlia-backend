@@ -145,7 +145,8 @@ def infer_fact_key(text: str) -> Optional[str]:
     raw = (text or "").strip()
     if not raw:
         return None
-    for rx, key in _FACT_PATTERNS:
+    patterns = globals().get("_FACT_PATTERNS", [])
+    for rx, key in patterns:
         if rx.search(raw):
             return key
     return None
