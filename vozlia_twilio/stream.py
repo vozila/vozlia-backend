@@ -14,6 +14,7 @@ from services.user_service import get_or_create_primary_user
 #from services.settings_service import get_realtime_prompt_addendum
 from services.settings_service import get_realtime_prompt_addendum, get_agent_greeting, get_skills_config
 from services.gmail_service import get_default_gmail_account_id
+from services.call_summary_service import ensure_call_summary_for_call
 from skills.registry import skill_registry
 
 
@@ -556,15 +557,6 @@ async def twilio_stream(websocket: WebSocket):
                     await asyncio.sleep(0.005)
                     continue
 
-                # If audio generation ended with a partial frame, it can get stuck forever and cause underruns.
-                # Clear it once it's been idle briefly (protects call quality and greeting drain).
-                if (not prebuffer_active) and 0 < len(audio_buffer) < BYTES_PER_FRAME:
-                    if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) > 0.25:
-                        logger.debug("AUDIO_BUFFER_CLEAR_PARTIAL bytes=%d", len(audio_buffer))
-                        audio_buffer = bytearray()
-                        await asyncio.sleep(0)  # yield
-                        continue
-
                 # prebuffer at utterance start
                 if prebuffer_active:
                     if len(audio_buffer) < PREBUFFER_BYTES:
@@ -633,19 +625,10 @@ async def twilio_stream(websocket: WebSocket):
         This prevents cutting off the end of the greeting when we enqueue an immediate follow-on response
         (e.g., AUTO_EXECUTE_AFTER_GREETING), because create_fsm_spoken_reply cancels/clears the buffer.
         """
-        nonlocal audio_buffer
-
         start = time.monotonic()
         while True:
             if twilio_ws_closed:
                 return False
-            # If we have a partial frame queued (< BYTES_PER_FRAME), it will never be sent.
-            # Drop it so drain protection doesn't time out on a stuck remainder (commonly 80 bytes).
-            if 0 < len(audio_buffer) < BYTES_PER_FRAME:
-                logger.debug("AUDIO_BUFFER_DROP_REMAINDER label=%s bytes=%d", label, len(audio_buffer))
-                audio_buffer = bytearray()
-                continue
-
             # We consider 'drained' when there's essentially nothing left queued for Twilio.
             if len(audio_buffer) <= target_bytes:
                 if grace_ms and grace_ms > 0:
@@ -1398,5 +1381,16 @@ async def twilio_stream(websocket: WebSocket):
             await websocket.close()
         except Exception:
             logger.exception("Error closing Twilio WebSocket")
+
+        # --- Call summary (end-of-call) ----------------------------------------
+        try:
+            if os.getenv("CALL_SUMMARY_ENABLED", "0").strip() == "1" and call_sid and from_number:
+                db2 = SessionLocal()
+                try:
+                    ensure_call_summary_for_call(db2, call_sid=str(call_sid), caller_id=str(from_number))
+                finally:
+                    db2.close()
+        except Exception:
+            logger.exception("CALL_SUMMARY_FINALIZE_ERROR call_sid=%s from=%s", call_sid, from_number)
 
         logger.info("WebSocket disconnected while sending audio")
