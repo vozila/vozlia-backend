@@ -102,10 +102,6 @@ def search_memory_events(
     Default behavior intentionally excludes per-turn rows (kind == "turn") so recall
     returns coherent summaries/skill outputs instead of disjoint turn fragments.
 
-    Set include_turns=True for conversational recall bridges when call summaries
-    are not yet available.
-    returns coherent summaries/skill outputs instead of disjoint turn fragments.
-
     To explicitly include turns, pass a `skill_key` that starts with "turn_" (e.g.
     "turn_user", "turn_assistant").
     """
@@ -124,7 +120,6 @@ def search_memory_events(
         .filter(CallerMemoryEvent.text.isnot(None))
         .filter(CallerMemoryEvent.text != "")
     )
-
     include_turn_rows = bool(include_turns)
     if q.skill_key:
         qq = qq.filter(CallerMemoryEvent.skill_key == q.skill_key)
