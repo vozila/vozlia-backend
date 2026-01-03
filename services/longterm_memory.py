@@ -198,19 +198,19 @@ def record_skill_result(
     memory_text: str = "",
     data_json: Optional[dict[str, _Any]] = None,
     expires_in_s: Optional[int] = None,
+    call_sid: str | None = None,  # NEW
 ) -> bool:
-    """Compat shim used by assistant_service; persists a skill outcome as a memory event."""
-    _ = input_text  # reserved for later
-    _ = expires_in_s  # reserved for later (future per-event TTL)
+    _ = input_text
+    _ = expires_in_s
     return write_memory_event(
         db,
         tenant_uuid=str(tenant_uuid),
         caller_id=str(caller_id),
-        call_sid=None,
-        skill_key=str(skill_key or "skill"),
-        text=(memory_text or "").strip(),
+        call_sid=(str(call_sid) if call_sid else None),  # NEW
+        skill_key=skill_key,
+        text=memory_text,
         data_json=data_json,
-        tags_json=[str(skill_key or "skill")],
+        tags_json=[f"skill:{skill_key or 'skill'}"],
     )
 
 
