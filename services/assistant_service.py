@@ -74,8 +74,8 @@ def _tool_to_canonical_phrase(tool: str) -> str | None:
         return "Email summary"
     if tool == "investment_reporting":
         return "Investment reporting"
-    if tool == "memory_lookup":
-        return "Remember"
+    # Intentionally do NOT canonicalize memory lookups.
+    # We must preserve the user's original query text (e.g., "cats") for retrieval.
     return None
 
 
@@ -528,6 +528,15 @@ def run_assistant_route(
 
         try:
             qmem = parse_memory_query(text or "")
+            if debug:
+                logger.info(
+                    "AUTO_MEMORY_RECALL_QUERY raw=%r skill_key=%r keywords=%r window=%s..%s",
+                    qmem.raw_text,
+                    qmem.skill_key,
+                    qmem.keywords,
+                    qmem.start_ts.isoformat(timespec="seconds"),
+                    qmem.end_ts.isoformat(timespec="seconds"),
+                )
 
             # 1) Facts-first: if the question maps to a known fact key (e.g., favorite_color),
             # answer deterministically from stored facts (no guessing).
@@ -601,7 +610,14 @@ def run_assistant_route(
                 caller_id=str(caller_id),
                 q=qmem,
                 limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "50") or 50),
+                include_turns=(os.getenv("LONGTERM_MEMORY_USE_TURNS_FOR_RECALL", "1") == "1"),
             )
+            if debug:
+                logger.info(
+                    "AUTO_MEMORY_RECALL_ROWS n=%s include_turns=%s",
+                    len(rows),
+                    (os.getenv("LONGTERM_MEMORY_USE_TURNS_FOR_RECALL", "1") == "1"),
+                )
         except Exception as e:
             logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
             rows = []
@@ -664,12 +680,22 @@ def run_assistant_route(
 
         try:
             qmem = parse_memory_query(text or "")
+            if debug:
+                logger.info(
+                    "AUTO_MEMORY_RECALL_QUERY raw=%r skill_key=%r keywords=%r window=%s..%s",
+                    qmem.raw_text,
+                    qmem.skill_key,
+                    qmem.keywords,
+                    qmem.start_ts.isoformat(timespec="seconds"),
+                    qmem.end_ts.isoformat(timespec="seconds"),
+                )
             rows = search_memory_events(
                 db,
                 tenant_id=str(tenant_uuid),
                 caller_id=str(caller_id),
                 q=qmem,
                 limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "50") or 50),
+                include_turns=(os.getenv("LONGTERM_MEMORY_USE_TURNS_FOR_RECALL", "1") == "1"),
             )
         except Exception as e:
             logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
