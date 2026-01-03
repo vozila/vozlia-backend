@@ -95,10 +95,15 @@ def search_memory_events(
     caller_id: str,
     q: MemoryQuery,
     limit: int = 12,
+    include_turns: bool = False,
 ) -> list[CallerMemoryEvent]:
     """Search caller memory events within a time window.
 
     Default behavior intentionally excludes per-turn rows (kind == "turn") so recall
+    returns coherent summaries/skill outputs instead of disjoint turn fragments.
+
+    Set include_turns=True for conversational recall bridges when call summaries
+    are not yet available.
     returns coherent summaries/skill outputs instead of disjoint turn fragments.
 
     To explicitly include turns, pass a `skill_key` that starts with "turn_" (e.g.
@@ -120,14 +125,14 @@ def search_memory_events(
         .filter(CallerMemoryEvent.text != "")
     )
 
-    include_turns = False
+    include_turn_rows = bool(include_turns)
     if q.skill_key:
         qq = qq.filter(CallerMemoryEvent.skill_key == q.skill_key)
         if str(q.skill_key).lower().startswith("turn_"):
-            include_turns = True
+            include_turn_rows = True
 
     # Default: exclude conversational turn spam from "memory recall" lookups
-    if not include_turns:
+    if not include_turn_rows:
         qq = qq.filter(CallerMemoryEvent.kind != "turn")
 
     # MVP keyword filter: OR over ILIKE
