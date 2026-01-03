@@ -95,47 +95,51 @@ def search_memory_events(
     caller_id: str,
     q: MemoryQuery,
     limit: int = 12,
-    include_turns: bool = False,
 ) -> list[CallerMemoryEvent]:
+    """Search caller memory events within a time window.
+
+    Default behavior intentionally excludes per-turn rows (kind == "turn") so recall
+    returns coherent summaries/skill outputs instead of disjoint turn fragments.
+
+    To explicitly include turns, pass a `skill_key` that starts with "turn_" (e.g.
+    "turn_user", "turn_assistant").
+    """
+    # Defensive: if DB missing, return empty
     if not tenant_id or not caller_id:
         return []
 
+    # Base query
     qq = (
         db.query(CallerMemoryEvent)
         .filter(CallerMemoryEvent.tenant_id == tenant_id)
         .filter(CallerMemoryEvent.caller_id == caller_id)
         .filter(CallerMemoryEvent.created_at >= q.start_ts.replace(tzinfo=None))
         .filter(CallerMemoryEvent.created_at <= q.end_ts.replace(tzinfo=None))
+        # Guard against historical bad rows
         .filter(CallerMemoryEvent.text.isnot(None))
         .filter(CallerMemoryEvent.text != "")
     )
 
-    # If caller explicitly requested a skill_key, honor it.
+    include_turns = False
     if q.skill_key:
         qq = qq.filter(CallerMemoryEvent.skill_key == q.skill_key)
         if str(q.skill_key).lower().startswith("turn_"):
             include_turns = True
 
-    # Default behavior: exclude turn-level spam from “memory recall”
+    # Default: exclude conversational turn spam from "memory recall" lookups
     if not include_turns:
         qq = qq.filter(CallerMemoryEvent.kind != "turn")
 
-    # Keyword filter (still ok, but now it won't hit turn spam unless include_turns=True)
+    # MVP keyword filter: OR over ILIKE
     if q.keywords:
+        ors = []
+        for kw in q.keywords[:8]:
+            ors.append(CallerMemoryEvent.text.ilike(f"%{kw}%"))
         from sqlalchemy import or_
-        ors = [CallerMemoryEvent.text.ilike(f"%{kw}%") for kw in q.keywords[:8]]
         qq = qq.filter(or_(*ors))
 
-    return qq.order_by(CallerMemoryEvent.created_at.desc()).limit(limit).all()
-
-# ----------------------------
-# Facts-first helpers (MVP)
-# ----------------------------
-
-_FACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bfavorite\s+colou?r\b", re.I), "favorite_color"),
-]
-
+    rows = qq.order_by(CallerMemoryEvent.created_at.desc()).limit(limit).all()
+    return rows
 def infer_fact_key(text: str) -> Optional[str]:
     """Map a user question to a durable fact key (MVP: favorite_color)."""
     raw = (text or "").strip()
