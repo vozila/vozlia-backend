@@ -60,6 +60,25 @@ except Exception:  # pragma: no cover
 
 _ROUTER_CLIENT = None
 
+def _is_junk_transcript(t: str) -> bool:
+    s = (t or "").strip().lower()
+    if len(s) < 5:
+        return True
+    if s in {"you", "ok", "okay", "yeah", "yes", "no", "um", "uh"}:
+        return True
+    return False
+
+def _tool_to_canonical_phrase(tool: str) -> str | None:
+    tool = (tool or "").strip().lower()
+    if tool == "gmail_summary":
+        return "Email summary"
+    if tool == "investment_reporting":
+        return "Investment reporting"
+    if tool == "memory_lookup":
+        return "Remember"
+    return None
+
+
 def _router_mode() -> str:
     return (os.getenv("LLM_ROUTER_MODE", "off") or "off").strip().lower()
 
