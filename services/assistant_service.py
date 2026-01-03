@@ -17,6 +17,7 @@ from services.investment_service import get_investment_reports
 
 import os
 import re
+import json
 from core.logging import logger
 from skills.registry import skill_registry
 from sqlalchemy.orm import Session
@@ -42,6 +43,124 @@ from services.longterm_memory import (
     record_skill_result,
 )
 
+# ----------------------------
+# LLM Router (intermediate step)
+# ----------------------------
+# Modes:
+#   - off (default): no additional OpenAI call
+#   - shadow: ask LLM for an intent/tool plan and LOG it (no behavior change)
+#   - assist: use the LLM plan to set force_* flags (still uses existing execution paths)
+#
+# This is intentionally small and feature-flagged so we can migrate from keyword/FSM triggers
+# to LLM-first tool planning without destabilizing production.
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
+
+_ROUTER_CLIENT = None
+
+def _router_mode() -> str:
+    return (os.getenv("LLM_ROUTER_MODE", "off") or "off").strip().lower()
+
+def _router_enabled() -> bool:
+    return _router_mode() in ("shadow", "assist")
+
+def _get_router_client():
+    global _ROUTER_CLIENT
+    if _ROUTER_CLIENT is not None:
+        return _ROUTER_CLIENT
+    if OpenAI is None:
+        return None
+    # Prefer OPENAI_API_KEY; fall back to legacy naming if present
+    api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "").strip()
+    if not api_key:
+        return None
+    try:
+        _ROUTER_CLIENT = OpenAI(api_key=api_key)
+        return _ROUTER_CLIENT
+    except Exception:
+        return None
+
+def llm_plan_route(text: str, *, ctx: dict | None = None) -> dict | None:
+    """Return a lightweight intent/tool plan (JSON) for routing.
+
+    This is NOT a tool-execution loop yet. It is an intermediate step to:
+      - validate LLM intent classification quality on real calls
+      - de-risk replacing Engagement Phrase keyword triggers
+    """
+    client = _get_router_client()
+    if client is None:
+        return None
+
+    model = (os.getenv("OPENAI_ROUTER_MODEL") or "").strip() or "gpt-4o-mini"
+    timeout_s = float((os.getenv("OPENAI_ROUTER_TIMEOUT_S", "4.0") or "4.0").strip())
+    max_tokens = int((os.getenv("OPENAI_ROUTER_MAX_TOKENS", "220") or "220").strip())
+
+    # Keep prompts short (voice hot path). Shadow mode should be used sparingly in production.
+    system = (
+        "You are an intent router for a real-time voice assistant. "
+        "Given the user's utterance, choose ONE tool to call next (or 'none'). "
+        "Return STRICT JSON only (no markdown)."
+    )
+    tools = [
+        {
+            "tool": "memory_lookup",
+            "when": "User asks about something previously discussed (last call, last week, before).",
+            "args": {"query": "string", "time_range": "last_call|last_7_days|last_30_days|all", "scope": "caller"},
+        },
+        {
+            "tool": "gmail_summary",
+            "when": "User asks for email summary, inbox, unread emails, latest emails, etc.",
+            "args": {"query": "string optional"},
+        },
+        {
+            "tool": "investment_reporting",
+            "when": "User asks about stocks, tickers, portfolio performance, market report.",
+            "args": {"tickers": ["string"], "mode": "brief|full"},
+        },
+        {
+            "tool": "none",
+            "when": "Normal conversation or the assistant can answer without tools.",
+            "args": {},
+        },
+    ]
+
+    user = {
+        "utterance": (text or "")[:800],
+        "context_keys": sorted(list((ctx or {}).keys()))[:20] if isinstance(ctx, dict) else [],
+        "available_tools": tools,
+        "output_schema": {
+            "intent": "short snake_case label",
+            "tool": "memory_lookup|gmail_summary|investment_reporting|none",
+            "tool_args": "object",
+            "confidence": "0.0-1.0",
+        },
+    }
+
+    try:
+        # Use chat.completions for compatibility with existing repo usage.
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user)},
+            ],
+            max_tokens=max_tokens,
+            timeout=timeout_s,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        # Best effort strict JSON parse
+        plan = json.loads(content)
+        if not isinstance(plan, dict):
+            return None
+        # Basic normalization
+        tool = str(plan.get("tool") or "").strip().lower()
+        if tool not in ("memory_lookup", "gmail_summary", "investment_reporting", "none"):
+            plan["tool"] = "none"
+        return plan
+    except Exception:
+        return None
 
 
 
@@ -231,6 +350,31 @@ def run_assistant_route(
     except Exception:
         force_memory = False
 
+    # ----------------------------
+    # (0) Optional LLM router plan (intermediate step)
+    # ----------------------------
+    llm_plan = None
+    if _router_enabled():
+        llm_plan = llm_plan_route(text or "", ctx=ctx_flags if isinstance(ctx_flags, dict) else None)
+        if llm_plan:
+            # Always log in shadow/assist so we can validate quality without changing core flow.
+            logger.info(
+                "LLM_ROUTER_PLAN mode=%s tool=%s conf=%s intent=%s",
+                _router_mode(),
+                llm_plan.get("tool"),
+                llm_plan.get("confidence"),
+                llm_plan.get("intent"),
+            )
+
+            # In assist mode, use the plan to set force flags (still uses existing execution paths).
+            if _router_mode() == "assist":
+                tool = str(llm_plan.get("tool") or "").strip().lower()
+                if tool == "gmail_summary":
+                    force_gmail_summary = True
+                elif tool == "investment_reporting":
+                    force_investment_reporting = True
+                elif tool == "memory_lookup":
+                    force_memory = True
     if debug:
         logger.info(
             "ASSISTANT_ROUTE_START user_id=%s account_id=%s text=%s ctx_keys=%s",
@@ -907,7 +1051,6 @@ def run_assistant_route(
                         db,
                         tenant_id=tenant_uuid,
                         caller_id=caller_id,
-                        call_sid=str(call_id) if call_id else None,
                         skill_key="gmail_summary",
                         cache_key_hash=cache_hash,
                     )
