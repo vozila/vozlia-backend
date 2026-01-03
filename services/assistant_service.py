@@ -294,6 +294,46 @@ def _answer_favorite_color(rows) -> str | None:
             continue
     return None
 
+
+def llm_answer_from_memory(question: str, evidence_lines: list[str]) -> str:
+    """LLM compose a fluent answer grounded in retrieved memory notes."""
+    client = _get_router_client()
+    if client is None:
+        # Fail-soft: return a minimal grounded response without hallucinating.
+        return "I found some notes, but I’m having trouble accessing my language model right now. Could you ask again?"
+
+    model = (os.getenv("MEMORY_ANSWER_MODEL") or os.getenv("OPENAI_ROUTER_MODEL") or "gpt-4o-mini").strip()
+    max_tokens = int(os.getenv("MEMORY_ANSWER_MAX_TOKENS", "220") or 220)
+    temperature = float(os.getenv("MEMORY_ANSWER_TEMPERATURE", "0.2") or 0.2)
+
+    # Keep context compact and grounded.
+    evidence_txt = "\n".join(evidence_lines[:12])
+    sys = (
+        "You are Vozlia, a helpful voice assistant on a phone call. "
+        "You have access to MEMORY NOTES from previous calls. "
+        "Answer the user's question using ONLY the notes. "
+        "If the notes don't contain the answer, say you don't know and ask a brief follow-up question. "
+        "Do not claim you have no memory capability; instead say what you found or that the notes are insufficient."
+    )
+
+    user = f"USER QUESTION:\n{question}\n\nMEMORY NOTES (most relevant first):\n{evidence_txt}"
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return out or "I couldn't find enough in my notes to answer that. Can you clarify what you meant?"
+    except Exception:
+        logger.exception("MEMORY_ANSWER_LLM_FAIL")
+        return "I couldn't find enough in my notes to answer that. Can you clarify what you meant?"
+
 def run_assistant_route(
     text: str,
     db: Session,
@@ -515,264 +555,128 @@ def run_assistant_route(
         )
 
     # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
-        # -------------------------
-    # AUTO memory question handling (facts-first for MVP)
+
     # -------------------------
-    if longterm_enabled and caller_id and tenant_uuid and (force_memory or _looks_like_memory_question(text)):
+    # AUTO memory question handling (summaries + vector first)
+    # -------------------------
+    if longterm_enabled and caller_id and tenant_uuid and _looks_like_memory_question(text):
         from services.memory_controller import (
             parse_memory_query,
             search_memory_events,
-            infer_fact_key,
-            fetch_fact_history,
+            vector_search_call_summaries,
         )
 
-        try:
-            qmem = parse_memory_query(text or "")
+        q_raw = text or ""
+        qmem = None
+        rows: list[CallerMemoryEvent] = []
+        use_turns_bridge = bool(int(os.getenv("LONGTERM_MEMORY_USE_TURNS_FOR_RECALL", "0") or "0"))
+        use_vector = os.getenv("VECTOR_MEMORY_ENABLED", "0").strip() == "1"
 
-            # 1) Facts-first: if the question maps to a known fact key (e.g., favorite_color),
-            # answer deterministically from stored facts (no guessing).
-            fact_key = infer_fact_key(text or "")
-            if fact_key:
-                facts = fetch_fact_history(
+        try:
+            qmem = parse_memory_query(q_raw)
+        except Exception:
+            logger.exception("AUTO_MEMORY_PARSE_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+
+        # 1) Vector search over call_summary rows (best quality)
+        if use_vector and qmem is not None:
+            try:
+                from services.embeddings_service import embed_texts
+                emb = embed_texts([q_raw])[0]
+                rows = vector_search_call_summaries(
                     db,
                     tenant_id=str(tenant_uuid),
                     caller_id=str(caller_id),
-                    fact_key=fact_key,
+                    query_embedding=emb,
                     start_ts=qmem.start_ts,
                     end_ts=qmem.end_ts,
-                    limit=int(os.getenv("LONGTERM_FACT_RECALL_LIMIT", "8") or 8),
+                    limit=int(os.getenv("LONGTERM_MEMORY_VECTOR_LIMIT", "8") or 8),
                 )
+                if debug:
+                    logger.info("AUTO_MEMORY_VECTOR_HITS tenant_id=%s caller_id=%s n=%s", tenant_id, caller_id, len(rows))
+            except Exception:
+                logger.exception("AUTO_MEMORY_VECTOR_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
 
-                if facts:
-                    newest = facts[0]
-                    newest_val = (newest.get("value") or "").strip()
+        # 2) If no vector hits (or vector disabled), prefer summaries by filtering skill_key='call_summary'
+        if not rows and qmem is not None:
+            try:
+                # First try: summaries only
+                qmem2 = qmem
+                qmem2.skill_key = "call_summary"
+                rows = search_memory_events(
+                    db,
+                    tenant_id=str(tenant_uuid),
+                    caller_id=str(caller_id),
+                    q=qmem2,
+                    include_turns=False,
+                    limit=int(os.getenv("LONGTERM_MEMORY_SUMMARY_LIMIT", "12") or 12),
+                )
+                if debug:
+                    logger.info("AUTO_MEMORY_SUMMARY_HITS tenant_id=%s caller_id=%s n=%s", tenant_id, caller_id, len(rows))
+            except Exception:
+                logger.exception("AUTO_MEMORY_SUMMARY_SEARCH_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
 
-                    distinct: list[str] = []
-                    for f in facts:
-                        v = (f.get("value") or "").strip()
-                        if v and v not in distinct:
-                            distinct.append(v)
-
-                    label = "favorite color" if fact_key == "favorite_color" else fact_key.replace("_", " ")
-
-                    if newest_val and len(distinct) == 1:
-                        return {
-                            "spoken_reply": f"You told me your {label} is {newest_val}.",
-                            "fsm": {
-                                "mode": "memory_fact",
-                                "fact_key": fact_key,
-                                "value": newest_val,
-                                "as_of": newest.get("created_at_iso"),
-                            },
-                            "gmail": None,
-                        }
-
-                    if newest_val and len(distinct) > 1:
-                        choices = []
-                        for f in facts[:3]:
-                            v = (f.get("value") or "").strip()
-                            ts = f.get("created_at_iso") or ""
-                            if v:
-                                choices.append(f"{v} (as of {ts})")
-                        choice_str = "; ".join(choices) if choices else ", ".join(distinct[:3])
-                        return {
-                            "spoken_reply": f"I have a couple different answers for your {label}: {choice_str}. Which one should I use going forward?",
-                            "fsm": {
-                                "mode": "memory_fact_conflict",
-                                "fact_key": fact_key,
-                                "values": distinct[:5],
-                                "evidence": facts[:3],
-                            },
-                            "gmail": None,
-                        }
-
-                # No fact hits: fail-soft WITHOUT guessing.
-                label = "favorite color" if fact_key == "favorite_color" else fact_key.replace("_", " ")
-                return {
-                    "spoken_reply": f"I couldn’t find your {label} in my notes. What did you want it to be?",
-                    "fsm": {"mode": "memory_fact", "fact_key": fact_key, "status": "no_hits"},
-                    "gmail": None,
-                }
-
-            # 2) Fallback: evidence snippets for generic “what did I say” questions.
-            rows = search_memory_events(
-                db,
-                tenant_id=str(tenant_uuid),
-                caller_id=str(caller_id),
-                q=qmem,
-                include_turns=bool(int(os.getenv('LONGTERM_MEMORY_USE_TURNS_FOR_RECALL', '1') or '1')),
-                limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "50") or 50),
-            )
-        except Exception as e:
-            logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
-            rows = []
+        # 3) Bridge fallback: include turns (temporary, until call summaries are consistently written)
+        if not rows and qmem is not None and use_turns_bridge:
+            try:
+                rows = search_memory_events(
+                    db,
+                    tenant_id=str(tenant_uuid),
+                    caller_id=str(caller_id),
+                    q=qmem,
+                    include_turns=True,
+                    limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "60") or 60),
+                )
+                if debug:
+                    logger.info("AUTO_MEMORY_TURN_HITS tenant_id=%s caller_id=%s n=%s", tenant_id, caller_id, len(rows))
+            except Exception as e:
+                logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
+                rows = []
 
         if not rows:
             if debug:
-                logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (text or "")[:200])
+                logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (q_raw or "")[:200])
             return {
-                "spoken_reply": "I couldn’t find that in my recent history. Can you repeat it, or give me a slightly wider timeframe?",
+                "spoken_reply": "I couldn’t find that in my notes yet. Can you tell me roughly when we talked about it?",
                 "fsm": {"mode": "memory_recall", "status": "no_hits"},
                 "gmail": None,
             }
 
-        snippets = []
-        for r in rows[:4]:
+        # Build compact evidence lines for the LLM
+        evidence_lines: list[str] = []
+        for r in rows[:12]:
+            ts = ""
             try:
-                ts = r.created_at.isoformat(timespec="seconds")
+                ts = r.created_at.isoformat()
             except Exception:
                 ts = ""
-            snippets.append(f"[{ts}] {r.text}")
+            label = (r.skill_key or r.kind or "note")
+            txt = (r.text or "").strip().replace("\n", " ")
+            if len(txt) > 420:
+                txt = txt[:420] + "…"
+            evidence_lines.append(f"- ({ts}) [{label}] {txt}")
 
-        spoken = "Here’s what I found: " + " … ".join(snippets[:3])
-        if len(snippets) > 3:
-            spoken += " …and I found a few more related notes."
-
-        return {
-            "spoken_reply": spoken,
-            "fsm": {
-                "mode": "memory_recall",
-                "has_evidence": True,
-                "hits": len(rows),
-                "skill_key": qmem.skill_key,
-                "keywords": qmem.keywords,
-                "evidence": snippets,
-            },
-            "gmail": None,
-        }
-
-
-    # Capture *every* user turn (best-effort; fail-open)
-    if longterm_enabled and capture_turns and caller_id and tenant_uuid:
-        ok = record_turn_event(
-            db,
-            tenant_uuid=str(tenant_uuid),
-            caller_id=str(caller_id),
-            call_sid=str(call_id) if call_id else None,
-            session_id=str(call_id) if call_id else None,
-            role="user",
-            text=text or "",
-        )
-
-        if debug:
-            logger.info("MEMORY_CAPTURE_TURN_USER ok=%s tenant_id=%s caller_id=%s", ok, tenant_id, caller_id)
-
-    # -------------------------
-    # AUTO memory question handling (facts-first for MVP)
-    # -------------------------
-    if longterm_enabled and caller_id and tenant_uuid and _looks_like_memory_question(text):
-        from services.memory_controller import parse_memory_query, search_memory_events
-
-        try:
-            qmem = parse_memory_query(text or "")
-            rows = search_memory_events(
-                db,
-                tenant_id=str(tenant_uuid),
-                caller_id=str(caller_id),
-                q=qmem,
-                include_turns=bool(int(os.getenv('LONGTERM_MEMORY_USE_TURNS_FOR_RECALL', '1') or '1')),
-                limit=int(os.getenv("LONGTERM_MEMORY_RECALL_LIMIT", "50") or 50),
-            )
-        except Exception as e:
-            logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
-            rows = []
-
-
-        # If we detected a memory question but could not retrieve any rows, fail-soft WITHOUT guessing.
-        if not rows:
-            if debug:
-                logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (text or "")[:200])
-            return {
-                "spoken_reply": "I couldn’t find that in my notes from that time window. Can you repeat it, or give me a slightly wider timeframe?",
-                "fsm": {"mode": "memory_recall", "status": "no_hits"},
-                "gmail": None,
-            }
-
-        if "favorite color" in (text or "").lower():
-            val = _answer_favorite_color(rows)
-            if val:
-                return {
-                    "spoken_reply": f"You told me your favorite color was {val}.",
-                    "fsm": {"mode": "memory_recall", "fact": "favorite_color", "value": val},
-                    "gmail": None,
-                }
-
-        if rows:
-            latest = rows[0]
-            raw = None
-            try:
-                data = getattr(latest, "data_json", None) or {}
-                if isinstance(data, dict):
-                    raw = data.get("raw")
-            except Exception:
-                raw = None
-            snippet = (raw or getattr(latest, "text", "") or "").strip()
-            if len(snippet) > 240:
-                snippet = snippet[:240] + "…"
-            return {
-                "spoken_reply": f"Here’s what I found from our recent conversation: {snippet}",
-                "fsm": {"mode": "memory_recall", "hits": len(rows)},
-                "gmail": None,
-            }
-
-        return {
-            "spoken_reply": "I couldn’t find that in your recent history. Can you tell me roughly when you said it?",
-            "fsm": {"mode": "memory_recall", "hits": 0},
-            "gmail": None,
-        }
-
-    # -------------------------
-    # Backend call: memory_recall (Option A: no stream.py changes needed)
-    # -------------------------
-    backend_call = None
-    try:
-        if isinstance(ctx, dict):
-            backend_call = (ctx.get("backend_call") or "").strip() or None
-    except Exception:
-        backend_call = None
-
-    if backend_call == "memory_recall":
-        from services.memory_controller import parse_memory_query, search_memory_events
-
-        t_mem0 = _time.perf_counter()
-        qmem = parse_memory_query(text or "")
-        rows = []
-        try:
-            rows = search_memory_events(
-                db,
-                tenant_id=tenant_id,
-                caller_id=caller_id or "",
-                q=qmem,
-                include_turns=bool(int(os.getenv('LONGTERM_MEMORY_USE_TURNS_FOR_RECALL', '1') or '1')),
-                limit=int(os.getenv("LONGTERM_MEMORY_RECALL_TOPK", "12") or 12),
-            )
-            logger.info(
-                "MEMORY_RECALL_QUERY_OK tenant_id=%s caller_id=%s skill=%s kws=%s window_days=%.1f hits=%s ms=%.1f",
-                tenant_id,
-                caller_id,
-                qmem.skill_key or None,
-                ",".join(qmem.keywords or []),
-                (qmem.end_ts - qmem.start_ts).total_seconds()/86400.0,
-                len(rows),
-                (_time.perf_counter() - t_mem0) * 1000.0,
-            )
-        except Exception as e:
-            logger.exception("MEMORY_RECALL_QUERY_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
-            rows = []
-
-        if not rows:
-            spoken = "I couldn’t find anything in your recent history for that. Can you tell me roughly when it was or what it was about?"
+        if os.getenv("MEMORY_LLM_ANSWER_ENABLED", "1").strip() == "1":
+            spoken = llm_answer_from_memory(q_raw, evidence_lines)
             return {
                 "spoken_reply": spoken,
                 "fsm": {
                     "mode": "memory_recall",
-                    "has_evidence": False,
-                    "hits": 0,
-                    "skill_key": qmem.skill_key,
-                    "keywords": qmem.keywords,
+                    "has_evidence": True,
+                    "hits": len(rows),
+                    "vector": bool(use_vector),
+                    "used_turns": bool(use_turns_bridge and any((getattr(r, "kind", "") == "turn") for r in rows)),
                 },
                 "gmail": None,
             }
+
+        # Fail-soft fallback: old snippet style (should be rarely used)
+        spoken = "Here’s what I found in your notes: " + " ".join([ln.split('] ',1)[-1] for ln in evidence_lines[:3]])
+        return {
+            "spoken_reply": spoken,
+            "fsm": {"mode": "memory_recall", "has_evidence": True, "hits": len(rows)},
+            "gmail": None,
+        }
+
 
         # Evidence-first summary (MVP, deterministic)
         # We return a natural sentence + include evidence snippets for debugging / future improvements.
