@@ -841,6 +841,7 @@ def run_assistant_route(
                         db,
                         tenant_uuid=tenant_uuid,
                         caller_id=caller_id,
+                        call_sid=str(call_id) if call_id else None,
                         skill_key="gmail_summary",
                         input_text=text,
                         memory_text=(gmail_data.get("summary") or "").strip()[:900],
@@ -906,6 +907,7 @@ def run_assistant_route(
                         db,
                         tenant_id=tenant_uuid,
                         caller_id=caller_id,
+                        call_sid=str(call_id) if call_id else None,
                         skill_key="gmail_summary",
                         cache_key_hash=cache_hash,
                     )
@@ -1042,6 +1044,7 @@ def run_assistant_route(
                     db,
                     tenant_uuid=str(tenant_uuid),
                     caller_id=str(caller_id),
+                    call_sid=str(call_id) if call_id else None,
                     skill_key="investment_reporting",
                     input_text=text,
                     memory_text=str(spoken_list[0]),
