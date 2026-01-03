@@ -556,6 +556,15 @@ async def twilio_stream(websocket: WebSocket):
                     await asyncio.sleep(0.005)
                     continue
 
+                # If audio generation ended with a partial frame, it can get stuck forever and cause underruns.
+                # Clear it once it's been idle briefly (protects call quality and greeting drain).
+                if (not prebuffer_active) and 0 < len(audio_buffer) < BYTES_PER_FRAME:
+                    if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) > 0.25:
+                        logger.debug("AUDIO_BUFFER_CLEAR_PARTIAL bytes=%d", len(audio_buffer))
+                        audio_buffer = bytearray()
+                        await asyncio.sleep(0)  # yield
+                        continue
+
                 # prebuffer at utterance start
                 if prebuffer_active:
                     if len(audio_buffer) < PREBUFFER_BYTES:
@@ -624,10 +633,19 @@ async def twilio_stream(websocket: WebSocket):
         This prevents cutting off the end of the greeting when we enqueue an immediate follow-on response
         (e.g., AUTO_EXECUTE_AFTER_GREETING), because create_fsm_spoken_reply cancels/clears the buffer.
         """
+        nonlocal audio_buffer
+
         start = time.monotonic()
         while True:
             if twilio_ws_closed:
                 return False
+            # If we have a partial frame queued (< BYTES_PER_FRAME), it will never be sent.
+            # Drop it so drain protection doesn't time out on a stuck remainder (commonly 80 bytes).
+            if 0 < len(audio_buffer) < BYTES_PER_FRAME:
+                logger.debug("AUDIO_BUFFER_DROP_REMAINDER label=%s bytes=%d", label, len(audio_buffer))
+                audio_buffer = bytearray()
+                continue
+
             # We consider 'drained' when there's essentially nothing left queued for Twilio.
             if len(audio_buffer) <= target_bytes:
                 if grace_ms and grace_ms > 0:
