@@ -1091,7 +1091,7 @@ async def twilio_stream(websocket: WebSocket):
 
         # If we're currently holding the floor (await_more), treat any new completed transcript
         # as a continuation fragment and extend the flush timer (unless we're resolving a discovery offer).
-        nonlocal pending_discovery_skill_id
+        nonlocal pending_discovery_skill_id, pending_discovery_trigger_text
         nonlocal await_more_task, await_more_text, await_more_current_ms, await_more_rounds
         if await_more_task is not None and (pending_discovery_skill_id is None):
             await_more_text = (await_more_text + " " + transcript).strip() if await_more_text else transcript
@@ -1102,7 +1102,6 @@ async def twilio_stream(websocket: WebSocket):
 
 
         # Resolve a pending discovery offer (Add-to-greeting) deterministically.
-        nonlocal pending_discovery_skill_id, pending_discovery_trigger_text
         if pending_discovery_skill_id:
             norm = _normalize_text(transcript)
             first = norm.split(" ", 1)[0] if norm else ""
