@@ -176,26 +176,35 @@ def write_call_summary_event(
     return True
 
 
-def ensure_call_summary_for_call(db: Any, *, call_sid: str, caller_id: str) -> None:
-    """Idempotent: creates call_summary for call_sid if enabled and not present."""
-    if os.getenv("CALL_SUMMARY_ENABLED", "0").strip() != "1":
+def ensure_call_summary_for_call(db: Any, *, call_sid: str) -> None:
+    """Idempotent: creates call_summary for call_sid if enabled and not present.
+
+    IMPORTANT: caller_id is inferred from existing events for this call_sid so the
+    stream handler does not need to pass it (and cannot accidentally pass a phone
+    number instead of the UUID).
+    """
+    enabled = (os.getenv("CALL_SUMMARY_ENABLED", "0").strip() == "1")
+    if not enabled:
         return
-    if not call_sid or not caller_id:
+    if not call_sid:
         return
 
-    # Find tenant_id from existing events for this call
-    tenant_row = (
-        db.query(CallerMemoryEvent.tenant_id)
+    # Find tenant_id + caller_id from existing events for this call
+    row = (
+        db.query(CallerMemoryEvent.tenant_id, CallerMemoryEvent.caller_id)
         .filter(CallerMemoryEvent.call_sid == call_sid)
         .order_by(CallerMemoryEvent.created_at.desc())
         .first()
     )
-    tenant_id = str(tenant_row[0]) if tenant_row and tenant_row[0] else None
-    if not tenant_id:
-        logger.warning("CALL_SUMMARY_SKIP no tenant_id for call_sid=%s", call_sid)
+    if not row or not row[0] or not row[1]:
+        logger.warning("CALL_SUMMARY_SKIP no tenant/caller for call_sid=%s", call_sid)
         return
 
-    exists = (
+    tenant_id = str(row[0])
+    caller_id = str(row[1])
+
+    # Already summarized?
+    existing = (
         db.query(CallerMemoryEvent.id)
         .filter(CallerMemoryEvent.tenant_id == tenant_id)
         .filter(CallerMemoryEvent.caller_id == caller_id)
@@ -203,7 +212,7 @@ def ensure_call_summary_for_call(db: Any, *, call_sid: str, caller_id: str) -> N
         .filter(CallerMemoryEvent.skill_key == "call_summary")
         .first()
     )
-    if exists:
+    if existing:
         return
 
     events = (
