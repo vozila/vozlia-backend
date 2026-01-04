@@ -18,8 +18,7 @@ from services.investment_service import get_investment_reports
 import os
 import re
 import json
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
 from core.logging import logger
 from skills.registry import skill_registry
 from sqlalchemy.orm import Session
@@ -46,53 +45,27 @@ def _maybe_answer_history_count(
     if ("email" not in t) and ("gmail" not in t):
         return None
     # Restrict to summary-request counts (avoid hijacking random email questions)
-    if ("summary" not in t and "summaries" not in t and "summar" not in t and "request" not in t and "requested" not in t):
-        if "my email" not in t:
+    # Prefer explicit 'summary' wording, but allow 'requested emails' phrasing.
+    if ("summary" not in t and "summaries" not in t and "summar" not in t):
+        if not ("request" in t or "requested" in t):
             return None
 
-    now_utc = datetime.now(timezone.utc)
-    # Interpret "today/this week/this month" in America/New_York, then convert to UTC for DB filtering.
-    tz = ZoneInfo(os.getenv("APP_TZ", "America/New_York"))
-    now_local = now_utc.astimezone(tz)
-
+    now = datetime.utcnow()
     start_dt = None
     scope = ""
-
     if "today" in t:
-        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_dt = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        start_dt = datetime(now.year, now.month, now.day)
         scope = " today"
-    elif "this week" in t:
-        # Week starts Monday 00:00 local time
-        start_local = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        start_dt = start_local.astimezone(timezone.utc).replace(tzinfo=None)
-        scope = " this week"
-    elif "past week" in t or "last week" in t:
-        start_dt = (now_utc - timedelta(days=7)).replace(tzinfo=None)
+    elif "this week" in t or "past week" in t or "last week" in t:
+        start_dt = now - timedelta(days=7)
         scope = " in the past week"
-    elif "this month" in t:
-        start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        start_dt = start_local.astimezone(timezone.utc).replace(tzinfo=None)
-        scope = " this month"
-    elif "past month" in t or "last month" in t:
-        start_dt = (now_utc - timedelta(days=30)).replace(tzinfo=None)
+    elif "this month" in t or "past month" in t or "last month" in t:
+        start_dt = now - timedelta(days=30)
         scope = " in the past month"
-
-    # Caller-id normalization: match either "+1..." or "1..." variants to avoid drift.
-    cid = str(caller_id)
-    cid_digits = "".join([c for c in cid if c.isdigit()])
-    caller_variants = {cid}
-    if cid.startswith("+"):
-        caller_variants.add(cid[1:])
-    else:
-        caller_variants.add("+" + cid)
-    if cid_digits:
-        caller_variants.add(cid_digits)
-        caller_variants.add("+" + cid_digits)
 
     qy = db.query(CallerMemoryEvent).filter(
         CallerMemoryEvent.tenant_id == str(tenant_id),
-        CallerMemoryEvent.caller_id.in_(sorted(caller_variants)),
+        CallerMemoryEvent.caller_id == str(caller_id),
         CallerMemoryEvent.skill_key == "gmail_summary",
     )
     if start_dt is not None:
@@ -102,7 +75,7 @@ def _maybe_answer_history_count(
     if cnt == 0:
         return f"You haven't requested email summaries{scope}."
     suffix = "time" if cnt == 1 else "times"
-    return f"In total, {cnt} {suffix}{scope}."
+    return f"{cnt} {suffix}{scope}."
 
 from services.memory_facade import (
     memory,
@@ -158,58 +131,6 @@ def _tool_to_canonical_phrase(tool: str) -> str | None:
     if tool == "memory_lookup":
         return None
     return None
-
-
-def _emit_await_more_enabled() -> bool:
-    return (os.getenv("ROUTER_EMIT_AWAIT_MORE", "0") or "").strip().lower() in ("1","true","yes","on")
-
-def _await_more_default_ms() -> int:
-    try:
-        return int(os.getenv("ROUTER_AWAIT_MORE_DEFAULT_MS", "650") or 650)
-    except Exception:
-        return 650
-
-def _await_more_max_ms() -> int:
-    try:
-        return int(os.getenv("ROUTER_AWAIT_MORE_MAX_MS", "1400") or 1400)
-    except Exception:
-        return 1400
-
-def _should_await_more_fragment(text: str) -> tuple[bool, int, str]:
-    """Heuristic: return (should_hold, ms, reason) when a transcript looks incomplete."""
-    t = (text or "").strip()
-    if not t:
-        return (False, 0, "")
-    s = t.lower()
-
-    # Never hold on explicit questions or "check in" phrases.
-    if "?" in s:
-        return (False, 0, "")
-    if s.startswith(("hello", "hi", "hey")):
-        return (False, 0, "")
-    if "are you there" in s or "you there" in s or "still there" in s:
-        return (False, 0, "")
-    if any(k in s for k in ("how many", "number of", "how often", "times")):
-        return (False, 0, "")
-
-    words = [w for w in re.split(r"\s+", s) if w]
-    wc = len(words)
-
-    if wc <= 4:
-        return (True, _await_more_default_ms(), "short_fragment")
-    if s.endswith(("...", ",", "—", "-", ":")):
-        return (True, _await_more_default_ms(), "trailing_punct")
-
-    trailing_words = ("when", "what", "why", "how", "because", "so", "and", "or", "but")
-    if any(s.endswith(" " + tw) or s.endswith(tw) for tw in trailing_words):
-        return (True, _await_more_default_ms(), "trailing_word")
-
-    # leading openers (common split)
-    leading_openers = ("can you", "could you", "would you", "tell me", "i was wondering", "i'm thinking", "im thinking")
-    if any(s.startswith(lo) for lo in leading_openers) and wc <= 8:
-        return (True, _await_more_default_ms(), "leading_opener")
-
-    return (False, 0, "")
 
 
 def _router_mode() -> str:
@@ -771,7 +692,7 @@ def run_assistant_route(
 
     # Deterministic history counts: avoid LLM guessing for "how many times ... email summaries" questions.
     # This runs before FSM so it works even when phrasing is inconsistent.
-    if caller_id and tenant_uuid:
+    if longterm_enabled and caller_id and tenant_uuid:
         try:
             _hc = _maybe_answer_history_count(db, tenant_id=str(tenant_uuid), caller_id=str(caller_id), text=raw_user_text)
         except Exception:
@@ -779,34 +700,7 @@ def run_assistant_route(
         if _hc:
             return {"spoken_reply": _hc, "fsm": {"mode": "history_count", "key": "gmail_summary_count"}, "gmail": None}
 
-    
-    # ---------------------------------------------------------
-    # Layer C (emitter): if the transcript looks incomplete, ask stream.py to hold the floor briefly.
-    # Feature-flagged: ROUTER_EMIT_AWAIT_MORE=1
-    if _emit_await_more_enabled():
-        try:
-            hold, ms, reason = _should_await_more_fragment(raw_user_text)
-        except Exception:
-            hold, ms, reason = (False, 0, "")
-        if hold:
-            max_ms = _await_more_max_ms()
-            if ms > max_ms:
-                ms = max_ms
-            logger.info("ROUTER_AWAIT_MORE_EMIT ms=%s reason=%s text=%r", ms, reason, (raw_user_text or "")[:120])
-            return {
-                "spoken_reply": "",
-                "fsm": {
-                    "mode": "await_more",
-                    "await_more": True,
-                    "await_more_ms": ms,
-                    "await_reason": reason,
-                    "suppress_response": True,
-                    "suppress_reason": "incomplete_fragment",
-                },
-                "gmail": None,
-            }
-
-# Turn capture (so call summaries include USER questions)
+    # Turn capture (so call summaries include USER questions)
     # -------------------------
     def _wrap_reply(payload: dict) -> dict:
         """Sanitize + capture assistant spoken_reply (if present), then return payload."""
@@ -861,9 +755,15 @@ def run_assistant_route(
 # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
 
     # -------------------------
-    # AUTO memory question handling (summaries + vector first)
+    # AUTO memory question handling (summaries first; vector is last resort)
+    # Policy:
+    #   - Never run memory/vector retrieval if another explicit route is selected (backend_call or forced tool).
+    #   - If we DO answer from memory (especially via vector), disclose that to the caller.
     # -------------------------
-    if longterm_enabled and caller_id and tenant_uuid and (force_memory or _looks_like_memory_question(raw_user_text)):
+    memory_route_blocked = bool(backend_call or force_gmail_summary or force_investment_reporting)
+    if (not memory_route_blocked) and longterm_enabled and caller_id and tenant_uuid and (
+        force_memory or _looks_like_memory_question(raw_user_text)
+    ):
         from services.memory_controller import (
             parse_memory_query,
             search_memory_events,
@@ -873,6 +773,7 @@ def run_assistant_route(
         q_raw = raw_user_text or ""
         qmem = None
         rows: list[Any] = []
+
         use_turns_bridge = bool(int(os.getenv("LONGTERM_MEMORY_USE_TURNS_FOR_RECALL", "0") or "0"))
         use_vector = os.getenv("VECTOR_MEMORY_ENABLED", "0").strip() == "1"
 
@@ -881,46 +782,26 @@ def run_assistant_route(
         except Exception:
             logger.exception("AUTO_MEMORY_PARSE_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
 
-        # 1) Vector search over call_summary rows (best quality)
-        if use_vector and qmem is not None:
+        # 1) Summaries / structured notes first (no embeddings)
+        if qmem is not None:
             try:
-                from services.embeddings_service import embed_texts
-                emb = embed_texts([q_raw])[0]
-                rows = vector_search_call_summaries(
-                    db,
-                    tenant_id=str(tenant_uuid),
-                    caller_id=str(caller_id),
-                    query_embedding=emb,
-                    start_ts=qmem.start_ts,
-                    end_ts=qmem.end_ts,
-                    limit=int(os.getenv("LONGTERM_MEMORY_VECTOR_LIMIT", "8") or 8),
-                )
-                if debug:
-                    logger.info("AUTO_MEMORY_VECTOR_HITS tenant_id=%s caller_id=%s n=%s", tenant_id, caller_id, len(rows))
-            except Exception:
-                logger.exception("AUTO_MEMORY_VECTOR_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
-
-        # 2) If no vector hits (or vector disabled), prefer summaries by filtering skill_key='call_summary'
-        if not rows and qmem is not None:
-            try:
-                # First try: summaries only
-                qmem2 = qmem
-                qmem2.skill_key = "call_summary"
+                qmem_summary = qmem
+                qmem_summary.skill_key = "call_summary"
                 rows = search_memory_events(
                     db,
                     tenant_id=str(tenant_uuid),
                     caller_id=str(caller_id),
-                    q=qmem2,
+                    q=qmem_summary,
                     include_turns=False,
                     limit=int(os.getenv("LONGTERM_MEMORY_SUMMARY_LIMIT", "12") or 12),
                 )
                 if debug:
                     logger.info("AUTO_MEMORY_SUMMARY_HITS tenant_id=%s caller_id=%s n=%s", tenant_id, caller_id, len(rows))
             except Exception:
-                logger.exception("AUTO_MEMORY_SUMMARY_SEARCH_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+                logger.exception("AUTO_MEMORY_SUMMARY_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
 
-        # 3) Bridge fallback: include turns (temporary, until call summaries are consistently written)
-        if not rows and qmem is not None and use_turns_bridge:
+        # 2) Optionally include turns (still no embeddings)
+        if (not rows) and qmem is not None and use_turns_bridge:
             try:
                 rows = search_memory_events(
                     db,
@@ -936,18 +817,39 @@ def run_assistant_route(
                 logger.exception("AUTO_MEMORY_RECALL_FAIL tenant_id=%s caller_id=%s err=%s", tenant_id, caller_id, e)
                 rows = []
 
+        # 3) Vector search LAST (only if no other memory route succeeded)
+        vector_used = False
+        if (not rows) and use_vector and qmem is not None:
+            try:
+                from services.embeddings_service import embed_texts
+                emb = embed_texts([q_raw])[0]
+                rows = vector_search_call_summaries(
+                    db,
+                    tenant_id=str(tenant_uuid),
+                    caller_id=str(caller_id),
+                    query_embedding=emb,
+                    start_ts=qmem.start_ts,
+                    end_ts=qmem.end_ts,
+                    limit=int(os.getenv("LONGTERM_MEMORY_VECTOR_LIMIT", "8") or 8),
+                )
+                vector_used = bool(rows)
+                if debug:
+                    logger.info("AUTO_MEMORY_VECTOR_HITS tenant_id=%s caller_id=%s n=%s", tenant_id, caller_id, len(rows))
+            except Exception:
+                logger.exception("AUTO_MEMORY_VECTOR_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+
         if not rows:
             if debug:
                 logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (q_raw or "")[:200])
             payload = {
-                "spoken_reply": "I couldn’t find that in my notes yet. Can you tell me roughly when we talked about it?",
-                "fsm": {"mode": "memory_recall", "status": "no_hits"},
+                "spoken_reply": "I don’t have that in my saved notes yet. Can you tell me roughly when we talked about it?",
+                "fsm": {"mode": "memory_recall", "status": "no_hits", "has_evidence": False},
                 "gmail": None,
             }
             _capture_turn("assistant", payload.get("spoken_reply"))
             return payload
 
-        # Build compact evidence lines for the LLM
+        # Build compact evidence lines (for grounded answering)
         evidence_lines: list[str] = []
         for r in rows[:12]:
             ts = ""
@@ -955,154 +857,41 @@ def run_assistant_route(
                 ts = r.created_at.isoformat()
             except Exception:
                 ts = ""
-            label = (r.skill_key or r.kind or "note")
-            txt = (r.text or "").strip().replace("\n", " ")
-            if len(txt) > 420:
-                txt = txt[:420] + "…"
-            evidence_lines.append(f"- ({ts}) [{label}] {txt}")
+            label = (r.skill_key or getattr(r, "kind", None) or "note")
+            txt = (r.text or "").strip()
+            if txt:
+                evidence_lines.append(f"[{ts}] ({label}) {txt}")
 
-        if os.getenv("MEMORY_LLM_ANSWER_ENABLED", "1").strip() == "1":
-            spoken = llm_answer_from_memory(q_raw, evidence_lines)
+        answer = llm_answer_from_memory(q_raw, evidence_lines)
+        prefix = "From my saved memory: " if vector_used else "From my saved notes: "
+
+        if answer:
             payload = {
-                "spoken_reply": spoken,
+                "spoken_reply": prefix + answer,
                 "fsm": {
                     "mode": "memory_recall",
                     "has_evidence": True,
                     "hits": len(rows),
-                    "vector": bool(use_vector),
-                    "used_turns": bool(use_turns_bridge and any((getattr(r, "kind", "") == "turn") for r in rows)),
+                    "vector": bool(vector_used),
+                    "memory_source": "vector" if vector_used else ("turns" if use_turns_bridge else "summaries"),
                 },
                 "gmail": None,
             }
             _capture_turn("assistant", payload.get("spoken_reply"))
             return payload
 
-        # Fail-soft fallback: old snippet style (should be rarely used)
-        spoken = "Here’s what I found in your notes: " + " ".join([ln.split('] ',1)[-1] for ln in evidence_lines[:3]])
-        payload = {
-            "spoken_reply": spoken,
-            "fsm": {"mode": "memory_recall", "has_evidence": True, "hits": len(rows)},
-            "gmail": None,
-        }
-        _capture_turn("assistant", payload.get("spoken_reply"))
-        return payload
-
-
-        # Evidence-first summary (MVP, deterministic)
-        # We return a natural sentence + include evidence snippets for debugging / future improvements.
+        # Fail-soft: deterministic snippet (still disclose memory source)
         snippets = []
-        for r in rows[:6]:
-            ts = (r.created_at.isoformat(timespec="seconds") if getattr(r, "created_at", None) else "")
-            snippets.append(f"[{ts}] {r.skill_key}: {r.text}")
-
-        spoken = "Here’s what I found from your history: " + " ".join(snippets[:3])
-        if len(snippets) > 3:
-            spoken += " …and I found a few more related notes."
+        for ln in evidence_lines[:3]:
+            snippets.append(ln.split(") ", 1)[-1])
 
         payload = {
-            "spoken_reply": spoken,
-            "fsm": {
-                "mode": "memory_recall",
-                "has_evidence": True,
-                "hits": len(rows),
-                "skill_key": qmem.skill_key,
-                "keywords": qmem.keywords,
-                "evidence": snippets,
-            },
+            "spoken_reply": prefix + (" ".join(snippets) if snippets else ""),
+            "fsm": {"mode": "memory_recall", "has_evidence": True, "hits": len(rows), "vector": bool(vector_used)},
             "gmail": None,
         }
         _capture_turn("assistant", payload.get("spoken_reply"))
         return payload
-
-    fsm = VozliaFSM()
-
-    base_greeting = get_agent_greeting(db, current_user)
-    greeting = base_greeting
-
-    # Optional: append the Gmail Summary skill greeting line to the greeting
-    try:
-        if gmail_summary_enabled(db, current_user) and gmail_summary_add_to_greeting(db, current_user):
-            sk = skill_registry.get("gmail_summary")
-            add = (getattr(sk, "greeting", "") or "").strip() if sk else ""
-            if add:
-                # keep spacing clean
-                greeting = (base_greeting or "").strip()
-                if greeting:
-                    greeting = greeting + (" " if not greeting.endswith(("!", ".", "?")) else " ") + add
-                else:
-                    greeting = add
-    except Exception:
-        pass
-
-    fsm.greeting_text = greeting
-
-
-    fsm_context = context or {}
-    if isinstance(fsm_context, dict) and memory_context:
-        fsm_context.setdefault("memory_context", memory_context)
-
-    fsm_context.setdefault("user_id", current_user.id)
-    fsm_context.setdefault("channel", "phone")
-
-    fsm_result: dict = fsm.handle_utterance(text, context=fsm_context)
-
-    spoken_reply: str = fsm_result.get("spoken_reply") or ""
-
-    # Silence annoying clarifying / uncertain fallbacks (user preference).
-    def _truthy_env(name: str, default: str = "1") -> bool:
-        v = (os.getenv(name, default) or default).strip().lower()
-        return v in ("1", "true", "yes", "on")
-
-    _silence_enabled = _truthy_env("VOICE_SILENT_ON_UNCERTAIN", "1") or _truthy_env("VOICE_SILENCE_FSM_FALLBACK", "1")
-    if _silence_enabled and spoken_reply:
-        _fallback_re = re.compile(
-            r"""(
-                i['’]?m\s+not\s+sure
-                |not\s+sure\s+what\s+you\s+mean
-                |not\s+sure\s+what\s+you\s+meant
-                |can\s+you\s+rephrase
-                |could\s+you\s+rephrase
-                |give\s+me\s+(?:a\s+bit\s+)?more\s+detail
-                |can\s+you\s+give\s+me\s+(?:a\s+bit\s+)?more\s+detail
-                |can\s+you\s+clarify
-                |could\s+you\s+clarify
-                |i\s+didn['’]?t\s+understand
-                |i\s+don['’]?t\s+understand
-                |i\s+am\s+confused
-                |i['’]?m\s+confused
-                |please\s+repeat
-                |say\s+that\s+again
-            )""",
-            re.IGNORECASE | re.VERBOSE,
-        )
-        if _fallback_re.search(spoken_reply):
-            spoken_reply = ""
-            fsm_result["spoken_reply"] = ""
-            fsm_result["suppress_response"] = True
-    if debug:
-        bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
-        logger.info(
-            "ASSISTANT_ROUTE_FSM spoken_len=%s backend_call=%s fsm_keys=%s dt_ms=%s",
-            len(spoken_reply or ''),
-            bc_type,
-            sorted(list(fsm_result.keys())) if isinstance(fsm_result, dict) else None,
-            int((_time.perf_counter() - t0) * 1000),
-        )
-    backend_call: dict | None = fsm_result.get("backend_call") or None
-    gmail_data: dict | None = None
-    if (not backend_call) and force_gmail_summary:
-        backend_call = {
-            "type": "gmail_summary",
-            "params": {"query": "is:unread", "max_results": 20},
-        }
-        # Keep behavior consistent with FSM email intent reply
-        spoken_reply = _standby_phrase() if wants_standby_ack else "Sure, I'll take a quick look at your recent unread emails."
-        try:
-            fsm_result = dict(fsm_result)
-            fsm_result["backend_call"] = backend_call
-        except Exception:
-            pass
-
 
 
     if (not backend_call) and force_investment_reporting:
