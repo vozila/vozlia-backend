@@ -17,6 +17,7 @@ from services.investment_service import get_investment_reports
 
 import os
 import re
+from typing import Any, Optional
 import json
 from core.logging import logger
 from skills.registry import skill_registry
@@ -386,7 +387,6 @@ def run_assistant_route(
                 "Please stand by while I check your inbox.",
             ]
         return _random.choice(choices)
-        return _random.choice(choices)
 
     # Skill engagement phrases (Gmail Summary)
     force_gmail_summary = False
@@ -598,7 +598,7 @@ def run_assistant_route(
     # Capture the user turn early so even early returns preserve the question.
     _capture_turn("user", raw_user_text)
 
-# Pull small recent context for prompt grounding (keep short; no hot-path bloat)
+    # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
 
     # -------------------------
     # AUTO memory question handling (summaries + vector first)
@@ -612,7 +612,7 @@ def run_assistant_route(
 
         q_raw = text or ""
         qmem = None
-        rows: list[CallerMemoryEvent] = []
+        rows: list[Any] = []
         use_turns_bridge = bool(int(os.getenv("LONGTERM_MEMORY_USE_TURNS_FOR_RECALL", "0") or "0"))
         use_vector = os.getenv("VECTOR_MEMORY_ENABLED", "0").strip() == "1"
 
