@@ -191,66 +191,53 @@ from services.gmail_service import get_default_gmail_account_id, summarize_gmail
 
 
 def _looks_like_memory_question(text: str) -> bool:
+    """Heuristic: does the user appear to be asking about prior calls / notes / what was said?
+
+    This should be permissive—it's okay to attempt memory recall and return silence if no evidence.
+    """
     t = (text or "").strip().lower()
     if not t:
         return False
 
-    # Voice transcripts often omit punctuation; keep heuristics simple and cheap.
-    # We treat anything referencing prior conversation/calls/notes as a memory lookup request.
-    triggers = [
-        "do you remember",
-        "did you remember",
-        "did i tell you",
-        "did i mention",
-        "what did i say",
-        "what did we talk about",
-        "what did i ask",
-        "what was i asking",
-        "what was i talking",
-        "what was i referring",
-        "in the previous call",
+    # Common temporal / recall cues
+    triggers = (
         "previous call",
         "last call",
         "last time",
-        "earlier call",
-        "earlier today",
+        "earlier",
+        "before",
         "previously",
+        "did i mention",
+        "did i say",
+        "what did i say",
+        "what did i tell",
+        "what did we talk",
         "we talked about",
         "we spoke about",
-        "from my notes",
-        "my notes",
-        "from my history",
-        "from my memory",
-        "in my memory",
+        "you remember",
+        "do you remember",
         "remind me",
-    ]
-    if any(tr in t for tr in triggers):
+        "from my notes",
+        "in my notes",
+        "my notes",
+        "from our conversation",
+        "from our last conversation",
+        "what was i talking about",
+        "what was i speaking about",
+        "what did i mention",
+        "what animal",
+        "what was the animal",
+        "what color",
+        "what was the color",
+    )
+    if any(x in t for x in triggers):
         return True
 
-    # Questions like "what did I mention?" without explicit trigger words
-    if t.startswith(("what ", "which ", "who ", "when ", "where ", "did ")) and ("mention" in t or "ask" in t or "say" in t):
+    # Question-shaped: asking "what/which" about something mentioned, without explicit trigger.
+    if "mention" in t and any(q in t for q in ("what", "which", "who")):
         return True
 
     return False
-
-
-def _is_open_ended_request(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-    # Generic openers where we should respond with a helpful prompt instead of a confusion message.
-    openers = [
-        "i have a request",
-        "i have a question",
-        "i have a problem",
-        "i need help",
-        "can you help me",
-        "can i ask you",
-        "i wanted to ask",
-        "i want to ask",
-        "i have something",
-    ]
-    return any(o in t for o in openers)
 
 
 # -----------------------------
@@ -357,7 +344,7 @@ def llm_answer_from_memory(question: str, evidence_lines: list[str]) -> str:
     client = _get_router_client()
     if client is None:
         # Fail-soft: return a minimal grounded response without hallucinating.
-        return "I found some notes, but I’m having trouble accessing my language model right now. Could you ask again?"
+        return ""
 
     model = (os.getenv("MEMORY_ANSWER_MODEL") or os.getenv("OPENAI_ROUTER_MODEL") or "gpt-4o-mini").strip()
     max_tokens = int(os.getenv("MEMORY_ANSWER_MAX_TOKENS", "220") or 220)
@@ -366,11 +353,10 @@ def llm_answer_from_memory(question: str, evidence_lines: list[str]) -> str:
     # Keep context compact and grounded.
     evidence_txt = "\n".join(evidence_lines[:12])
     sys = (
-        "You are Vozlia, a helpful voice assistant on a phone call. "
-        "You have access to MEMORY NOTES from previous calls. "
-        "Answer the user's question using ONLY the notes. "
-        "If the notes don't contain the answer, say you don't know and ask a brief follow-up question. "
-        "Do not claim you have no memory capability; instead say what you found or that the notes are insufficient."
+        "You are Vozlia, a voice assistant. You can answer questions using ONLY the provided MEMORY NOTES. "
+        "If the MEMORY NOTES do not contain the answer, return an empty string. "
+        "Do NOT ask clarifying questions. Do NOT mention limitations like 'I can't remember' or 'I don't have memory'. "
+        "Be concise and grounded."
     )
 
     user = f"USER QUESTION:\n{question}\n\nMEMORY NOTES (most relevant first):\n{evidence_txt}"
@@ -386,10 +372,10 @@ def llm_answer_from_memory(question: str, evidence_lines: list[str]) -> str:
             ],
         )
         out = (resp.choices[0].message.content or "").strip()
-        return out or "I couldn't find enough in my notes to answer that. Can you clarify what you meant?"
+        return out or ""
     except Exception:
         logger.exception("MEMORY_ANSWER_LLM_FAIL")
-        return "I couldn't find enough in my notes to answer that. Can you clarify what you meant?"
+        return ""
 
 def run_assistant_route(
     text: str,
@@ -509,7 +495,9 @@ def run_assistant_route(
                             force_memory = True
 
                         canonical = _tool_to_canonical_phrase(tool)
-                        if canonical:
+                        # Do NOT canonicalize memory lookups: we want to preserve the original question
+                        # (e.g., "what animal did I mention?") for vector retrieval.
+                        if canonical and tool != "memory_lookup":
                             logger.info("LLM_ROUTER_ASSIST_CANONICALIZE from=%r to=%r", text, canonical)
                             text = canonical
         else:
@@ -660,16 +648,16 @@ def run_assistant_route(
     # -------------------------
     # AUTO memory question handling (summaries + vector first)
     # -------------------------
-    if longterm_enabled and caller_id and tenant_uuid and (force_memory or _looks_like_memory_question(text)):
+    if longterm_enabled and caller_id and tenant_uuid and (force_memory or _looks_like_memory_question(raw_user_text)):
         from services.memory_controller import (
             parse_memory_query,
             search_memory_events,
             vector_search_call_summaries,
         )
 
-        q_raw = text or ""
+        q_raw = raw_user_text or ""
         qmem = None
-        rows: list[CallerMemoryEvent] = []
+        rows: list[Any] = []
         use_turns_bridge = bool(int(os.getenv("LONGTERM_MEMORY_USE_TURNS_FOR_RECALL", "0") or "0"))
         use_vector = os.getenv("VECTOR_MEMORY_ENABLED", "0").strip() == "1"
 
@@ -736,10 +724,8 @@ def run_assistant_route(
         if not rows:
             if debug:
                 logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (q_raw or "")[:200])
-            silent_unknown = (os.getenv("VOICE_FALLBACK_SILENT_ON_UNKNOWN", "0") or "0").strip().lower() in ("1","true","yes","on")
-            spoken_no_hits = "" if silent_unknown else "I couldn’t find that in my notes yet."
             payload = {
-                "spoken_reply": spoken_no_hits,
+                "spoken_reply": "I couldn’t find that in my notes yet. Can you tell me roughly when we talked about it?",
                 "fsm": {"mode": "memory_recall", "status": "no_hits"},
                 "gmail": None,
             }
@@ -846,26 +832,26 @@ def run_assistant_route(
     fsm_result: dict = fsm.handle_utterance(text, context=fsm_context)
 
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
-    # -------------------------
-    # Voice UX: avoid clarifying "I'm not sure..." fallbacks for now (feature-flagged).
-    # - If the user gives a generic opener ("I have a request"), prompt them helpfully.
-    # - Otherwise, optionally go silent on unknown/clarifying responses.
-    # -------------------------
-    silent_unknown = (os.getenv("VOICE_FALLBACK_SILENT_ON_UNKNOWN", "0") or "0").strip().lower() in ("1","true","yes","on")
-    if _is_open_ended_request(raw_user_text):
-        spoken_reply = "Sure — how can I help?"
-    else:
-        low_info_markers = (
+
+    # Silence annoying clarifying / uncertain fallbacks (user preference).
+    if (os.getenv("VOICE_SILENT_ON_UNCERTAIN", "1") or "1").strip().lower() in ("1", "true", "yes", "on"):
+        low = (spoken_reply or "").strip().lower()
+        bad_phrases = (
+            "i'm not sure what you mean",
+            "im not sure what you mean",
             "i'm not sure what you meant",
             "im not sure what you meant",
             "can you give me a bit more detail",
-            "could you rephrase",
-            "please rephrase",
-            "can you rephrase",
+            "could you give me a bit more detail",
+            "can you clarify",
+            "could you clarify",
+            "i didn't understand",
+            "i dont understand",
+            "i'm confused",
         )
-        if any(m in (spoken_reply or "").lower() for m in low_info_markers):
-            if silent_unknown:
-                spoken_reply = ""
+        if any(p in low for p in bad_phrases):
+            spoken_reply = ""
+            fsm_result["spoken_reply"] = ""
 
     if debug:
         bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
