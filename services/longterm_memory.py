@@ -200,7 +200,13 @@ def record_skill_result(
     expires_in_s: Optional[int] = None,
     call_sid: str | None = None,  # NEW
 ) -> bool:
-    _ = input_text
+    # Preserve the user query for auditability + call summaries.
+    if input_text:
+        if data_json is None or not isinstance(data_json, dict):
+            data_json = {}
+        uq = str(input_text).strip()
+        if uq:
+            data_json.setdefault("user_query", uq[:2000])
     _ = expires_in_s
     return write_memory_event(
         db,
