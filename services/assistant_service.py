@@ -630,11 +630,55 @@ def run_assistant_route(
             )
         except Exception:
             logger.exception("TURN_CAPTURE_FAIL tenant_id=%s caller_id=%s role=%s", tenant_id, caller_id, role)
-
     def _wrap_reply(payload: dict) -> dict:
-        """Capture assistant spoken_reply (if present), then return payload unchanged."""
+        """Sanitize + capture assistant spoken_reply (if present), then return payload.
+
+        We silence known FSM/unknown fallback phrases because callers often think out loud and
+        we don't want annoying "I'm not sure what you meant" responses.
+        Controlled by env: VOICE_SILENCE_FSM_FALLBACK (default=1).
+        """
+        def _truthy(v):
+            return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+        def _sanitize_spoken_reply(s):
+            if not s:
+                return ""
+            # Feature flag: default ON
+            if not _truthy(os.getenv("VOICE_SILENCE_FSM_FALLBACK", "1")):
+                return s
+
+            low = str(s).strip().lower()
+            banned = (
+                "i'm not sure what you meant",
+                "im not sure what you meant",
+                "i’m not sure what you meant",
+                "i'm not sure what you mean",
+                "im not sure what you mean",
+                "i’m not sure what you mean",
+                "i'm not entirely sure",
+                "im not entirely sure",
+                "i’m not entirely sure",
+                "can you rephrase",
+                "could you rephrase",
+                "can you say that again",
+                "give me a bit more detail",
+                "give me more detail",
+                "can you give me a bit more detail",
+                "can you clarify",
+                "could you clarify",
+                "i didn't understand",
+                "i did not understand",
+                "i don’t understand",
+                "i don't understand",
+            )
+            if any(p in low for p in banned):
+                return ""
+            return s
+
         try:
             if isinstance(payload, dict):
+                if "spoken_reply" in payload:
+                    payload["spoken_reply"] = _sanitize_spoken_reply(payload.get("spoken_reply"))
                 _capture_turn("assistant", payload.get("spoken_reply"))
         except Exception:
             logger.exception("TURN_CAPTURE_WRAP_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
