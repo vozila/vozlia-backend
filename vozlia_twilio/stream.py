@@ -821,36 +821,36 @@ async def twilio_stream(websocket: WebSocket):
             return None
 
     async def route_to_fsm_and_get_payload(transcript: str, account_id: str | None = None) -> dict:
-    """Preserve suppress_response so we can avoid generic Realtime fallback on intentional silence."""
-    try:
-        ctx = {"channel": "phone"}
-        if stream_sid:
-            ctx["stream_sid"] = stream_sid
-        if call_sid:
-            ctx["call_sid"] = call_sid
-        if from_number:
-            ctx["from_number"] = from_number
+        """Preserve suppress_response so we can avoid generic Realtime fallback on intentional silence."""
+        try:
+            ctx = {"channel": "phone"}
+            if stream_sid:
+                ctx["stream_sid"] = stream_sid
+            if call_sid:
+                ctx["call_sid"] = call_sid
+            if from_number:
+                ctx["from_number"] = from_number
 
-        data = await call_fsm_router(transcript, context=ctx, account_id=account_id)
-        if not isinstance(data, dict):
+            data = await call_fsm_router(transcript, context=ctx, account_id=account_id)
+            if not isinstance(data, dict):
+                return {"spoken_reply": None, "suppress_response": False}
+
+            spoken = (
+                data.get("spoken_reply")
+                or (data.get("result") or {}).get("spoken_reply")
+                or (data.get("skill_result") or {}).get("spoken_reply")
+            )
+            if isinstance(spoken, str):
+                spoken = spoken.strip()
+            else:
+                spoken = None
+
+            fsm_obj = data.get("fsm") if isinstance(data.get("fsm"), dict) else {}
+            suppress = bool(data.get("suppress_response") or (fsm_obj or {}).get("suppress_response"))
+            return {"spoken_reply": spoken, "suppress_response": suppress}
+        except Exception:
+            logger.exception("FSM_ROUTE_ERROR")
             return {"spoken_reply": None, "suppress_response": False}
-
-        spoken = (
-            data.get("spoken_reply")
-            or (data.get("result") or {}).get("spoken_reply")
-            or (data.get("skill_result") or {}).get("spoken_reply")
-        )
-        if isinstance(spoken, str):
-            spoken = spoken.strip()
-        else:
-            spoken = None
-
-        fsm_obj = data.get("fsm") if isinstance(data.get("fsm"), dict) else {}
-        suppress = bool(data.get("suppress_response") or (fsm_obj or {}).get("suppress_response"))
-        return {"spoken_reply": spoken, "suppress_response": suppress}
-    except Exception:
-        logger.exception("FSM_ROUTE_ERROR")
-        return {"spoken_reply": None, "suppress_response": False}
 
 
     # --- Cancel active response & clear audio buffer -------------------------
