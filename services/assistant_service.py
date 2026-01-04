@@ -572,7 +572,7 @@ def run_assistant_route(
         if not tenant_uuid or not caller_id:
             return
         body = (msg or "").strip()
-        if not body or _is_junk_transcript(body):
+        if not body:
             return
         try:
             record_turn_event(
