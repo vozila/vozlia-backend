@@ -17,7 +17,6 @@ from services.investment_service import get_investment_reports
 
 import os
 import re
-from typing import Any, Optional
 import json
 from core.logging import logger
 from skills.registry import skill_registry
@@ -195,6 +194,63 @@ def _looks_like_memory_question(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
         return False
+
+    # Voice transcripts often omit punctuation; keep heuristics simple and cheap.
+    # We treat anything referencing prior conversation/calls/notes as a memory lookup request.
+    triggers = [
+        "do you remember",
+        "did you remember",
+        "did i tell you",
+        "did i mention",
+        "what did i say",
+        "what did we talk about",
+        "what did i ask",
+        "what was i asking",
+        "what was i talking",
+        "what was i referring",
+        "in the previous call",
+        "previous call",
+        "last call",
+        "last time",
+        "earlier call",
+        "earlier today",
+        "previously",
+        "we talked about",
+        "we spoke about",
+        "from my notes",
+        "my notes",
+        "from my history",
+        "from my memory",
+        "in my memory",
+        "remind me",
+    ]
+    if any(tr in t for tr in triggers):
+        return True
+
+    # Questions like "what did I mention?" without explicit trigger words
+    if t.startswith(("what ", "which ", "who ", "when ", "where ", "did ")) and ("mention" in t or "ask" in t or "say" in t):
+        return True
+
+    return False
+
+
+def _is_open_ended_request(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    # Generic openers where we should respond with a helpful prompt instead of a confusion message.
+    openers = [
+        "i have a request",
+        "i have a question",
+        "i have a problem",
+        "i need help",
+        "can you help me",
+        "can i ask you",
+        "i wanted to ask",
+        "i want to ask",
+        "i have something",
+    ]
+    return any(o in t for o in openers)
 
 
 # -----------------------------
@@ -386,6 +442,7 @@ def run_assistant_route(
                 "Okay — give me a second to fetch your email summaries.",
                 "Please stand by while I check your inbox.",
             ]
+        return _random.choice(choices)
         return _random.choice(choices)
 
     # Skill engagement phrases (Gmail Summary)
@@ -598,12 +655,12 @@ def run_assistant_route(
     # Capture the user turn early so even early returns preserve the question.
     _capture_turn("user", raw_user_text)
 
-    # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
+# Pull small recent context for prompt grounding (keep short; no hot-path bloat)
 
     # -------------------------
     # AUTO memory question handling (summaries + vector first)
     # -------------------------
-    if longterm_enabled and caller_id and tenant_uuid and _looks_like_memory_question(text):
+    if longterm_enabled and caller_id and tenant_uuid and (force_memory or _looks_like_memory_question(text)):
         from services.memory_controller import (
             parse_memory_query,
             search_memory_events,
@@ -612,7 +669,7 @@ def run_assistant_route(
 
         q_raw = text or ""
         qmem = None
-        rows: list[Any] = []
+        rows: list[CallerMemoryEvent] = []
         use_turns_bridge = bool(int(os.getenv("LONGTERM_MEMORY_USE_TURNS_FOR_RECALL", "0") or "0"))
         use_vector = os.getenv("VECTOR_MEMORY_ENABLED", "0").strip() == "1"
 
@@ -679,8 +736,10 @@ def run_assistant_route(
         if not rows:
             if debug:
                 logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (q_raw or "")[:200])
+            silent_unknown = (os.getenv("VOICE_FALLBACK_SILENT_ON_UNKNOWN", "0") or "0").strip().lower() in ("1","true","yes","on")
+            spoken_no_hits = "" if silent_unknown else "I couldn’t find that in my notes yet."
             payload = {
-                "spoken_reply": "I couldn’t find that in my notes yet. Can you tell me roughly when we talked about it?",
+                "spoken_reply": spoken_no_hits,
                 "fsm": {"mode": "memory_recall", "status": "no_hits"},
                 "gmail": None,
             }
@@ -787,6 +846,27 @@ def run_assistant_route(
     fsm_result: dict = fsm.handle_utterance(text, context=fsm_context)
 
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
+    # -------------------------
+    # Voice UX: avoid clarifying "I'm not sure..." fallbacks for now (feature-flagged).
+    # - If the user gives a generic opener ("I have a request"), prompt them helpfully.
+    # - Otherwise, optionally go silent on unknown/clarifying responses.
+    # -------------------------
+    silent_unknown = (os.getenv("VOICE_FALLBACK_SILENT_ON_UNKNOWN", "0") or "0").strip().lower() in ("1","true","yes","on")
+    if _is_open_ended_request(raw_user_text):
+        spoken_reply = "Sure — how can I help?"
+    else:
+        low_info_markers = (
+            "i'm not sure what you meant",
+            "im not sure what you meant",
+            "can you give me a bit more detail",
+            "could you rephrase",
+            "please rephrase",
+            "can you rephrase",
+        )
+        if any(m in (spoken_reply or "").lower() for m in low_info_markers):
+            if silent_unknown:
+                spoken_reply = ""
+
     if debug:
         bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
         logger.info(
