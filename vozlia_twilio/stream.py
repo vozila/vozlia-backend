@@ -1350,7 +1350,24 @@ async def twilio_stream(websocket: WebSocket):
         )
 
 
-        await asyncio.gather(openai_loop(), twilio_loop())
+        # Run both loops, but ensure we ALWAYS exit if either side ends (e.g. Twilio sends stop).
+        # asyncio.gather() can hang if one loop is still awaiting (e.g. OpenAI WS idle) after the other ended.
+        openai_task = asyncio.create_task(openai_loop(), name="openai_loop")
+        twilio_task = asyncio.create_task(twilio_loop(), name="twilio_loop")
+        done, pending = await asyncio.wait({openai_task, twilio_task}, return_when=asyncio.FIRST_COMPLETED)
+
+        # Cancel the remaining loop so we reach cleanup + call summary reliably.
+        for t in pending:
+            t.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        # If the completed task raised, surface it (except cancellation).
+        for t in done:
+            exc = t.exception()
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                raise exc
+
 
     finally:
         try:
