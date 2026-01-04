@@ -671,42 +671,87 @@ def run_assistant_route(
 
         try:
             if isinstance(payload, dict) and "spoken_reply" in payload:
-                payload["spoken_reply"] = _sanitize_spoken_reply(payload.get("spoken_reply"))
+                _orig = payload.get("spoken_reply")
+                payload["spoken_reply"] = _sanitize_spoken_reply(_orig)
+                # If we silenced a known uncertain/clarify filler, instruct downstream to skip generic responses.
+                if _orig and payload.get("spoken_reply") == "" and _silence_enabled and _fallback_re.search(str(_orig)):
+                    payload["suppress_response"] = True
+                    if isinstance(payload.get("fsm"), dict):
+                        payload["fsm"]["suppress_response"] = True
+                    else:
+                        payload["fsm"] = {"suppress_response": True}
             if isinstance(payload, dict):
                 _capture_turn("assistant", payload.get("spoken_reply"))
         except Exception:
             logger.exception("TURN_CAPTURE_WRAP_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
         return payload
 
+def _maybe_answer_history_count(q: str) -> str | None:
+    """Deterministic counts for questions like: 'how many times did I request email summaries?'
+    Counts gmail_summary skill events from caller_memory_events.
+    """
+    t = (q or "").strip().lower()
+    if not t:
+        return None
+    if not (("how many" in t) or ("number of" in t) or ("how often" in t) or ("times" in t)):
+        return None
+    if "email" not in t and "gmail" not in t:
+        return None
+    if ("summary" not in t and "summaries" not in t and "summar" not in t and "request" not in t and "requested" not in t):
+        if "my email" not in t:
+            return None
+
+    now = datetime.utcnow()
+    start_dt = None
+    scope = ""
+    if "today" in t:
+        start_dt = datetime(now.year, now.month, now.day)
+        scope = " today"
+    elif "this week" in t:
+        sow = now - timedelta(days=now.weekday())
+        start_dt = datetime(sow.year, sow.month, sow.day)
+        scope = " this week"
+    elif "this month" in t:
+        start_dt = datetime(now.year, now.month, 1)
+        scope = " this month"
+
+    try:
+        from db.models import CallerMemoryEvent
+    except Exception:
+        return None
+
+    try:
+        qy = db.query(CallerMemoryEvent).filter(
+            CallerMemoryEvent.tenant_id == str(tenant_uuid),
+            CallerMemoryEvent.caller_id == str(caller_id),
+            CallerMemoryEvent.skill_key == "gmail_summary",
+        )
+        if start_dt is not None:
+            qy = qy.filter(CallerMemoryEvent.created_at >= start_dt)
+        cnt = int(qy.count() or 0)
+    except Exception:
+        logger.exception("HISTORY_COUNT_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+        return None
+
+    if cnt == 0:
+        return f"I don't see any email summary requests{scope}."
+    suffix = "time" if cnt == 1 else "times"
+    return f"You've requested email summaries {cnt} {suffix}{scope}."
+
     # Capture the user turn early so even early returns preserve the question.
     _capture_turn("user", raw_user_text)
 
-# Pull small recent context for prompt grounding (keep short; no hot-path bloat)
+    # Deterministic history counts (e.g., "how many times did I request email summaries")
+    _hc = _maybe_answer_history_count(raw_user_text)
+    if _hc:
+        return _wrap_reply({"spoken_reply": _hc, "fsm": {"mode": "history_count", "key": "gmail_summary_count"}, "gmail": None})
+
+    # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
 
     # -------------------------
-    def _auto_recall_on_question(text_in: str) -> bool:
-        """Attempt memory recall on question-shaped utterances to avoid 'magic phrase' brittleness.
-        Guarded by MEMORY_AUTO_RECALL_ON_QUESTIONS (default ON).
-        """
-        v = (os.getenv("MEMORY_AUTO_RECALL_ON_QUESTIONS", "1") or "1").strip().lower()
-        if v not in ("1", "true", "yes", "on"):
-            return False
-        t = (text_in or "").strip().lower()
-        if not t:
-            return False
-        if _is_next_cmd(t) or _is_stop_cmd(t):
-            return False
-        if "?" in t:
-            return True
-        if re.match(r"^(what|which|who|where|when|why|how)\b", t):
-            return True
-        if re.match(r"^(did\s+i|did\s+we|do\s+you|can\s+you)\b", t):
-            return True
-        return False
-
     # AUTO memory question handling (summaries + vector first)
     # -------------------------
-    if longterm_enabled and caller_id and tenant_uuid and (force_memory or _looks_like_memory_question(raw_user_text) or _auto_recall_on_question(raw_user_text)):
+    if longterm_enabled and caller_id and tenant_uuid and (force_memory or _looks_like_memory_question(raw_user_text)):
         from services.memory_controller import (
             parse_memory_query,
             search_memory_events,
@@ -783,11 +828,14 @@ def run_assistant_route(
             if debug:
                 logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (q_raw or "")[:200])
             payload = {
-                "spoken_reply": "" if (os.getenv("VOICE_SILENT_ON_UNCERTAIN","1").strip().lower() in ("1","true","yes","on")) else "I couldn’t find that in my notes yet.",
+                "spoken_reply": "",
+                "suppress_response": True,
                 "fsm": {"mode": "memory_recall", "status": "no_hits"},
                 "gmail": None,
             }
-            return _wrap_reply(payload)
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
+
         # Build compact evidence lines for the LLM
         evidence_lines: list[str] = []
         for r in rows[:12]:
@@ -815,7 +863,9 @@ def run_assistant_route(
                 },
                 "gmail": None,
             }
-            return _wrap_reply(payload)
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
+
         # Fail-soft fallback: old snippet style (should be rarely used)
         spoken = "Here’s what I found in your notes: " + " ".join([ln.split('] ',1)[-1] for ln in evidence_lines[:3]])
         payload = {
@@ -823,7 +873,10 @@ def run_assistant_route(
             "fsm": {"mode": "memory_recall", "has_evidence": True, "hits": len(rows)},
             "gmail": None,
         }
-        return _wrap_reply(payload)
+        _capture_turn("assistant", payload.get("spoken_reply"))
+        return payload
+
+
         # Evidence-first summary (MVP, deterministic)
         # We return a natural sentence + include evidence snippets for debugging / future improvements.
         snippets = []
@@ -847,7 +900,9 @@ def run_assistant_route(
             },
             "gmail": None,
         }
-        return _wrap_reply(payload)
+        _capture_turn("assistant", payload.get("spoken_reply"))
+        return payload
+
     fsm = VozliaFSM()
 
     base_greeting = get_agent_greeting(db, current_user)
@@ -868,58 +923,6 @@ def run_assistant_route(
     except Exception:
         pass
 
-    # Optional: memory-tailored greeting (one short line derived from the most recent call_summary).
-    # This runs at most once per call_id to avoid extra latency.
-    try:
-        mg_enabled = (os.getenv("MEMORY_GREETING_ENABLED", "0") or "0").strip().lower() in ("1","true","yes","on")
-        if mg_enabled and longterm_enabled and caller_id and tenant_uuid and call_id:
-            from services.memory_cache import memory
-            done = memory.get_handle(tenant_id=tenant_id, call_id=call_id, name="memory_greeting_done")
-            if not done:
-                memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="memory_greeting_done", value=True, ttl_s=SESSION_MEMORY_TTL_S)
-                from sqlalchemy import text as _sql_text
-                row = db.execute(
-                    _sql_text(
-                        "SELECT text, data_json FROM caller_memory_events "
-                        "WHERE tenant_id=:t AND caller_id=:c AND skill_key='call_summary' "
-                        "AND (call_sid IS NULL OR call_sid <> :sid) "
-                        "ORDER BY created_at DESC LIMIT 1"
-                    ),
-                    {"t": str(tenant_uuid), "c": str(caller_id), "sid": str(call_id) if call_id else ""},
-                ).fetchone()
-                if row:
-                    last_text = (row[0] or "").strip()
-                    last_json = row[1] or {}
-                    client = _get_router_client()
-                    if client and last_text:
-                        model = (os.getenv("MEMORY_GREETING_MODEL") or "gpt-4o-mini").strip()
-                        timeout_s = float(os.getenv("MEMORY_GREETING_TIMEOUT_S", "1.2") or "1.2")
-                        max_tokens = int(os.getenv("MEMORY_GREETING_MAX_TOKENS", "45") or "45")
-                        sys = (
-                            "You are a voice assistant greeting a returning caller. "
-                            "Using ONLY the provided notes from the previous call, write exactly ONE short sentence (<= 18 words). "
-                            "Do NOT ask questions. Do NOT mention 'memory' or 'notes'. "
-                            "If there is nothing clearly useful, return an empty string."
-                        )
-                        user = json.dumps({"last_summary": last_text, "details": last_json}, ensure_ascii=False)
-                        resp = client.chat.completions.create(
-                            model=model,
-                            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-                            max_tokens=max_tokens,
-                            temperature=0.2,
-                            timeout=timeout_s,
-                        )
-                        line = (resp.choices[0].message.content or "").strip().strip('"').strip()
-                        if line:
-                            greeting = (greeting or "").strip()
-                            if greeting and not greeting.endswith(("!", ".", "?")):
-                                greeting += "."
-                            if greeting:
-                                greeting += " " + line
-                            else:
-                                greeting = line
-    except Exception:
-        logger.exception("MEMORY_GREETING_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
     fsm.greeting_text = greeting
 
 
@@ -1013,7 +1016,9 @@ def run_assistant_route(
                 "fsm": fsm_result,
                 "gmail": None,
             }
-            return _wrap_reply(payload)
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
+
         # If this was initiated via auto-exec/offer-followup, use a neutral standby phrase instead of a confirmation.
         if wants_standby_ack:
             spoken_reply = _standby_phrase()
@@ -1181,7 +1186,9 @@ def run_assistant_route(
             gmail_data["used_account_id"] = account_id_effective
 
         payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
-        return _wrap_reply(payload)
+        _capture_turn("assistant", payload.get("spoken_reply"))
+        return payload
+
     # ----------------------------
     # (2) Skills Engine fallback (feature-flagged)
     # Only runs when FSM did NOT request a backend call.
@@ -1209,7 +1216,9 @@ def run_assistant_route(
                 if not account_id_effective:
                     spoken_reply = "I tried to check your email, but I don't see a Gmail account connected for you yet."
                     payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": {"summary": None, "used_account_id": None}}
-                    return _wrap_reply(payload)
+                    _capture_turn("assistant", payload.get("spoken_reply"))
+                    return payload
+
                 # Session memory cache (SkillsEngine path)
                 cache_hash = None
                 cached = None
@@ -1309,7 +1318,9 @@ def run_assistant_route(
 
                 logger.info("SkillsEngine executed skill=%s account_id=%s", matched_skill.id, account_id_effective)
                 payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
-                return _wrap_reply(payload)
+                _capture_turn("assistant", payload.get("spoken_reply"))
+                return payload
+
         except Exception:
             # Never fail the call path because the skills engine had an issue.
             logger.exception("SkillsEngine failed; falling back to FSM result.")
@@ -1325,11 +1336,15 @@ def run_assistant_route(
         cfg = get_investment_reporting_config(db, current_user) or {}
         if not bool(cfg.get("enabled", False)):
             payload = {"spoken_reply": "Investment reporting is currently turned off in your settings.", "fsm": fsm_result, "gmail": None}
-            return _wrap_reply(payload)
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
+
         tickers = get_investment_reporting_tickers(db, current_user)
         if not tickers:
             payload = {"spoken_reply": "Investment reporting is enabled, but no tickers are configured yet.", "fsm": fsm_result, "gmail": None}
-            return _wrap_reply(payload)
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
+
         llm_prompt = (cfg.get("llm_prompt") or "").strip()
         if not llm_prompt:
             llm_prompt = (
@@ -1345,11 +1360,15 @@ def run_assistant_route(
         except Exception as e:
             logger.exception("INVREP_FETCH_FAIL tickers=%s err=%s", tickers, e)
             payload = {"spoken_reply": "Sorry — I couldn’t fetch stock data right now.", "fsm": fsm_result, "gmail": None}
-            return _wrap_reply(payload)
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
+
         spoken_list = rep.get("spoken_reports") or []
         if not isinstance(spoken_list, list) or not spoken_list:
             payload = {"spoken_reply": "Sorry — I couldn’t generate a stock report right now.", "fsm": fsm_result, "gmail": None}
-            return _wrap_reply(payload)
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
+
         # Seed session queue so the caller can say “next” to advance tickers.
         if call_id and tenant_id:
             try:
@@ -1375,6 +1394,9 @@ def run_assistant_route(
             pass
 
         payload = {"spoken_reply": str(spoken_list[0]), "fsm": fsm_result, "gmail": None}
-        return _wrap_reply(payload)
+        _capture_turn("assistant", payload.get("spoken_reply"))
+        return payload
+
     payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
-    return _wrap_reply(payload)
+    _capture_turn("assistant", payload.get("spoken_reply"))
+    return payload
