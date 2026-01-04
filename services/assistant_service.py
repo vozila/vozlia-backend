@@ -632,8 +632,46 @@ def run_assistant_route(
             logger.exception("TURN_CAPTURE_FAIL tenant_id=%s caller_id=%s role=%s", tenant_id, caller_id, role)
 
     def _wrap_reply(payload: dict) -> dict:
-        """Capture assistant spoken_reply (if present), then return payload unchanged."""
+        """Sanitize + capture assistant spoken_reply (if present), then return payload."""
+
+        def _truthy_env(name: str, default: str = "1") -> bool:
+            v = (os.getenv(name, default) or default).strip().lower()
+            return v in ("1", "true", "yes", "on")
+
+        # If either flag is enabled (default ON), suppress "uncertain / clarify" filler replies.
+        _silence_enabled = _truthy_env("VOICE_SILENT_ON_UNCERTAIN", "1") or _truthy_env("VOICE_SILENCE_FSM_FALLBACK", "1")
+
+        _fallback_re = re.compile(
+            r"""(
+                i['’]?m\s+not\s+sure
+                |not\s+sure\s+what\s+you\s+mean
+                |not\s+sure\s+what\s+you\s+meant
+                |can\s+you\s+rephrase
+                |could\s+you\s+rephrase
+                |give\s+me\s+(?:a\s+bit\s+)?more\s+detail
+                |can\s+you\s+give\s+me\s+(?:a\s+bit\s+)?more\s+detail
+                |can\s+you\s+clarify
+                |could\s+you\s+clarify
+                |i\s+didn['’]?t\s+understand
+                |i\s+don['’]?t\s+understand
+                |i\s+am\s+confused
+                |i['’]?m\s+confused
+                |please\s+repeat
+                |say\s+that\s+again
+            )""",
+            re.IGNORECASE | re.VERBOSE,
+        )
+
+        def _sanitize_spoken_reply(s: str | None) -> str:
+            if not s:
+                return ""
+            if _silence_enabled and _fallback_re.search(s):
+                return ""
+            return s
+
         try:
+            if isinstance(payload, dict) and "spoken_reply" in payload:
+                payload["spoken_reply"] = _sanitize_spoken_reply(payload.get("spoken_reply"))
             if isinstance(payload, dict):
                 _capture_turn("assistant", payload.get("spoken_reply"))
         except Exception:
@@ -833,60 +871,36 @@ def run_assistant_route(
 
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
 
-# Silence annoying clarifying / uncertain fallbacks (user preference).
-# Callers often "think out loud" — we prefer silence over interruption for low-confidence/clarify prompts.
-def _silence_if_uncertain(s: str) -> str:
-    if not s:
-        return ""
-    enabled = (os.getenv("VOICE_SILENT_ON_UNCERTAIN", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-    if not enabled:
-        return s
+    # Silence annoying clarifying / uncertain fallbacks (user preference).
+    def _truthy_env(name: str, default: str = "1") -> bool:
+        v = (os.getenv(name, default) or default).strip().lower()
+        return v in ("1", "true", "yes", "on")
 
-    low = s.strip().lower()
-
-    # Normalize curly apostrophes → straight apostrophes for matching.
-    low = low.replace("’", "'")
-
-    # Broad match: any of these patterns indicates an "unknown / clarify" fallback we want to silence.
-    # Keep this intentionally permissive (better to be silent than annoy users).
-    uncertain_patterns = [
-        r"\bi'?m\s+not\s+sure\b",              # i'm not sure ...
-        r"\bnot\s+sure\b",                     # not sure ...
-        r"\bcan\s+you\s+rephrase\b",
-        r"\bcould\s+you\s+rephrase\b",
-        r"\brephrase\b",
-        r"\bmore\s+detail\b",
-        r"\bbit\s+more\s+detail\b",
-        r"\bgive\s+me\s+.*detail\b",
-        r"\bclarif(y|ication)\b",
-        r"\bi\s+did\s+not\s+understand\b",
-        r"\bi\s+didn't\s+understand\b",
-        r"\bi\s+don't\s+understand\b",
-        r"\bi\s+dont\s+understand\b",
-        r"\bi\s+didn'?t\s+catch\s+that\b",
-        r"\bcould\s+you\s+repeat\b",
-        r"\bcan\s+you\s+repeat\b",
-        r"\bcan\s+you\s+say\s+that\s+again\b",
-        r"\bcome\s+again\b",
-    ]
-    try:
-        for pat in uncertain_patterns:
-            if re.search(pat, low):
-                return ""
-    except Exception:
-        # If regex fails for any reason, fail-open (do not silence).
-        return s
-
-    return s
-
-spoken_reply = _silence_if_uncertain(spoken_reply)
-if spoken_reply == "":
-    try:
-        fsm_result["spoken_reply"] = ""
-    except Exception:
-        pass
-
-
+    _silence_enabled = _truthy_env("VOICE_SILENT_ON_UNCERTAIN", "1") or _truthy_env("VOICE_SILENCE_FSM_FALLBACK", "1")
+    if _silence_enabled and spoken_reply:
+        _fallback_re = re.compile(
+            r"""(
+                i['’]?m\s+not\s+sure
+                |not\s+sure\s+what\s+you\s+mean
+                |not\s+sure\s+what\s+you\s+meant
+                |can\s+you\s+rephrase
+                |could\s+you\s+rephrase
+                |give\s+me\s+(?:a\s+bit\s+)?more\s+detail
+                |can\s+you\s+give\s+me\s+(?:a\s+bit\s+)?more\s+detail
+                |can\s+you\s+clarify
+                |could\s+you\s+clarify
+                |i\s+didn['’]?t\s+understand
+                |i\s+don['’]?t\s+understand
+                |i\s+am\s+confused
+                |i['’]?m\s+confused
+                |please\s+repeat
+                |say\s+that\s+again
+            )""",
+            re.IGNORECASE | re.VERBOSE,
+        )
+        if _fallback_re.search(spoken_reply):
+            spoken_reply = ""
+            fsm_result["spoken_reply"] = ""
     if debug:
         bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
         logger.info(
