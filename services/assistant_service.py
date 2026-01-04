@@ -588,6 +588,32 @@ def run_assistant_route(
     caller_id = normalize_caller_id(from_number)
     gmail_data_fresh = False  # safe default; set True only when Gmail fetch occurs
 
+    # Turn capture helper must be defined before early-return paths (e.g., investment reporting next/stop).
+    # Defaults are set here; later logic may update longterm_enabled/capture_turns based on tenant settings.
+    longterm_enabled = False
+    capture_turns = False
+
+    def _capture_turn(role: str, msg: str | None) -> None:
+        if not longterm_enabled or not capture_turns:
+            return
+        if not tenant_uuid or not caller_id:
+            return
+        body = (msg or "").strip()
+        if not body:
+            return
+        try:
+            record_turn_event(
+                db,
+                tenant_uuid=str(tenant_uuid),
+                caller_id=str(caller_id),
+                call_sid=(str(call_id) if call_id else None),
+                role=str(role or "user"),
+                text=body,
+            )
+        except Exception:
+            logger.exception("TURN_CAPTURE_FAIL tenant_id=%s caller_id=%s role=%s", tenant_id, caller_id, role)
+
+
     # --------------------------------------------
     # Investment Reporting: next/stop navigation
     # If a stock report is in progress, allow the caller to say
@@ -675,26 +701,6 @@ def run_assistant_route(
 
     # Turn capture (so call summaries include USER questions)
     # -------------------------
-    def _capture_turn(role: str, msg: str | None) -> None:
-        if not longterm_enabled or not capture_turns:
-            return
-        if not tenant_uuid or not caller_id:
-            return
-        body = (msg or "").strip()
-        if not body:
-            return
-        try:
-            record_turn_event(
-                db,
-                tenant_uuid=str(tenant_uuid),
-                caller_id=str(caller_id),
-                call_sid=(str(call_id) if call_id else None),
-                role=str(role or "user"),
-                text=body,
-            )
-        except Exception:
-            logger.exception("TURN_CAPTURE_FAIL tenant_id=%s caller_id=%s role=%s", tenant_id, caller_id, role)
-
     def _wrap_reply(payload: dict) -> dict:
         """Sanitize + capture assistant spoken_reply (if present), then return payload."""
 
