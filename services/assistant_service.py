@@ -18,7 +18,8 @@ from services.investment_service import get_investment_reports
 import os
 import re
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from core.logging import logger
 from skills.registry import skill_registry
 from sqlalchemy.orm import Session
@@ -49,22 +50,49 @@ def _maybe_answer_history_count(
         if "my email" not in t:
             return None
 
-    now = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
+    # Interpret "today/this week/this month" in America/New_York, then convert to UTC for DB filtering.
+    tz = ZoneInfo(os.getenv("APP_TZ", "America/New_York"))
+    now_local = now_utc.astimezone(tz)
+
     start_dt = None
     scope = ""
+
     if "today" in t:
-        start_dt = datetime(now.year, now.month, now.day)
+        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_dt = start_local.astimezone(timezone.utc).replace(tzinfo=None)
         scope = " today"
-    elif "this week" in t or "past week" in t or "last week" in t:
-        start_dt = now - timedelta(days=7)
+    elif "this week" in t:
+        # Week starts Monday 00:00 local time
+        start_local = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_dt = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        scope = " this week"
+    elif "past week" in t or "last week" in t:
+        start_dt = (now_utc - timedelta(days=7)).replace(tzinfo=None)
         scope = " in the past week"
-    elif "this month" in t or "past month" in t or "last month" in t:
-        start_dt = now - timedelta(days=30)
+    elif "this month" in t:
+        start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        start_dt = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        scope = " this month"
+    elif "past month" in t or "last month" in t:
+        start_dt = (now_utc - timedelta(days=30)).replace(tzinfo=None)
         scope = " in the past month"
+
+    # Caller-id normalization: match either "+1..." or "1..." variants to avoid drift.
+    cid = str(caller_id)
+    cid_digits = "".join([c for c in cid if c.isdigit()])
+    caller_variants = {cid}
+    if cid.startswith("+"):
+        caller_variants.add(cid[1:])
+    else:
+        caller_variants.add("+" + cid)
+    if cid_digits:
+        caller_variants.add(cid_digits)
+        caller_variants.add("+" + cid_digits)
 
     qy = db.query(CallerMemoryEvent).filter(
         CallerMemoryEvent.tenant_id == str(tenant_id),
-        CallerMemoryEvent.caller_id == str(caller_id),
+        CallerMemoryEvent.caller_id.in_(sorted(caller_variants)),
         CallerMemoryEvent.skill_key == "gmail_summary",
     )
     if start_dt is not None:
@@ -74,7 +102,7 @@ def _maybe_answer_history_count(
     if cnt == 0:
         return f"You haven't requested email summaries{scope}."
     suffix = "time" if cnt == 1 else "times"
-    return f"{cnt} {suffix}{scope}."
+    return f"In total, {cnt} {suffix}{scope}."
 
 from services.memory_facade import (
     memory,
@@ -130,6 +158,58 @@ def _tool_to_canonical_phrase(tool: str) -> str | None:
     if tool == "memory_lookup":
         return None
     return None
+
+
+def _emit_await_more_enabled() -> bool:
+    return (os.getenv("ROUTER_EMIT_AWAIT_MORE", "0") or "").strip().lower() in ("1","true","yes","on")
+
+def _await_more_default_ms() -> int:
+    try:
+        return int(os.getenv("ROUTER_AWAIT_MORE_DEFAULT_MS", "650") or 650)
+    except Exception:
+        return 650
+
+def _await_more_max_ms() -> int:
+    try:
+        return int(os.getenv("ROUTER_AWAIT_MORE_MAX_MS", "1400") or 1400)
+    except Exception:
+        return 1400
+
+def _should_await_more_fragment(text: str) -> tuple[bool, int, str]:
+    """Heuristic: return (should_hold, ms, reason) when a transcript looks incomplete."""
+    t = (text or "").strip()
+    if not t:
+        return (False, 0, "")
+    s = t.lower()
+
+    # Never hold on explicit questions or "check in" phrases.
+    if "?" in s:
+        return (False, 0, "")
+    if s.startswith(("hello", "hi", "hey")):
+        return (False, 0, "")
+    if "are you there" in s or "you there" in s or "still there" in s:
+        return (False, 0, "")
+    if any(k in s for k in ("how many", "number of", "how often", "times")):
+        return (False, 0, "")
+
+    words = [w for w in re.split(r"\s+", s) if w]
+    wc = len(words)
+
+    if wc <= 4:
+        return (True, _await_more_default_ms(), "short_fragment")
+    if s.endswith(("...", ",", "—", "-", ":")):
+        return (True, _await_more_default_ms(), "trailing_punct")
+
+    trailing_words = ("when", "what", "why", "how", "because", "so", "and", "or", "but")
+    if any(s.endswith(" " + tw) or s.endswith(tw) for tw in trailing_words):
+        return (True, _await_more_default_ms(), "trailing_word")
+
+    # leading openers (common split)
+    leading_openers = ("can you", "could you", "would you", "tell me", "i was wondering", "i'm thinking", "im thinking")
+    if any(s.startswith(lo) for lo in leading_openers) and wc <= 8:
+        return (True, _await_more_default_ms(), "leading_opener")
+
+    return (False, 0, "")
 
 
 def _router_mode() -> str:
@@ -691,7 +771,7 @@ def run_assistant_route(
 
     # Deterministic history counts: avoid LLM guessing for "how many times ... email summaries" questions.
     # This runs before FSM so it works even when phrasing is inconsistent.
-    if longterm_enabled and caller_id and tenant_uuid:
+    if caller_id and tenant_uuid:
         try:
             _hc = _maybe_answer_history_count(db, tenant_id=str(tenant_uuid), caller_id=str(caller_id), text=raw_user_text)
         except Exception:
@@ -699,7 +779,34 @@ def run_assistant_route(
         if _hc:
             return {"spoken_reply": _hc, "fsm": {"mode": "history_count", "key": "gmail_summary_count"}, "gmail": None}
 
-    # Turn capture (so call summaries include USER questions)
+    
+    # ---------------------------------------------------------
+    # Layer C (emitter): if the transcript looks incomplete, ask stream.py to hold the floor briefly.
+    # Feature-flagged: ROUTER_EMIT_AWAIT_MORE=1
+    if _emit_await_more_enabled():
+        try:
+            hold, ms, reason = _should_await_more_fragment(raw_user_text)
+        except Exception:
+            hold, ms, reason = (False, 0, "")
+        if hold:
+            max_ms = _await_more_max_ms()
+            if ms > max_ms:
+                ms = max_ms
+            logger.info("ROUTER_AWAIT_MORE_EMIT ms=%s reason=%s text=%r", ms, reason, (raw_user_text or "")[:120])
+            return {
+                "spoken_reply": "",
+                "fsm": {
+                    "mode": "await_more",
+                    "await_more": True,
+                    "await_more_ms": ms,
+                    "await_reason": reason,
+                    "suppress_response": True,
+                    "suppress_reason": "incomplete_fragment",
+                },
+                "gmail": None,
+            }
+
+# Turn capture (so call summaries include USER questions)
     # -------------------------
     def _wrap_reply(payload: dict) -> dict:
         """Sanitize + capture assistant spoken_reply (if present), then return payload."""
