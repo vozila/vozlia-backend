@@ -630,55 +630,11 @@ def run_assistant_route(
             )
         except Exception:
             logger.exception("TURN_CAPTURE_FAIL tenant_id=%s caller_id=%s role=%s", tenant_id, caller_id, role)
+
     def _wrap_reply(payload: dict) -> dict:
-        """Sanitize + capture assistant spoken_reply (if present), then return payload.
-
-        We silence known FSM/unknown fallback phrases because callers often think out loud and
-        we don't want annoying "I'm not sure what you meant" responses.
-        Controlled by env: VOICE_SILENCE_FSM_FALLBACK (default=1).
-        """
-        def _truthy(v):
-            return str(v or "").strip().lower() in ("1", "true", "yes", "on")
-
-        def _sanitize_spoken_reply(s):
-            if not s:
-                return ""
-            # Feature flag: default ON
-            if not _truthy(os.getenv("VOICE_SILENCE_FSM_FALLBACK", "1")):
-                return s
-
-            low = str(s).strip().lower()
-            banned = (
-                "i'm not sure what you meant",
-                "im not sure what you meant",
-                "i’m not sure what you meant",
-                "i'm not sure what you mean",
-                "im not sure what you mean",
-                "i’m not sure what you mean",
-                "i'm not entirely sure",
-                "im not entirely sure",
-                "i’m not entirely sure",
-                "can you rephrase",
-                "could you rephrase",
-                "can you say that again",
-                "give me a bit more detail",
-                "give me more detail",
-                "can you give me a bit more detail",
-                "can you clarify",
-                "could you clarify",
-                "i didn't understand",
-                "i did not understand",
-                "i don’t understand",
-                "i don't understand",
-            )
-            if any(p in low for p in banned):
-                return ""
-            return s
-
+        """Capture assistant spoken_reply (if present), then return payload unchanged."""
         try:
             if isinstance(payload, dict):
-                if "spoken_reply" in payload:
-                    payload["spoken_reply"] = _sanitize_spoken_reply(payload.get("spoken_reply"))
                 _capture_turn("assistant", payload.get("spoken_reply"))
         except Exception:
             logger.exception("TURN_CAPTURE_WRAP_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
@@ -877,25 +833,59 @@ def run_assistant_route(
 
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
 
-    # Silence annoying clarifying / uncertain fallbacks (user preference).
-    if (os.getenv("VOICE_SILENT_ON_UNCERTAIN", "1") or "1").strip().lower() in ("1", "true", "yes", "on"):
-        low = (spoken_reply or "").strip().lower()
-        bad_phrases = (
-            "i'm not sure what you mean",
-            "im not sure what you mean",
-            "i'm not sure what you meant",
-            "im not sure what you meant",
-            "can you give me a bit more detail",
-            "could you give me a bit more detail",
-            "can you clarify",
-            "could you clarify",
-            "i didn't understand",
-            "i dont understand",
-            "i'm confused",
-        )
-        if any(p in low for p in bad_phrases):
-            spoken_reply = ""
-            fsm_result["spoken_reply"] = ""
+# Silence annoying clarifying / uncertain fallbacks (user preference).
+# Callers often "think out loud" — we prefer silence over interruption for low-confidence/clarify prompts.
+def _silence_if_uncertain(s: str) -> str:
+    if not s:
+        return ""
+    enabled = (os.getenv("VOICE_SILENT_ON_UNCERTAIN", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return s
+
+    low = s.strip().lower()
+
+    # Normalize curly apostrophes → straight apostrophes for matching.
+    low = low.replace("’", "'")
+
+    # Broad match: any of these patterns indicates an "unknown / clarify" fallback we want to silence.
+    # Keep this intentionally permissive (better to be silent than annoy users).
+    uncertain_patterns = [
+        r"\bi'?m\s+not\s+sure\b",              # i'm not sure ...
+        r"\bnot\s+sure\b",                     # not sure ...
+        r"\bcan\s+you\s+rephrase\b",
+        r"\bcould\s+you\s+rephrase\b",
+        r"\brephrase\b",
+        r"\bmore\s+detail\b",
+        r"\bbit\s+more\s+detail\b",
+        r"\bgive\s+me\s+.*detail\b",
+        r"\bclarif(y|ication)\b",
+        r"\bi\s+did\s+not\s+understand\b",
+        r"\bi\s+didn't\s+understand\b",
+        r"\bi\s+don't\s+understand\b",
+        r"\bi\s+dont\s+understand\b",
+        r"\bi\s+didn'?t\s+catch\s+that\b",
+        r"\bcould\s+you\s+repeat\b",
+        r"\bcan\s+you\s+repeat\b",
+        r"\bcan\s+you\s+say\s+that\s+again\b",
+        r"\bcome\s+again\b",
+    ]
+    try:
+        for pat in uncertain_patterns:
+            if re.search(pat, low):
+                return ""
+    except Exception:
+        # If regex fails for any reason, fail-open (do not silence).
+        return s
+
+    return s
+
+spoken_reply = _silence_if_uncertain(spoken_reply)
+if spoken_reply == "":
+    try:
+        fsm_result["spoken_reply"] = ""
+    except Exception:
+        pass
+
 
     if debug:
         bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
