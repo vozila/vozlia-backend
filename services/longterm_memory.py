@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 from datetime import datetime, timedelta
 from typing import Any, Optional, Any as _Any
 
@@ -251,6 +252,9 @@ def record_turn_event(
         }
         if session_id:
             data["session_id"] = session_id
+        data["is_ack"] = _is_ack_turn(text)
+        if data["is_ack"] and isinstance(enriched.tags, list):
+            enriched.tags.append("ack")
         # include extracted facts (small / structured)
         if enriched.facts:
             data["facts"] = enriched.facts
