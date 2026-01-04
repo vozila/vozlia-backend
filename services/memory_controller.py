@@ -233,18 +233,26 @@ def vector_search_call_summaries(
     *,
     tenant_id: str,
     caller_id: str,
-    q_embedding: list[float],
     start_ts: datetime,
     end_ts: datetime,
     limit: int = 6,
+    q_embedding: Optional[list[float]] = None,
+    query_embedding: Optional[list[float]] = None,
 ) -> list[CallerMemoryEvent]:
-    """Vector search over call_summary rows using pgvector if available."""
-    if not tenant_id or not caller_id or not q_embedding:
+    """Vector search over call_summary rows using pgvector.
+
+    Notes:
+      - Accepts either `q_embedding` (legacy) or `query_embedding` (newer call sites).
+      - Returns events ordered by vector similarity (best match first).
+      - Logs a single VECTOR_RECALL_OK line for easy production verification.
+    """
+    emb = q_embedding or query_embedding or []
+    if not tenant_id or not caller_id or not emb:
         return []
 
-    qv = _vector_literal(q_embedding)
+    qv = _vector_literal(emb)
     sql = """
-    SELECT id
+    SELECT id, (embedding <=> (:qv)::vector) AS dist
     FROM caller_memory_events
     WHERE tenant_id = :tenant_id
       AND caller_id = :caller_id
@@ -252,26 +260,63 @@ def vector_search_call_summaries(
       AND embedding IS NOT NULL
       AND created_at >= :start_ts
       AND created_at <= :end_ts
-    ORDER BY embedding <=> (:qv)::vector
+    ORDER BY dist
     LIMIT :limit
     """
+
     try:
-        ids = [r[0] for r in db.execute(text(sql), {
-            "tenant_id": tenant_id,
-            "caller_id": caller_id,
-            "qv": qv,
-            "start_ts": start_ts.replace(tzinfo=None),
-            "end_ts": end_ts.replace(tzinfo=None),
-            "limit": limit,
-        }).fetchall()]
-        if not ids:
+        res = db.execute(
+            text(sql),
+            {
+                "tenant_id": tenant_id,
+                "caller_id": caller_id,
+                "qv": qv,
+                "start_ts": start_ts.replace(tzinfo=None),
+                "end_ts": end_ts.replace(tzinfo=None),
+                "limit": int(limit),
+            },
+        ).fetchall()
+
+        if not res:
+            logger.info(
+                "VECTOR_RECALL_OK tenant_id=%s caller_id=%s k=%s hits=0",
+                tenant_id,
+                caller_id,
+                int(limit),
+            )
             return []
-        return (
-            db.query(CallerMemoryEvent)
-            .filter(CallerMemoryEvent.id.in_(ids))
-            .order_by(CallerMemoryEvent.created_at.desc())
-            .all()
-        )
+
+        ids = [r[0] for r in res]
+        best_dist = None
+        try:
+            best_dist = float(res[0][1])
+        except Exception:
+            best_dist = None
+
+        if best_dist is None:
+            logger.info(
+                "VECTOR_RECALL_OK tenant_id=%s caller_id=%s k=%s hits=%s",
+                tenant_id,
+                caller_id,
+                int(limit),
+                len(ids),
+            )
+        else:
+            # Smaller distance is better; for cosine distance, 0.0 is perfect match.
+            logger.info(
+                "VECTOR_RECALL_OK tenant_id=%s caller_id=%s k=%s hits=%s best_dist=%.4f",
+                tenant_id,
+                caller_id,
+                int(limit),
+                len(ids),
+                best_dist,
+            )
+
+        # Fetch ORM rows and preserve similarity order.
+        events = db.query(CallerMemoryEvent).filter(CallerMemoryEvent.id.in_(ids)).all()
+        by_id = {e.id: e for e in events}
+        ordered = [by_id[i] for i in ids if i in by_id]
+        return ordered
     except Exception:
-        logger.exception("VECTOR_SEARCH_SQL_FAIL")
+        logger.exception("VECTOR_SEARCH_SQL_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
         return []
