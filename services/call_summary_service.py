@@ -94,12 +94,20 @@ def build_transcript(events: List[CallerMemoryEvent]) -> str:
 
 def generate_call_summary(transcript: str) -> Dict[str, Any]:
     sys = (
-        "You summarize phone calls for long-term memory. "
-        "Output JSON with keys: summary, memory_bullets, preferences, facts, todos. "
-        "- summary: 4-8 bullet sentences, <= 900 chars.\n"
-        "- memory_bullets: up to 8 short bullets of durable facts the assistant should remember.\n"
-        "- preferences: dict (e.g., likes/dislikes).\n"
-        "- facts: dict of important entities or details.\n"
+        "You summarize phone calls for long-term memory and vector recall. "
+        "Output JSON ONLY (no markdown) with keys: summary, memory_bullets, preferences, facts, todos.\n\n"
+        "Rules (important):\n"
+        "1) Capture the caller's questions/requests explicitly (what they asked for).\n"
+        "2) Extract casual facts too: if the caller casually mentions a preference or personal detail, include it.\n"
+        "   Example: 'I like cats' -> preferences.likes includes 'cats' AND memory_bullets includes 'Caller likes cats.'\n"
+        "3) Put named entities into facts.entities when possible (tickers, names, animals, products, places).\n"
+        "4) Make memory_bullets durable and searchable: include key nouns (e.g., 'cats', 'MSFT') verbatim.\n"
+        "5) Do NOT invent details. Use only what appears in the transcript.\n\n"
+        "Field specs:\n"
+        "- summary: 4-8 bullet sentences, <= 900 chars total.\n"
+        "- memory_bullets: up to 10 short bullets of durable facts to remember.\n"
+        "- preferences: dict (likes/dislikes/favorites). Use simple strings or lists.\n"
+        "- facts: dict. Prefer {entities:{...}} plus any other important details.\n"
         "- todos: list of follow-ups.\n"
         "Never say you lack memory; these notes ARE the memory."
     )
@@ -109,6 +117,7 @@ def generate_call_summary(transcript: str) -> Dict[str, Any]:
         {"role": "user", "content": user},
     ])
 
+
 def write_call_summary_event(
     db: Any,
     *,
@@ -116,6 +125,7 @@ def write_call_summary_event(
     caller_id: str,
     call_sid: str,
     summary_obj: Dict[str, Any],
+    transcript: str,
 ) -> bool:
     summary_text = (summary_obj.get("summary") or "").strip()
     bullets = summary_obj.get("memory_bullets") or []
@@ -129,8 +139,24 @@ def write_call_summary_event(
         "preferences": summary_obj.get("preferences") or {},
         "facts": summary_obj.get("facts") or {},
         "todos": summary_obj.get("todos") or [],
+        "transcript": transcript,
         "schema": "call_summary.v1",
     }
+
+    # Build an embedding text that stays searchable even if the narrative summary is brief.
+    prefs = data_json.get("preferences") or {}
+    facts = data_json.get("facts") or {}
+    todos = data_json.get("todos") or []
+    embedding_text = summary_text
+    try:
+        if prefs:
+            embedding_text += "\n\nPreferences: " + json.dumps(prefs, ensure_ascii=False)
+        if facts:
+            embedding_text += "\n\nFacts: " + json.dumps(facts, ensure_ascii=False)
+        if todos:
+            embedding_text += "\n\nTodos: " + json.dumps(todos, ensure_ascii=False)
+    except Exception:
+        pass
 
     ev = CallerMemoryEvent(
         tenant_id=tenant_id,
@@ -146,7 +172,7 @@ def write_call_summary_event(
     vec_lit: str | None = None
     if _embedding_enabled():
         try:
-            emb = embed_texts([summary_text])[0]
+            emb = embed_texts([embedding_text])[0]
             vec_lit = _vector_str(emb)
             # If model has embedding attr (pgvector column), store it.
             if hasattr(ev, "embedding"):
@@ -229,5 +255,5 @@ def ensure_call_summary_for_call(db: Any, *, call_sid: str) -> None:
 
     transcript = build_transcript(events)
     summary_obj = generate_call_summary(transcript)
-    write_call_summary_event(db, tenant_id=tenant_id, caller_id=caller_id, call_sid=call_sid, summary_obj=summary_obj)
+    write_call_summary_event(db, tenant_id=tenant_id, caller_id=caller_id, call_sid=call_sid, summary_obj=summary_obj, transcript=transcript)
     logger.info("CALL_SUMMARY_WRITE_OK tenant_id=%s caller_id=%s call_sid=%s", tenant_id, caller_id, call_sid)
