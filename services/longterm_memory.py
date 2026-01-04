@@ -218,6 +218,15 @@ def record_skill_result(
         data_json=data_json,
         tags_json=[f"skill:{skill_key or 'skill'}"],
     )
+def _is_ack_turn(text: str) -> bool:
+    t = (text or "").strip().lower()
+    t = re.sub(r"[^a-z0-9\s']", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t in {
+        "yes", "no", "yeah", "yep", "nope",
+        "ok", "okay", "k", "sure", "correct", "right",
+        "uh huh", "mm hmm", "mhm"
+    }
 
 
 def record_turn_event(
