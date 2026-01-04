@@ -795,12 +795,7 @@ async def twilio_stream(websocket: WebSocket):
         return False
 
     # --- FSM router ----------------------------------------------------------
-    async def route_to_fsm_and_get_reply(transcript: str, account_id: str | None = None) -> Optional[dict]:
-        """Call /assistant/route (FSM+router) and return the full payload.
-
-        We return the *full* payload so Flow A can honor `suppress_response=True`
-        (true silence) instead of falling back to generic OpenAI Realtime chatter.
-        """
+    async def route_to_fsm_and_get_reply(transcript: str, account_id: str | None = None) -> Optional[str]:
         try:
             ctx = {"channel": "phone"}
             if stream_sid:
@@ -811,40 +806,16 @@ async def twilio_stream(websocket: WebSocket):
                 ctx["from_number"] = from_number
 
             data = await call_fsm_router(transcript, context=ctx, account_id=account_id)
-            if not isinstance(data, dict):
-                return None
-
-            # Normalize spoken_reply (many historical shapes exist).
-            spoken = (
-                data.get("spoken_reply")
-                or (data.get("result") or {}).get("spoken_reply")
-                or (data.get("skill_result") or {}).get("spoken_reply")
-                or ""
-            )
-            if isinstance(spoken, str):
-                spoken = spoken.strip()
-            else:
-                spoken = ""
-
-            # Ensure top-level spoken_reply exists.
-            payload = dict(data)
-            payload["spoken_reply"] = spoken
-
-            # Normalize suppress_response flag from top-level or nested fsm.
-            fsm_obj = payload.get("fsm") or (payload.get("result") or {}).get("fsm") or {}
-            suppress_response = bool(
-                payload.get("suppress_response")
-                or (isinstance(fsm_obj, dict) and fsm_obj.get("suppress_response"))
-            )
-            if suppress_response:
-                payload["suppress_response"] = True
-                # also mirror into fsm for convenience
-                if isinstance(fsm_obj, dict):
-                    fsm_obj = dict(fsm_obj)
-                    fsm_obj["suppress_response"] = True
-                    payload["fsm"] = fsm_obj
-
-            return payload
+            if isinstance(data, dict):
+                # Common patterns we’ve used across codepaths
+                spoken = (
+                    data.get("spoken_reply")
+                    or (data.get("result") or {}).get("spoken_reply")
+                    or (data.get("skill_result") or {}).get("spoken_reply")
+                )
+                if isinstance(spoken, str) and spoken.strip():
+                    return spoken.strip()
+            return None
         except Exception:
             logger.exception("FSM_ROUTE_ERROR")
             return None
@@ -900,25 +871,10 @@ async def twilio_stream(websocket: WebSocket):
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Sent generic response.create for chit-chat turn")
 
-    def _truthy_env(name: str, default: str = "0") -> bool:
-        v = (os.getenv(name, default) or default).strip().lower()
-        return v in ("1", "true", "yes", "on")
-
-    _SKIP_GENERIC_ON_SUPPRESS = _truthy_env("VOICE_SKIP_GENERIC_ON_SUPPRESS", "1")
-
-    def _payload_suppress_response(payload: dict | None) -> bool:
-        if not payload or not isinstance(payload, dict):
-            return False
-        if payload.get("suppress_response"):
-            return True
-        fsm_obj = payload.get("fsm") or {}
-        if isinstance(fsm_obj, dict) and fsm_obj.get("suppress_response"):
-            return True
-        return False
-
     async def create_fsm_spoken_reply(spoken_reply: str, *, clear_playback: bool = True, reason_tag: str = "fsm_spoken_reply", verbatim: bool = False):
         if not spoken_reply:
-            logger.info("create_fsm_spoken_reply: empty spoken_reply; skipping")
+            logger.warning("create_fsm_spoken_reply called with empty spoken_reply")
+            await create_generic_response()
             return
 
         # Cancellation handled in send-path selection (controller vs legacy)
@@ -1042,15 +998,10 @@ async def twilio_stream(websocket: WebSocket):
                 pending_discovery_trigger_text = ""
                 logger.info("DISCOVERY_OFFER_ACCEPTED skill_id=%s trigger=%r", sid, trig)
 
-                fsm_payload = await route_to_fsm_and_get_reply(trig, account_id=default_gmail_account_id if sid == "gmail_summary" else None)
-                spoken_reply = (fsm_payload or {}).get("spoken_reply") if isinstance(fsm_payload, dict) else None
-                spoken_reply = (spoken_reply or "").strip() if isinstance(spoken_reply, str) else ""
+                spoken_reply = await route_to_fsm_and_get_reply(trig, account_id=default_gmail_account_id if sid == "gmail_summary" else None)
                 if spoken_reply:
                     await create_fsm_spoken_reply(spoken_reply, clear_playback=False)
                 else:
-                    if _SKIP_GENERIC_ON_SUPPRESS and _payload_suppress_response(fsm_payload):
-                        logger.info("VOICE_SUPPRESS_GENERIC_RESPONSE call_sid=%s reason=suppress_response(discovery)", call_sid)
-                        return
                     await create_generic_response()
                 return
 
@@ -1084,17 +1035,12 @@ async def twilio_stream(websocket: WebSocket):
             await create_generic_response()
             return
 
-        fsm_payload = await route_to_fsm_and_get_reply(transcript)
-        spoken_reply = (fsm_payload or {}).get("spoken_reply") if isinstance(fsm_payload, dict) else None
-        spoken_reply = (spoken_reply or "").strip() if isinstance(spoken_reply, str) else ""
+        spoken_reply = await route_to_fsm_and_get_reply(transcript)
+
         if spoken_reply:
             await create_fsm_spoken_reply(spoken_reply)
         else:
-            if _SKIP_GENERIC_ON_SUPPRESS and _payload_suppress_response(fsm_payload):
-                logger.info("VOICE_SUPPRESS_GENERIC_RESPONSE call_sid=%s reason=suppress_response(fsm)", call_sid)
-                return
             await create_generic_response()
-
 
     # --- Logging helpers -----------------------------------------------------
     def _log_realtime_audio_transcript_delta(event: dict):
