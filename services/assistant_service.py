@@ -18,11 +18,64 @@ from services.investment_service import get_investment_reports
 import os
 import re
 import json
+from datetime import datetime, timedelta
 from core.logging import logger
 from skills.registry import skill_registry
 from sqlalchemy.orm import Session
 from models import User
+from models import CallerMemoryEvent
 from vozlia_fsm import VozliaFSM
+
+def _maybe_answer_history_count(
+    db: Session,
+    *,
+    tenant_id: str,
+    caller_id: str,
+    text: str,
+) -> str | None:
+    """Deterministic counts for questions like:
+    - 'how many times did I request email summaries'
+    - 'how often did I ask for my email summary this week'
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    if not (("how many" in t) or ("number of" in t) or ("how often" in t) or ("times" in t)):
+        return None
+    if ("email" not in t) and ("gmail" not in t):
+        return None
+    # Restrict to summary-request counts (avoid hijacking random email questions)
+    if ("summary" not in t and "summaries" not in t and "summar" not in t and "request" not in t and "requested" not in t):
+        if "my email" not in t:
+            return None
+
+    now = datetime.utcnow()
+    start_dt = None
+    scope = ""
+    if "today" in t:
+        start_dt = datetime(now.year, now.month, now.day)
+        scope = " today"
+    elif "this week" in t or "past week" in t or "last week" in t:
+        start_dt = now - timedelta(days=7)
+        scope = " in the past week"
+    elif "this month" in t or "past month" in t or "last month" in t:
+        start_dt = now - timedelta(days=30)
+        scope = " in the past month"
+
+    qy = db.query(CallerMemoryEvent).filter(
+        CallerMemoryEvent.tenant_id == str(tenant_id),
+        CallerMemoryEvent.caller_id == str(caller_id),
+        CallerMemoryEvent.skill_key == "gmail_summary",
+    )
+    if start_dt is not None:
+        qy = qy.filter(CallerMemoryEvent.created_at >= start_dt)
+
+    cnt = int(qy.count() or 0)
+    if cnt == 0:
+        return f"You haven't requested email summaries{scope}."
+    suffix = "time" if cnt == 1 else "times"
+    return f"{cnt} {suffix}{scope}."
+
 from services.memory_facade import (
     memory,
     make_skill_cache_key_hash,
@@ -609,6 +662,17 @@ def run_assistant_route(
         )
 
         # -------------------------
+
+    # Deterministic history counts: avoid LLM guessing for "how many times ... email summaries" questions.
+    # This runs before FSM so it works even when phrasing is inconsistent.
+    if longterm_enabled and caller_id and tenant_uuid:
+        try:
+            _hc = _maybe_answer_history_count(db, tenant_id=str(tenant_uuid), caller_id=str(caller_id), text=raw_user_text)
+        except Exception:
+            _hc = None
+        if _hc:
+            return {"spoken_reply": _hc, "fsm": {"mode": "history_count", "key": "gmail_summary_count"}, "gmail": None}
+
     # Turn capture (so call summaries include USER questions)
     # -------------------------
     def _capture_turn(role: str, msg: str | None) -> None:
@@ -671,82 +735,17 @@ def run_assistant_route(
 
         try:
             if isinstance(payload, dict) and "spoken_reply" in payload:
-                _orig = payload.get("spoken_reply")
-                payload["spoken_reply"] = _sanitize_spoken_reply(_orig)
-                # If we silenced a known uncertain/clarify filler, instruct downstream to skip generic responses.
-                if _orig and payload.get("spoken_reply") == "" and _silence_enabled and _fallback_re.search(str(_orig)):
-                    payload["suppress_response"] = True
-                    if isinstance(payload.get("fsm"), dict):
-                        payload["fsm"]["suppress_response"] = True
-                    else:
-                        payload["fsm"] = {"suppress_response": True}
+                payload["spoken_reply"] = _sanitize_spoken_reply(payload.get("spoken_reply"))
             if isinstance(payload, dict):
                 _capture_turn("assistant", payload.get("spoken_reply"))
         except Exception:
             logger.exception("TURN_CAPTURE_WRAP_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
         return payload
 
-def _maybe_answer_history_count(q: str) -> str | None:
-    """Deterministic counts for questions like: 'how many times did I request email summaries?'
-    Counts gmail_summary skill events from caller_memory_events.
-    """
-    t = (q or "").strip().lower()
-    if not t:
-        return None
-    if not (("how many" in t) or ("number of" in t) or ("how often" in t) or ("times" in t)):
-        return None
-    if "email" not in t and "gmail" not in t:
-        return None
-    if ("summary" not in t and "summaries" not in t and "summar" not in t and "request" not in t and "requested" not in t):
-        if "my email" not in t:
-            return None
-
-    now = datetime.utcnow()
-    start_dt = None
-    scope = ""
-    if "today" in t:
-        start_dt = datetime(now.year, now.month, now.day)
-        scope = " today"
-    elif "this week" in t:
-        sow = now - timedelta(days=now.weekday())
-        start_dt = datetime(sow.year, sow.month, sow.day)
-        scope = " this week"
-    elif "this month" in t:
-        start_dt = datetime(now.year, now.month, 1)
-        scope = " this month"
-
-    try:
-        from db.models import CallerMemoryEvent
-    except Exception:
-        return None
-
-    try:
-        qy = db.query(CallerMemoryEvent).filter(
-            CallerMemoryEvent.tenant_id == str(tenant_uuid),
-            CallerMemoryEvent.caller_id == str(caller_id),
-            CallerMemoryEvent.skill_key == "gmail_summary",
-        )
-        if start_dt is not None:
-            qy = qy.filter(CallerMemoryEvent.created_at >= start_dt)
-        cnt = int(qy.count() or 0)
-    except Exception:
-        logger.exception("HISTORY_COUNT_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
-        return None
-
-    if cnt == 0:
-        return f"I don't see any email summary requests{scope}."
-    suffix = "time" if cnt == 1 else "times"
-    return f"You've requested email summaries {cnt} {suffix}{scope}."
-
     # Capture the user turn early so even early returns preserve the question.
     _capture_turn("user", raw_user_text)
 
-    # Deterministic history counts (e.g., "how many times did I request email summaries")
-    _hc = _maybe_answer_history_count(raw_user_text)
-    if _hc:
-        return _wrap_reply({"spoken_reply": _hc, "fsm": {"mode": "history_count", "key": "gmail_summary_count"}, "gmail": None})
-
-    # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
+# Pull small recent context for prompt grounding (keep short; no hot-path bloat)
 
     # -------------------------
     # AUTO memory question handling (summaries + vector first)
@@ -828,8 +827,7 @@ def _maybe_answer_history_count(q: str) -> str | None:
             if debug:
                 logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (q_raw or "")[:200])
             payload = {
-                "spoken_reply": "",
-                "suppress_response": True,
+                "spoken_reply": "I couldn’t find that in my notes yet. Can you tell me roughly when we talked about it?",
                 "fsm": {"mode": "memory_recall", "status": "no_hits"},
                 "gmail": None,
             }
@@ -967,6 +965,7 @@ def _maybe_answer_history_count(q: str) -> str | None:
         if _fallback_re.search(spoken_reply):
             spoken_reply = ""
             fsm_result["spoken_reply"] = ""
+            fsm_result["suppress_response"] = True
     if debug:
         bc_type = backend_call.get('type') if isinstance(backend_call, dict) else None
         logger.info(
