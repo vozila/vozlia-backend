@@ -358,6 +358,9 @@ def run_assistant_route(
     else:
         text_snip = ""
 
+    # Preserve original user text before any router canonicalization
+    raw_user_text = text
+
     text_l = (text or "").lower()
 
     ctx_flags = context if isinstance(context, dict) else {}
@@ -507,7 +510,9 @@ def run_assistant_route(
                     memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_index", value=0, ttl_s=SESSION_MEMORY_TTL_S)
                 except Exception:
                     pass
-                return {"spoken_reply": "Okay — ending the stock report.", "fsm": {"mode": "investment_reporting", "action": "stop"}, "gmail": None}
+                payload = {"spoken_reply": "Okay — ending the stock report.", "fsm": {"mode": "investment_reporting", "action": "stop"}, "gmail": None}
+                _capture_turn("assistant", payload.get("spoken_reply"))
+                return payload
 
             if _is_next_cmd(text):
                 try:
@@ -521,7 +526,9 @@ def run_assistant_route(
                         memory.set_handle(tenant_id=tenant_id, call_id=call_id, name="invrep_index", value=0, ttl_s=SESSION_MEMORY_TTL_S)
                     except Exception:
                         pass
-                    return {"spoken_reply": "That’s the end of your stock report.", "fsm": {"mode": "investment_reporting", "action": "done"}, "gmail": None}
+                    payload = {"spoken_reply": "That’s the end of your stock report.", "fsm": {"mode": "investment_reporting", "action": "done"}, "gmail": None}
+                    _capture_turn("assistant", payload.get("spoken_reply"))
+                    return payload
 
                 # Advance
                 try:
@@ -529,7 +536,9 @@ def run_assistant_route(
                 except Exception:
                     pass
                 nxt = inv_queue[i2]
-                return {"spoken_reply": str(nxt), "fsm": {"mode": "investment_reporting", "action": "next", "index": i2}, "gmail": None}
+                payload = {"spoken_reply": str(nxt), "fsm": {"mode": "investment_reporting", "action": "next", "index": i2}, "gmail": None}
+                _capture_turn("assistant", payload.get("spoken_reply"))
+                return payload
 
     # -------------------------
     # LONGTERM MEMORY: config + context + capture turns (Option A)
@@ -554,7 +563,42 @@ def run_assistant_route(
             call_id,
         )
 
-    # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
+        # -------------------------
+    # Turn capture (so call summaries include USER questions)
+    # -------------------------
+    def _capture_turn(role: str, msg: str | None) -> None:
+        if not longterm_enabled or not capture_turns:
+            return
+        if not tenant_uuid or not caller_id:
+            return
+        body = (msg or "").strip()
+        if not body or _is_junk_transcript(body):
+            return
+        try:
+            record_turn_event(
+                db,
+                tenant_uuid=str(tenant_uuid),
+                caller_id=str(caller_id),
+                call_sid=(str(call_id) if call_id else None),
+                role=str(role or "user"),
+                text=body,
+            )
+        except Exception:
+            logger.exception("TURN_CAPTURE_FAIL tenant_id=%s caller_id=%s role=%s", tenant_id, caller_id, role)
+
+    def _wrap_reply(payload: dict) -> dict:
+        """Capture assistant spoken_reply (if present), then return payload unchanged."""
+        try:
+            if isinstance(payload, dict):
+                _capture_turn("assistant", payload.get("spoken_reply"))
+        except Exception:
+            logger.exception("TURN_CAPTURE_WRAP_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+        return payload
+
+    # Capture the user turn early so even early returns preserve the question.
+    _capture_turn("user", raw_user_text)
+
+# Pull small recent context for prompt grounding (keep short; no hot-path bloat)
 
     # -------------------------
     # AUTO memory question handling (summaries + vector first)
@@ -635,11 +679,13 @@ def run_assistant_route(
         if not rows:
             if debug:
                 logger.info("AUTO_MEMORY_NO_HITS tenant_id=%s caller_id=%s q=%s", tenant_id, caller_id, (q_raw or "")[:200])
-            return {
+            payload = {
                 "spoken_reply": "I couldn’t find that in my notes yet. Can you tell me roughly when we talked about it?",
                 "fsm": {"mode": "memory_recall", "status": "no_hits"},
                 "gmail": None,
             }
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
 
         # Build compact evidence lines for the LLM
         evidence_lines: list[str] = []
@@ -657,7 +703,7 @@ def run_assistant_route(
 
         if os.getenv("MEMORY_LLM_ANSWER_ENABLED", "1").strip() == "1":
             spoken = llm_answer_from_memory(q_raw, evidence_lines)
-            return {
+            payload = {
                 "spoken_reply": spoken,
                 "fsm": {
                     "mode": "memory_recall",
@@ -668,14 +714,18 @@ def run_assistant_route(
                 },
                 "gmail": None,
             }
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
 
         # Fail-soft fallback: old snippet style (should be rarely used)
         spoken = "Here’s what I found in your notes: " + " ".join([ln.split('] ',1)[-1] for ln in evidence_lines[:3]])
-        return {
+        payload = {
             "spoken_reply": spoken,
             "fsm": {"mode": "memory_recall", "has_evidence": True, "hits": len(rows)},
             "gmail": None,
         }
+        _capture_turn("assistant", payload.get("spoken_reply"))
+        return payload
 
 
         # Evidence-first summary (MVP, deterministic)
@@ -689,7 +739,7 @@ def run_assistant_route(
         if len(snippets) > 3:
             spoken += " …and I found a few more related notes."
 
-        return {
+        payload = {
             "spoken_reply": spoken,
             "fsm": {
                 "mode": "memory_recall",
@@ -701,6 +751,8 @@ def run_assistant_route(
             },
             "gmail": None,
         }
+        _capture_turn("assistant", payload.get("spoken_reply"))
+        return payload
 
     fsm = VozliaFSM()
 
@@ -779,11 +831,13 @@ def run_assistant_route(
     if backend_call and backend_call.get("type") == "gmail_summary":
         # ✅ Skill toggle gate (portal-controlled)
         if not gmail_summary_enabled(db, current_user):
-            return {
+            payload = {
                 "spoken_reply": "Email summaries are currently turned off in your settings.",
                 "fsm": fsm_result,
                 "gmail": None,
             }
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
 
         # If this was initiated via auto-exec/offer-followup, use a neutral standby phrase instead of a confirmation.
         if wants_standby_ack:
@@ -936,7 +990,7 @@ def run_assistant_route(
                         caller_id=caller_id,
                         call_sid=str(call_id) if call_id else None,
                         skill_key="gmail_summary",
-                        input_text=text,
+                        input_text=raw_user_text,
                         memory_text=(gmail_data.get("summary") or "").strip()[:900],
                         data_json={
                             "account_id": account_id_effective,
@@ -951,7 +1005,9 @@ def run_assistant_route(
                     logger.exception("LONGTERM_MEM_RECORD_GMAIL_FAILED")
             gmail_data["used_account_id"] = account_id_effective
 
-        return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
+        payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
+        _capture_turn("assistant", payload.get("spoken_reply"))
+        return payload
 
     # ----------------------------
     # (2) Skills Engine fallback (feature-flagged)
@@ -979,7 +1035,9 @@ def run_assistant_route(
                 account_id_effective = account_id or get_default_gmail_account_id(current_user, db)
                 if not account_id_effective:
                     spoken_reply = "I tried to check your email, but I don't see a Gmail account connected for you yet."
-                    return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": {"summary": None, "used_account_id": None}}
+                    payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": {"summary": None, "used_account_id": None}}
+                    _capture_turn("assistant", payload.get("spoken_reply"))
+                    return payload
 
                 # Session memory cache (SkillsEngine path)
                 cache_hash = None
@@ -1079,7 +1137,9 @@ def run_assistant_route(
                     spoken_reply = "I checked your email, but there wasn’t anything to summarize right now."
 
                 logger.info("SkillsEngine executed skill=%s account_id=%s", matched_skill.id, account_id_effective)
-                return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
+                payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
+                _capture_turn("assistant", payload.get("spoken_reply"))
+                return payload
 
         except Exception:
             # Never fail the call path because the skills engine had an issue.
@@ -1095,11 +1155,15 @@ def run_assistant_route(
     if backend_call and backend_call.get("type") == "investment_reporting":
         cfg = get_investment_reporting_config(db, current_user) or {}
         if not bool(cfg.get("enabled", False)):
-            return {"spoken_reply": "Investment reporting is currently turned off in your settings.", "fsm": fsm_result, "gmail": None}
+            payload = {"spoken_reply": "Investment reporting is currently turned off in your settings.", "fsm": fsm_result, "gmail": None}
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
 
         tickers = get_investment_reporting_tickers(db, current_user)
         if not tickers:
-            return {"spoken_reply": "Investment reporting is enabled, but no tickers are configured yet.", "fsm": fsm_result, "gmail": None}
+            payload = {"spoken_reply": "Investment reporting is enabled, but no tickers are configured yet.", "fsm": fsm_result, "gmail": None}
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
 
         llm_prompt = (cfg.get("llm_prompt") or "").strip()
         if not llm_prompt:
@@ -1115,11 +1179,15 @@ def run_assistant_route(
             logger.info("INVREP_FETCH_OK tickers=%s", tickers)
         except Exception as e:
             logger.exception("INVREP_FETCH_FAIL tickers=%s err=%s", tickers, e)
-            return {"spoken_reply": "Sorry — I couldn’t fetch stock data right now.", "fsm": fsm_result, "gmail": None}
+            payload = {"spoken_reply": "Sorry — I couldn’t fetch stock data right now.", "fsm": fsm_result, "gmail": None}
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
 
         spoken_list = rep.get("spoken_reports") or []
         if not isinstance(spoken_list, list) or not spoken_list:
-            return {"spoken_reply": "Sorry — I couldn’t generate a stock report right now.", "fsm": fsm_result, "gmail": None}
+            payload = {"spoken_reply": "Sorry — I couldn’t generate a stock report right now.", "fsm": fsm_result, "gmail": None}
+            _capture_turn("assistant", payload.get("spoken_reply"))
+            return payload
 
         # Seed session queue so the caller can say “next” to advance tickers.
         if call_id and tenant_id:
@@ -1138,13 +1206,17 @@ def run_assistant_route(
                     caller_id=str(caller_id),
                     call_sid=str(call_id) if call_id else None,
                     skill_key="investment_reporting",
-                    input_text=text,
+                    input_text=raw_user_text,
                     memory_text=str(spoken_list[0]),
                     data_json={"tickers": tickers, "report": rep},
                 )
         except Exception:
             pass
 
-        return {"spoken_reply": str(spoken_list[0]), "fsm": fsm_result, "gmail": None}
+        payload = {"spoken_reply": str(spoken_list[0]), "fsm": fsm_result, "gmail": None}
+        _capture_turn("assistant", payload.get("spoken_reply"))
+        return payload
 
-    return {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
+    payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
+    _capture_turn("assistant", payload.get("spoken_reply"))
+    return payload
