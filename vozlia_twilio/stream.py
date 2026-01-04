@@ -469,6 +469,11 @@ async def twilio_stream(websocket: WebSocket):
     await_more_current_ms: int = 0
     await_more_rounds: int = 0
 
+    # Backchannel (light acknowledgment): when router intentionally suppresses speech,
+    # play a short acknowledgment after a short delay so callers don't feel dropped.
+    backchannel_task: Optional[asyncio.Task] = None
+    backchannel_pending: bool = False
+
 
 
     barge_in_enabled: bool = False
@@ -738,6 +743,70 @@ async def twilio_stream(websocket: WebSocket):
         await_more_task = asyncio.create_task(_flush())
         logger.info("VOICE_AWAIT_MORE_START ms=%d reason=%s", ms, reason)
 
+
+
+    # --- Backchannel helpers -------------------------------------------------
+    async def _cancel_backchannel(reason: str):
+        """Cancel any pending backchannel acknowledgment."""
+        nonlocal backchannel_task, backchannel_pending
+        if backchannel_task and not backchannel_task.done():
+            backchannel_task.cancel()
+            logger.info("VOICE_BACKCHANNEL_CANCEL reason=%s", reason)
+        backchannel_task = None
+        backchannel_pending = False
+
+    def _backchannel_enabled() -> bool:
+        v = (os.getenv("VOICE_BACKCHANNEL_ON_SUPPRESS", "1") or "1").strip().lower()
+        return v in ("1", "true", "yes", "on")
+
+    def _backchannel_delay_ms() -> int:
+        try:
+            return int(os.getenv("VOICE_BACKCHANNEL_DELAY_MS", "700") or 700)
+        except Exception:
+            return 700
+
+    def _backchannel_text(intent: str | None = None) -> str:
+        # Intent-specific minimal acknowledgments (avoid paraphrasing / hallucinations).
+        if intent == "check_in":
+            return "Yes — I'm here."
+        if intent == "greeting":
+            return "Hi — how can I help?"
+        return (os.getenv("VOICE_BACKCHANNEL_TEXT", "Okay.") or "Okay.").strip() or "Okay."
+
+    async def _schedule_backchannel(*, intent: str | None, reason: str):
+        """Schedule a short acknowledgment after a brief delay (if enabled)."""
+        nonlocal backchannel_task, backchannel_pending
+        if not _backchannel_enabled():
+            return
+        if backchannel_pending:
+            return
+        backchannel_pending = True
+
+        delay_ms = _backchannel_delay_ms()
+        text = _backchannel_text(intent)
+
+        if backchannel_task and not backchannel_task.done():
+            backchannel_task.cancel()
+
+        async def _run():
+            nonlocal backchannel_task, backchannel_pending
+            try:
+                # check-in / greeting should feel immediate
+                if intent in ("check_in", "greeting"):
+                    await asyncio.sleep(0.15)
+                else:
+                    await asyncio.sleep(max(0, delay_ms) / 1000.0)
+                backchannel_task = None
+                backchannel_pending = False
+                logger.info("VOICE_BACKCHANNEL_FIRE intent=%s reason=%s", intent, reason)
+                await create_fsm_spoken_reply(text)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("VOICE_BACKCHANNEL_ERROR")
+
+        backchannel_task = asyncio.create_task(_run())
+        logger.info("VOICE_BACKCHANNEL_START delay_ms=%d intent=%s reason=%s", delay_ms, intent, reason)
 
     async def twilio_clear_buffer():
         if stream_sid is None:
@@ -1076,6 +1145,8 @@ async def twilio_stream(websocket: WebSocket):
         if not transcript:
             return
 
+        await _cancel_backchannel("new_transcript")
+
         if event.get("_await_more_flush"):
             logger.info("USER Transcript merged (await_more_flush): %r", transcript)
         else:
@@ -1158,11 +1229,21 @@ async def twilio_stream(websocket: WebSocket):
         suppress = bool(fsm_payload.get("suppress_response")) if isinstance(fsm_payload, dict) else False
 
         if spoken_reply:
+            await _cancel_backchannel("spoken_reply")
             await create_fsm_spoken_reply(spoken_reply)
         else:
             if suppress and (os.getenv("VOICE_SKIP_GENERIC_ON_SUPPRESS", "1").strip().lower() in ("1","true","yes","on")):
                 logger.info("VOICE_SUPPRESS_GENERIC_RESPONSE call_sid=%s", call_sid)
+                # Schedule a short acknowledgment so the caller doesn't feel dropped.
+                try:
+                    fsm_obj = (fsm_payload.get("fsm") if isinstance(fsm_payload, dict) else None) or {}
+                    intent = fsm_obj.get("intent") or (fsm_payload.get("intent") if isinstance(fsm_payload, dict) else None)
+                except Exception:
+                    intent = None
+                await _schedule_backchannel(intent=intent, reason="suppress_response")
+                await _cancel_await_more("suppress_response")
                 return
+            await _cancel_backchannel("generic_fallback")
             await create_generic_response()
 
 
