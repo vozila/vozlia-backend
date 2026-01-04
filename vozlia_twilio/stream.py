@@ -462,6 +462,15 @@ async def twilio_stream(websocket: WebSocket):
     greeting_drain_task: Optional[asyncio.Task] = None
     pending_transcript_during_greeting: Optional[str] = None
 
+    # Await-more (human-style floor holding): when /assistant/route returns await_more=True,
+    # we temporarily hold off on speaking and wait for additional transcript fragments.
+    await_more_task: Optional[asyncio.Task] = None
+    await_more_text: str = ""
+    await_more_current_ms: int = 0
+    await_more_rounds: int = 0
+
+
+
     barge_in_enabled: bool = False
     twilio_ws_closed: bool = False
     transcript_action_task: Optional[asyncio.Task] = None
@@ -669,6 +678,66 @@ async def twilio_stream(websocket: WebSocket):
                 await handle_transcript_event({"transcript": t})
             except Exception:
                 logger.exception("DEFERRED_TRANSCRIPT_PROCESS_ERROR")
+
+    # --- Await-more helpers -------------------------------------------------
+    async def _cancel_await_more(reason: str):
+        """Cancel any pending await-more timer and clear buffered transcript."""
+        nonlocal await_more_task, await_more_text, await_more_current_ms, await_more_rounds
+        if await_more_task and not await_more_task.done():
+            await_more_task.cancel()
+            logger.info("VOICE_AWAIT_MORE_CANCEL reason=%s", reason)
+        await_more_task = None
+        await_more_text = ""
+        await_more_current_ms = 0
+        await_more_rounds = 0
+
+    def _await_more_enabled() -> bool:
+        return (os.getenv("VOICE_ENABLE_AWAIT_MORE", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    def _await_more_max_rounds() -> int:
+        try:
+            return int(os.getenv("VOICE_AWAIT_MORE_MAX_ROUNDS", "2") or 2)
+        except Exception:
+            return 2
+
+    async def _schedule_await_more_flush(*, ms: int, reason: str):
+        """Schedule a flush of buffered transcript after `ms` of silence."""
+        nonlocal await_more_task, await_more_current_ms
+
+        # Clamp / sanitize
+        if ms <= 0:
+            ms = int(os.getenv("VOICE_AWAIT_MORE_DEFAULT_MS", "1200") or 1200)
+        max_ms = int(os.getenv("VOICE_AWAIT_MORE_MAX_MS", "2500") or 2500)
+        if ms > max_ms:
+            ms = max_ms
+
+        await_more_current_ms = ms
+
+        # Cancel old timer if any
+        if await_more_task and not await_more_task.done():
+            await_more_task.cancel()
+
+        async def _flush():
+            nonlocal await_more_task, await_more_text, await_more_current_ms
+            try:
+                await asyncio.sleep(ms / 1000.0)
+                merged = (await_more_text or "").strip()
+                # Clear before routing to avoid re-entrancy loops
+                await_more_task = None
+                await_more_text = ""
+                await_more_current_ms = 0
+                if not merged:
+                    return
+                logger.info("VOICE_AWAIT_MORE_FLUSH ms=%d reason=%s merged_len=%d", ms, reason, len(merged))
+                await handle_transcript_event({"transcript": merged, "_await_more_flush": True})
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("VOICE_AWAIT_MORE_FLUSH_ERROR")
+
+        await_more_task = asyncio.create_task(_flush())
+        logger.info("VOICE_AWAIT_MORE_START ms=%d reason=%s", ms, reason)
+
 
     async def twilio_clear_buffer():
         if stream_sid is None:
@@ -1007,7 +1076,11 @@ async def twilio_stream(websocket: WebSocket):
         if not transcript:
             return
 
-        logger.info("USER Transcript completed: %r", transcript)
+        if event.get("_await_more_flush"):
+            logger.info("USER Transcript merged (await_more_flush): %r", transcript)
+        else:
+            logger.info("USER Transcript completed: %r", transcript)
+
 
         # Greeting protection: never let early caller speech cancel/clip the greeting.
         nonlocal pending_transcript_during_greeting
@@ -1015,6 +1088,18 @@ async def twilio_stream(websocket: WebSocket):
             pending_transcript_during_greeting = transcript
             logger.info("DEFER_TRANSCRIPT_DURING_GREETING: %r", transcript)
             return
+
+        # If we're currently holding the floor (await_more), treat any new completed transcript
+        # as a continuation fragment and extend the flush timer (unless we're resolving a discovery offer).
+        nonlocal pending_discovery_skill_id
+        nonlocal await_more_task, await_more_text, await_more_current_ms, await_more_rounds
+        if await_more_task is not None and (pending_discovery_skill_id is None):
+            await_more_text = (await_more_text + " " + transcript).strip() if await_more_text else transcript
+            ms = await_more_current_ms or int(os.getenv("VOICE_AWAIT_MORE_DEFAULT_MS", "1200") or 1200)
+            await _schedule_await_more_flush(ms=ms, reason="continuation_fragment")
+            logger.info("VOICE_AWAIT_MORE_APPEND merged_len=%d", len(await_more_text))
+            return
+
 
         # Resolve a pending discovery offer (Add-to-greeting) deterministically.
         nonlocal pending_discovery_skill_id, pending_discovery_trigger_text
