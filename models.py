@@ -159,6 +159,43 @@ class Task(Base):
 # - Used as a best-effort cache to avoid re-hitting external APIs for follow-ups.
 # ---------------------------------------------------------------------------
 
+class KBDocumentStatus(enum.Enum):
+    pending_link = "pending_link"
+    pending_upload = "pending_upload"
+    uploaded = "uploaded"
+    ingesting = "ingesting"
+    ready = "ready"
+    failed = "failed"
+
+
+class KBDocument(Base):
+    __tablename__ = "kb_documents"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    # Tenant scope (for now, tenant == user id)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Who we texted (optional, useful for auditing)
+    target_phone = Column(String, nullable=True)
+
+    filename = Column(String, nullable=True)
+    content_type = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+
+    storage_bucket = Column(String, nullable=True)
+    storage_key = Column(String, nullable=True)
+
+    status = Column(SAEnum(KBDocumentStatus), nullable=False, default=KBDocumentStatus.pending_link)
+    error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_kb_documents_tenant_created", "tenant_id", "created_at"),
+    )
+
 class CallerSkillCache(Base):
     __tablename__ = "caller_skill_cache"
 
