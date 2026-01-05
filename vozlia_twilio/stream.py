@@ -841,990 +841,1000 @@ async def twilio_stream(websocket: WebSocket):
             logger.exception("Failed to send Twilio clear")
 
 
-# --- Concierge greeting -------------------------------------------------
-def _concierge_enabled() -> bool:
-    return (os.getenv("VOICE_CONCIERGE_GREETING", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+    # --- Concierge greeting -------------------------------------------------
+    def _concierge_enabled() -> bool:
+        return (os.getenv("VOICE_CONCIERGE_GREETING", "0") or "").strip().lower() in ("1", "true", "yes", "on")
 
-def _concierge_max_calls() -> int:
-    try:
-        return int(os.getenv("VOICE_CONCIERGE_MAX_CALLS", "3") or 3)
-    except Exception:
-        return 3
-
-def _concierge_max_wait_ms() -> int:
-    try:
-        return int(os.getenv("VOICE_CONCIERGE_MAX_WAIT_MS", "250") or 250)
-    except Exception:
-        return 250
-
-def _safe_topic_from_tags(tags_json) -> Optional[str]:
-    """Return a short safe topic string if tags_json contains a known keyword."""
-    if not tags_json:
-        return None
-    try:
-        tags = tags_json
-        # tags_json is jsonb; it should deserialize to list/dict already when loaded by SQLAlchemy.
-        if isinstance(tags, dict):
-            # accept {"tags": [...]} or {"kw:cats": true} shapes
-            if "tags" in tags and isinstance(tags["tags"], list):
-                tags = tags["tags"]
-            else:
-                tags = list(tags.keys())
-        if not isinstance(tags, list):
-            return None
-        safe = {"cats", "cat", "dogs", "dog", "email", "emails", "pricing", "quote", "menu", "order", "orders", "hours", "location", "locations"}
-        for t in tags:
-            if not isinstance(t, str):
-                continue
-            s = t.strip().lower()
-            if s.startswith("kw:"):
-                s = s[3:]
-            if s in safe:
-                # normalize plurals for speech
-                if s == "cat":
-                    return "cats"
-                if s == "dog":
-                    return "dogs"
-                if s == "emails":
-                    return "email"
-                if s == "orders":
-                    return "orders"
-                if s == "locations":
-                    return "locations"
-                return s
-    except Exception:
-        return None
-    return None
-
-async def _prefetch_concierge_text(*, tenant_id, caller_id: str, current_call_sid: Optional[str]):
-    """Compute concierge_text in a background task. Never blocks audio hot paths."""
-    nonlocal concierge_text
-    if not caller_id:
-        return
-    db2 = SessionLocal()
-    try:
-        # Parse tenant UUID if needed (model column is uuid)
-        tid = tenant_id
-        if isinstance(tid, str):
-            try:
-                tid = _uuid.UUID(tid)
-            except Exception:
-                pass
-
-        # Last N prior calls (exclude current call_sid)
-        q = (
-            db2.query(CallerMemoryEvent.call_sid, func.max(CallerMemoryEvent.created_at).label("last_at"))
-            .filter(CallerMemoryEvent.tenant_id == tid)
-            .filter(CallerMemoryEvent.caller_id == caller_id)
-            .filter(CallerMemoryEvent.call_sid.isnot(None))
-        )
-        if current_call_sid:
-            q = q.filter(CallerMemoryEvent.call_sid != current_call_sid)
-
-        rows = (
-            q.group_by(CallerMemoryEvent.call_sid)
-            .order_by(desc(func.max(CallerMemoryEvent.created_at)))
-            .limit(_concierge_max_calls())
-            .all()
-        )
-
-        if not rows:
-            concierge_text = None
-            return
-
-        # Format the most recent prior call timestamp for speech
-        last_at = rows[0][1]
-        if last_at is None:
-            concierge_text = None
-            return
-
-        # created_at is stored without tz; treat as UTC and convert to NY
-        dt_utc = last_at.replace(tzinfo=timezone.utc)
-        dt_local = dt_utc.astimezone(ZoneInfo("America/New_York"))
-        tstr = dt_local.strftime("%I:%M %p").lstrip("0")
-        when = f"{dt_local.strftime('%a')} at {tstr}"
-
-        topic: Optional[str] = None
+    def _concierge_max_calls() -> int:
         try:
-            prior_call_sid = rows[0][0]
-            # Pull recent tags_json from the prior call for a safe topic nod
-            tag_rows = (
-                db2.query(CallerMemoryEvent.tags_json)
+            return int(os.getenv("VOICE_CONCIERGE_MAX_CALLS", "3") or 3)
+        except Exception:
+            return 3
+
+    def _concierge_max_wait_ms() -> int:
+        try:
+            return int(os.getenv("VOICE_CONCIERGE_MAX_WAIT_MS", "250") or 250)
+        except Exception:
+            return 250
+
+    def _safe_topic_from_tags(tags_json) -> Optional[str]:
+        """Return a short safe topic string if tags_json contains a known keyword."""
+        if not tags_json:
+            return None
+        try:
+            tags = tags_json
+            # tags_json is jsonb; it should deserialize to list/dict already when loaded by SQLAlchemy.
+            if isinstance(tags, dict):
+                # accept {"tags": [...]} or {"kw:cats": true} shapes
+                if "tags" in tags and isinstance(tags["tags"], list):
+                    tags = tags["tags"]
+                else:
+                    tags = list(tags.keys())
+            if not isinstance(tags, list):
+                return None
+            safe = {"cats", "cat", "dogs", "dog", "email", "emails", "pricing", "quote", "menu", "order", "orders", "hours", "location", "locations"}
+            for t in tags:
+                if not isinstance(t, str):
+                    continue
+                s = t.strip().lower()
+                if s.startswith("kw:"):
+                    s = s[3:]
+                if s in safe:
+                    # normalize plurals for speech
+                    if s == "cat":
+                        return "cats"
+                    if s == "dog":
+                        return "dogs"
+                    if s == "emails":
+                        return "email"
+                    if s == "orders":
+                        return "orders"
+                    if s == "locations":
+                        return "locations"
+                    return s
+        except Exception:
+            return None
+        return None
+
+    async def _prefetch_concierge_text(*, tenant_id, caller_id: str, current_call_sid: Optional[str]) -> Optional[str]:
+        """Compute concierge greeting text in a background task.
+
+        Important:
+          - This function must NOT touch outer-scope variables (no `nonlocal`/`global`).
+          - Callers should read the returned value from the task result.
+          - Never blocks audio hot paths.
+        """
+        if not caller_id:
+            return None
+
+        db2 = SessionLocal()
+        try:
+            # Parse tenant UUID if needed (model column is uuid)
+            tid = tenant_id
+            if isinstance(tid, str):
+                try:
+                    tid = _uuid.UUID(tid)
+                except Exception:
+                    pass
+
+            # Last N prior calls (exclude current call_sid)
+            q = (
+                db2.query(
+                    CallerMemoryEvent.call_sid,
+                    func.max(CallerMemoryEvent.created_at),
+                )
                 .filter(CallerMemoryEvent.tenant_id == tid)
                 .filter(CallerMemoryEvent.caller_id == caller_id)
-                .filter(CallerMemoryEvent.call_sid == prior_call_sid)
-                .filter(CallerMemoryEvent.tags_json.isnot(None))
-                .order_by(desc(CallerMemoryEvent.created_at))
-                .limit(50)
+                .filter(CallerMemoryEvent.call_sid.isnot(None))
+            )
+            if current_call_sid:
+                q = q.filter(CallerMemoryEvent.call_sid != current_call_sid)
+
+            rows = (
+                q.group_by(CallerMemoryEvent.call_sid)
+                .order_by(desc(func.max(CallerMemoryEvent.created_at)))
+                .limit(_concierge_max_calls())
                 .all()
             )
-            for (tj,) in tag_rows:
-                topic = _safe_topic_from_tags(tj)
-                if topic:
-                    break
-        except Exception:
-            topic = None
 
-        if topic:
-            concierge_text = f"Welcome back. I see you called {when}. Last time we chatted about {topic}. How can I help today?"
-        else:
-            concierge_text = f"Welcome back. I see you called {when}. How can I help today?"
-    except Exception:
-        logger.exception("CONCIERGE_PREFETCH_ERROR")
-        concierge_text = None
-    finally:
+            if not rows:
+                return None
+
+            # Format the most recent prior call timestamp for speech
+            last_at = rows[0][1]
+            if last_at is None:
+                return None
+
+            # created_at is stored without tz; treat as UTC and convert to NY
+            dt_utc = last_at.replace(tzinfo=timezone.utc)
+            dt_local = dt_utc.astimezone(ZoneInfo("America/New_York"))
+            tstr = dt_local.strftime("%I:%M %p").lstrip("0")
+            when = f"{dt_local.strftime('%a')} at {tstr}"
+
+            topic: Optional[str] = None
+            try:
+                prior_call_sid = rows[0][0]
+                # Pull recent tags_json from the prior call for a safe topic nod
+                tag_rows = (
+                    db2.query(CallerMemoryEvent.tags_json)
+                    .filter(CallerMemoryEvent.tenant_id == tid)
+                    .filter(CallerMemoryEvent.caller_id == caller_id)
+                    .filter(CallerMemoryEvent.call_sid == prior_call_sid)
+                    .filter(CallerMemoryEvent.tags_json.isnot(None))
+                    .order_by(desc(CallerMemoryEvent.created_at))
+                    .limit(50)
+                    .all()
+                )
+                for (tj,) in tag_rows:
+                    topic = _safe_topic_from_tags(tj)
+                    if topic:
+                        break
+            except Exception:
+                topic = None
+
+            if topic:
+                return f"Welcome back. I see you called {when}. Last time we chatted about {topic}. How can I help today?"
+            return f"Welcome back. I see you called {when}. How can I help today?"
+        except Exception:
+            logger.exception("CONCIERGE_PREFETCH_ERROR")
+            return None
+        finally:
+            with suppress(Exception):
+                db2.close()
+
+
+    async def _maybe_say_concierge_after_greeting():
+        """Speak concierge_text once after greeting, if ready and appropriate."""
+        nonlocal concierge_said, concierge_task, concierge_text
+
+        if concierge_said or not _concierge_enabled():
+            return
+        # If user spoke during greeting or we captured deferred transcript, skip concierge.
+        if pending_transcript_during_greeting:
+            return
+        # user_spoke_once is set by VAD; if they spoke already, don't interrupt.
         try:
-            db2.close()
+            if user_spoke_once:
+                return
         except Exception:
             pass
 
-async def _maybe_say_concierge_after_greeting():
-    """Speak concierge_text once after greeting, if ready and appropriate."""
-    nonlocal concierge_said, concierge_task, concierge_text
+        # Wait briefly for prefetch to finish (don't stall call start)
+        if concierge_task is not None and not concierge_task.done():
+            max_wait = _concierge_max_wait_ms()
+            if max_wait > 0:
+                try:
+                    await asyncio.wait_for(concierge_task, timeout=max_wait / 1000.0)
+                except Exception:
+                    pass
 
-    if concierge_said or not _concierge_enabled():
-        return
-    # If user spoke during greeting or we captured deferred transcript, skip concierge.
-    if pending_transcript_during_greeting:
-        return
-    # user_spoke_once is set by VAD; if they spoke already, don't interrupt.
-    try:
-        if user_spoke_once:
-            return
-    except Exception:
-        pass
+        # If the prefetch task finished, read the computed text from the task result.
+        if concierge_task is not None and concierge_task.done() and concierge_text is None:
+            with suppress(Exception):
+                concierge_text = concierge_task.result()
 
-    # Wait briefly for prefetch to finish (don't stall call start)
-    if concierge_task is not None and not concierge_task.done():
-        max_wait = _concierge_max_wait_ms()
-        if max_wait > 0:
-            try:
-                await asyncio.wait_for(concierge_task, timeout=max_wait / 1000.0)
-            except Exception:
-                pass
-
-    text = (concierge_text or "").strip()
-    if not text:
-        return
-
-    concierge_said = True
-    try:
-        await create_fsm_spoken_reply(text, reason_tag="concierge")
-    except Exception:
-        logger.exception("CONCIERGE_SPEAK_ERROR")
-
-    # --- Barge-in: local mute only ------------------------------------------
-    async def handle_barge_in():
-        """
-        Cancel the active OpenAI response on barge-in and clear Twilio audio.
-        """
-        nonlocal active_response_id, prebuffer_active
-        nonlocal greeting_audio_protected
-        if greeting_audio_protected:
-            logger.info("BARGE-IN: ignored (greeting protected)")
-            return
-
-        if not barge_in_enabled:
-            logger.info("BARGE-IN: ignored (not yet enabled)")
-            return
-
-        if not assistant_actively_speaking():
-            logger.info("BARGE-IN: assistant not actively speaking; nothing to mute")
-            return
-
-        logger.info(
-            "BARGE-IN: user speech started while AI speaking; canceling active response and clearing audio buffer."
-        )
-
-        # Cancel server-side generation if possible
-        if openai_ws is not None and active_response_id is not None:
-            rid = active_response_id
-            try:
-                await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
-                logger.info("BARGE-IN: Sent response.cancel for %s", rid)
-            except Exception:
-                logger.exception("BARGE-IN: Failed sending response.cancel for %s", rid)
-
-        # Clear local audio immediately
-        await twilio_clear_buffer()
-        audio_buffer.clear()
-
-        # Optionally inform the Realtime conversation that the assistant output was interrupted.
-        # This helps the model avoid "reset" replies when the caller says "continue/go on".
-        if openai_ws is not None and os.getenv("BARGE_IN_CONTEXT_NOTE", "1") == "1":
-            try:
-                await openai_ws.send(json.dumps({
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "system",
-                        "content": [
-                            {"type": "input_text", "text": "Caller barged in. Your previous response audio was interrupted and may not have been heard. Do NOT restart the conversation. If the caller says continue/go on, continue the interrupted thought rather than greeting again."}
-                        ],
-                    },
-                }))
-            except Exception:
-                logger.exception("BARGE_IN_CONTEXT_NOTE send failed (non-fatal)")
-
-
-        # Reset playback state
-        prebuffer_active = True
-        active_response_id = None
-
-    # --- Intent helpers ------------------------------------------------------
-    EMAIL_KEYWORDS_LOCAL = [
-        "email",
-        "emails",
-        "e-mail",
-        "e-mails",
-        "e mail",
-        "e mails",
-        "inbox",
-        "gmail",
-        "g mail",
-        "mailbox",
-        "my mail",
-        "my messages",
-        "unread",
-        "new mail",
-        "new emails",
-        "today's emails",
-        "today emails",
-        "read my email",
-        "read my emails",
-        "check my email",
-        "check my emails",
-        "how many emails",
-        "how many messages",
-        "email today",
-        "emails today",
-        "summary of my email",
-        "summary of my emails",
-        "summary of my e mail",
-        "summary of my e mails",
-    ]
-
-    def looks_like_email_intent(text: str) -> bool:
+        text = (concierge_text or "").strip()
         if not text:
-            return False
-        normalized = _normalize_text(text)
+            return
 
-        for kw in EMAIL_KEYWORDS_LOCAL:
-            if kw in normalized:
+        concierge_said = True
+        try:
+            await create_fsm_spoken_reply(text, reason_tag="concierge")
+        except Exception:
+            logger.exception("CONCIERGE_SPEAK_ERROR")
+
+        # --- Barge-in: local mute only ------------------------------------------
+        async def handle_barge_in():
+            """
+            Cancel the active OpenAI response on barge-in and clear Twilio audio.
+            """
+            nonlocal active_response_id, prebuffer_active
+            nonlocal greeting_audio_protected
+            if greeting_audio_protected:
+                logger.info("BARGE-IN: ignored (greeting protected)")
+                return
+
+            if not barge_in_enabled:
+                logger.info("BARGE-IN: ignored (not yet enabled)")
+                return
+
+            if not assistant_actively_speaking():
+                logger.info("BARGE-IN: assistant not actively speaking; nothing to mute")
+                return
+
+            logger.info(
+                "BARGE-IN: user speech started while AI speaking; canceling active response and clearing audio buffer."
+            )
+
+            # Cancel server-side generation if possible
+            if openai_ws is not None and active_response_id is not None:
+                rid = active_response_id
+                try:
+                    await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
+                    logger.info("BARGE-IN: Sent response.cancel for %s", rid)
+                except Exception:
+                    logger.exception("BARGE-IN: Failed sending response.cancel for %s", rid)
+
+            # Clear local audio immediately
+            await twilio_clear_buffer()
+            audio_buffer.clear()
+
+            # Optionally inform the Realtime conversation that the assistant output was interrupted.
+            # This helps the model avoid "reset" replies when the caller says "continue/go on".
+            if openai_ws is not None and os.getenv("BARGE_IN_CONTEXT_NOTE", "1") == "1":
+                try:
+                    await openai_ws.send(json.dumps({
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "system",
+                            "content": [
+                                {"type": "input_text", "text": "Caller barged in. Your previous response audio was interrupted and may not have been heard. Do NOT restart the conversation. If the caller says continue/go on, continue the interrupted thought rather than greeting again."}
+                            ],
+                        },
+                    }))
+                except Exception:
+                    logger.exception("BARGE_IN_CONTEXT_NOTE send failed (non-fatal)")
+
+
+            # Reset playback state
+            prebuffer_active = True
+            active_response_id = None
+
+        # --- Intent helpers ------------------------------------------------------
+        EMAIL_KEYWORDS_LOCAL = [
+            "email",
+            "emails",
+            "e-mail",
+            "e-mails",
+            "e mail",
+            "e mails",
+            "inbox",
+            "gmail",
+            "g mail",
+            "mailbox",
+            "my mail",
+            "my messages",
+            "unread",
+            "new mail",
+            "new emails",
+            "today's emails",
+            "today emails",
+            "read my email",
+            "read my emails",
+            "check my email",
+            "check my emails",
+            "how many emails",
+            "how many messages",
+            "email today",
+            "emails today",
+            "summary of my email",
+            "summary of my emails",
+            "summary of my e mail",
+            "summary of my e mails",
+        ]
+
+        def looks_like_email_intent(text: str) -> bool:
+            if not text:
+                return False
+            normalized = _normalize_text(text)
+
+            for kw in EMAIL_KEYWORDS_LOCAL:
+                if kw in normalized:
+                    return True
+
+            if "how many" in normalized and ("mail" in normalized or "message" in normalized or "inbox" in normalized):
+                return True
+            if "check my" in normalized and ("inbox" in normalized or "gmail" in normalized or "g mail" in normalized):
+                return True
+            if "read my" in normalized and ("messages" in normalized or "mail" in normalized or "inbox" in normalized):
                 return True
 
-        if "how many" in normalized and ("mail" in normalized or "message" in normalized or "inbox" in normalized):
-            return True
-        if "check my" in normalized and ("inbox" in normalized or "gmail" in normalized or "g mail" in normalized):
-            return True
-        if "read my" in normalized and ("messages" in normalized or "mail" in normalized or "inbox" in normalized):
-            return True
+            return False
 
-        return False
+        # --- FSM router ----------------------------------------------------------
+        async def route_to_fsm_and_get_reply(transcript: str, account_id: str | None = None) -> Optional[str]:
+            try:
+                ctx = {"channel": "phone"}
+                if stream_sid:
+                    ctx["stream_sid"] = stream_sid
+                if call_sid:
+                    ctx["call_sid"] = call_sid
+                if from_number:
+                    ctx["from_number"] = from_number
 
-    # --- FSM router ----------------------------------------------------------
-    async def route_to_fsm_and_get_reply(transcript: str, account_id: str | None = None) -> Optional[str]:
-        try:
-            ctx = {"channel": "phone"}
-            if stream_sid:
-                ctx["stream_sid"] = stream_sid
-            if call_sid:
-                ctx["call_sid"] = call_sid
-            if from_number:
-                ctx["from_number"] = from_number
+                data = await call_fsm_router(transcript, context=ctx, account_id=account_id)
+                if isinstance(data, dict):
+                    # Common patterns we’ve used across codepaths
+                    spoken = (
+                        data.get("spoken_reply")
+                        or (data.get("result") or {}).get("spoken_reply")
+                        or (data.get("skill_result") or {}).get("spoken_reply")
+                    )
+                    if isinstance(spoken, str) and spoken.strip():
+                        return spoken.strip()
+                return None
+            except Exception:
+                logger.exception("FSM_ROUTE_ERROR")
+                return None
 
-            data = await call_fsm_router(transcript, context=ctx, account_id=account_id)
-            if isinstance(data, dict):
-                # Common patterns we’ve used across codepaths
+        async def route_to_fsm_and_get_payload(transcript: str, account_id: str | None = None) -> dict:
+            """Preserve suppress_response so we can avoid generic Realtime fallback on intentional silence."""
+            try:
+                ctx = {"channel": "phone"}
+                if stream_sid:
+                    ctx["stream_sid"] = stream_sid
+                if call_sid:
+                    ctx["call_sid"] = call_sid
+                if from_number:
+                    ctx["from_number"] = from_number
+
+                data = await call_fsm_router(transcript, context=ctx, account_id=account_id)
+                if not isinstance(data, dict):
+                    return {"spoken_reply": None, "suppress_response": False}
+
                 spoken = (
                     data.get("spoken_reply")
                     or (data.get("result") or {}).get("spoken_reply")
                     or (data.get("skill_result") or {}).get("spoken_reply")
                 )
-                if isinstance(spoken, str) and spoken.strip():
-                    return spoken.strip()
-            return None
-        except Exception:
-            logger.exception("FSM_ROUTE_ERROR")
-            return None
+                if isinstance(spoken, str):
+                    spoken = spoken.strip()
+                else:
+                    spoken = None
 
-    async def route_to_fsm_and_get_payload(transcript: str, account_id: str | None = None) -> dict:
-        """Preserve suppress_response so we can avoid generic Realtime fallback on intentional silence."""
-        try:
-            ctx = {"channel": "phone"}
-            if stream_sid:
-                ctx["stream_sid"] = stream_sid
-            if call_sid:
-                ctx["call_sid"] = call_sid
-            if from_number:
-                ctx["from_number"] = from_number
-
-            data = await call_fsm_router(transcript, context=ctx, account_id=account_id)
-            if not isinstance(data, dict):
+                fsm_obj = data.get("fsm") if isinstance(data.get("fsm"), dict) else {}
+                suppress = bool(data.get("suppress_response") or (fsm_obj or {}).get("suppress_response"))
+                return {"spoken_reply": spoken, "suppress_response": suppress}
+            except Exception:
+                logger.exception("FSM_ROUTE_ERROR")
                 return {"spoken_reply": None, "suppress_response": False}
 
-            spoken = (
-                data.get("spoken_reply")
-                or (data.get("result") or {}).get("spoken_reply")
-                or (data.get("skill_result") or {}).get("spoken_reply")
-            )
-            if isinstance(spoken, str):
-                spoken = spoken.strip()
-            else:
-                spoken = None
 
-            fsm_obj = data.get("fsm") if isinstance(data.get("fsm"), dict) else {}
-            suppress = bool(data.get("suppress_response") or (fsm_obj or {}).get("suppress_response"))
-            return {"spoken_reply": spoken, "suppress_response": suppress}
-        except Exception:
-            logger.exception("FSM_ROUTE_ERROR")
-            return {"spoken_reply": None, "suppress_response": False}
-
-
-    # --- Cancel active response & clear audio buffer -------------------------
+        # --- Cancel active response & clear audio buffer -------------------------
     
-    async def _cancel_active_and_clear_buffer(
-        reason: str,
-        *,
-        clear_twilio_playback: bool = False,
-        clear_local_audio_buffer: bool = True,
-    ):
-        """Cancel the active OpenAI response.
+        async def _cancel_active_and_clear_buffer(
+            reason: str,
+            *,
+            clear_twilio_playback: bool = False,
+            clear_local_audio_buffer: bool = True,
+        ):
+            """Cancel the active OpenAI response.
 
-        Critical rule:
-        - If there is NO active_response_id, do NOT clear local buffers or Twilio playback.
-          Clearing local audio_buffer at that point can clip the tail end of the greeting (or any finished response)
-          because Twilio may not have received/sent all frames yet.
-        """
-        nonlocal active_response_id, prebuffer_active
+            Critical rule:
+            - If there is NO active_response_id, do NOT clear local buffers or Twilio playback.
+              Clearing local audio_buffer at that point can clip the tail end of the greeting (or any finished response)
+              because Twilio may not have received/sent all frames yet.
+            """
+            nonlocal active_response_id, prebuffer_active
 
-        if not openai_ws:
-            logger.info("_cancel_active_and_clear_buffer: no openai_ws (reason=%s)", reason)
-            return
+            if not openai_ws:
+                logger.info("_cancel_active_and_clear_buffer: no openai_ws (reason=%s)", reason)
+                return
 
-        if not active_response_id:
-            logger.info("_cancel_active_and_clear_buffer: no active response (reason=%s)", reason)
-            return
+            if not active_response_id:
+                logger.info("_cancel_active_and_clear_buffer: no active response (reason=%s)", reason)
+                return
 
-        rid = active_response_id
-        logger.info("Sent response.cancel for %s due to %s", rid, reason)
+            rid = active_response_id
+            logger.info("Sent response.cancel for %s due to %s", rid, reason)
 
-        try:
-            await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
-        except Exception:
-            logger.exception("Error sending response.cancel for %s", rid)
+            try:
+                await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
+            except Exception:
+                logger.exception("Error sending response.cancel for %s", rid)
 
-        active_response_id = None
+            active_response_id = None
 
-        if clear_twilio_playback:
-            await twilio_clear_buffer()
+            if clear_twilio_playback:
+                await twilio_clear_buffer()
 
-        if clear_local_audio_buffer:
-            audio_buffer.clear()
+            if clear_local_audio_buffer:
+                audio_buffer.clear()
 
-        prebuffer_active = True
-
-
-# --- Create responses ----------------------------------------------------
-    async def create_generic_response():
-        await _cancel_active_and_clear_buffer("create_generic_response")
-        await openai_ws.send(json.dumps({"type": "response.create"}))
-        logger.info("Sent generic response.create for chit-chat turn")
-
-    async def create_fsm_spoken_reply(spoken_reply: str, *, clear_playback: bool = True, reason_tag: str = "fsm_spoken_reply", verbatim: bool = False):
-        if not spoken_reply:
-            # IMPORTANT: empty spoken reply should be true silence.
-            # Do NOT fall back to generic response.create here.
-            logger.info("create_fsm_spoken_reply called with empty spoken_reply -> SILENCE")
-            return
+            prebuffer_active = True
 
 
-        # Cancellation handled in send-path selection (controller vs legacy)
+    # --- Create responses ----------------------------------------------------
+        async def create_generic_response():
+            await _cancel_active_and_clear_buffer("create_generic_response")
+            await openai_ws.send(json.dumps({"type": "response.create"}))
+            logger.info("Sent generic response.create for chit-chat turn")
 
-        instructions = ""
-        if verbatim:
-            instructions = (
-                "You are Vozlia on a live phone call. This response was auto-executed after the greeting.\n"
-                "Speak the following text exactly as written.\n\n"
-                f"\"{spoken_reply}\"\n\n"
-                "Rules (STRICT):\n"
-                "- Start immediately with the text; do NOT add any preface like 'Sure', 'Okay', 'Of course', 'No problem', etc.\n"
-                "- Do NOT add any extra words before or after the text.\n"
-                "- Do NOT rephrase or paraphrase.\n"
-                "- Do NOT mention tools, security, privacy, or inability to access email.\n"
-            )
-        else:
-            instructions = (
-                "You are on a live phone call as Vozlia.\n"
-                "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
-                "Here is the summary you must speak to the caller:\n"
-                f"\"{spoken_reply}\"\n\n"
-                "For THIS response only:\n"
-                "- Say this summary naturally.\n"
-                "- Do NOT begin with acknowledgements like 'Sure', 'Okay', or 'Of course'.\n"
-                "- You MAY lightly rephrase for flow, but keep all important facts.\n"
-                "- DO NOT mention tools, security, privacy, or inability to access email.\n"
-                "- DO NOT apologize or refuse.\n"
-            )
+        async def create_fsm_spoken_reply(spoken_reply: str, *, clear_playback: bool = True, reason_tag: str = "fsm_spoken_reply", verbatim: bool = False):
+            if not spoken_reply:
+                # IMPORTANT: empty spoken reply should be true silence.
+                # Do NOT fall back to generic response.create here.
+                logger.info("create_fsm_spoken_reply called with empty spoken_reply -> SILENCE")
+                return
 
-        # Step 3: tool/FSM speech cutover (controller owns response.create) behind flag.
-        tool_only = os.getenv("SPEECH_CONTROLLER_TOOL_ONLY", "0") == "1"
-        use_ctrl = (speech_ctrl is not None and getattr(speech_ctrl, "enabled", False) and tool_only)
 
-        logger.info(
-            "FSM_SPEECH_SEND_PATH use_ctrl=%s tool_only=%s ctrl_enabled=%s",
-            use_ctrl,
-            tool_only,
-            (getattr(speech_ctrl, "enabled", None) if speech_ctrl is not None else None),
-        )
+            # Cancellation handled in send-path selection (controller vs legacy)
 
-        if use_ctrl:
-            # Preserve existing behavior: cancel any active response first (same as legacy path).
-            if clear_playback:
-                await _cancel_active_and_clear_buffer(
-                    "create_fsm_spoken_reply_ctrl", clear_twilio_playback=False, clear_local_audio_buffer=True
+            instructions = ""
+            if verbatim:
+                instructions = (
+                    "You are Vozlia on a live phone call. This response was auto-executed after the greeting.\n"
+                    "Speak the following text exactly as written.\n\n"
+                    f"\"{spoken_reply}\"\n\n"
+                    "Rules (STRICT):\n"
+                    "- Start immediately with the text; do NOT add any preface like 'Sure', 'Okay', 'Of course', 'No problem', etc.\n"
+                    "- Do NOT add any extra words before or after the text.\n"
+                    "- Do NOT rephrase or paraphrase.\n"
+                    "- Do NOT mention tools, security, privacy, or inability to access email.\n"
+                )
+            else:
+                instructions = (
+                    "You are on a live phone call as Vozlia.\n"
+                    "The secure backend has already checked the caller's email account and produced a short summary.\n\n"
+                    "Here is the summary you must speak to the caller:\n"
+                    f"\"{spoken_reply}\"\n\n"
+                    "For THIS response only:\n"
+                    "- Say this summary naturally.\n"
+                    "- Do NOT begin with acknowledgements like 'Sure', 'Okay', or 'Of course'.\n"
+                    "- You MAY lightly rephrase for flow, but keep all important facts.\n"
+                    "- DO NOT mention tools, security, privacy, or inability to access email.\n"
+                    "- DO NOT apologize or refuse.\n"
                 )
 
-            tenant_id = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
-            ctx = ExecutionContext(
-                tenant_id=str(tenant_id),
-                call_sid=call_sid,
-                session_id=stream_sid,
-                skill_key="fsm",
-            )
+            # Step 3: tool/FSM speech cutover (controller owns response.create) behind flag.
+            tool_only = os.getenv("SPEECH_CONTROLLER_TOOL_ONLY", "0") == "1"
+            use_ctrl = (speech_ctrl is not None and getattr(speech_ctrl, "enabled", False) and tool_only)
 
-            req = SpeechRequest(
-                text=spoken_reply,
-                reason=reason_tag,
-                ctx=ctx,
-                instructions_override=instructions,  # preserve legacy scaffolding
-                content_text_override=spoken_reply,
-            )
-            try:
-                ok = await speech_ctrl.enqueue(req)
-            except Exception:
-                logger.exception("FSM_SPEECH_CONTROLLER_ENQUEUE_EXCEPTION")
-                ok = False
-
-            if ok:
-                logger.info("FSM_SPEECH_CONTROLLER_ENQUEUED trace_id=%s reason=%s", req.trace_id, req.reason)
-                return
-            logger.warning("FSM_SPEECH_CONTROLLER_FALLBACK_LEGACY")
-
-        # Legacy path (unchanged)
-        if clear_playback:
-            await _cancel_active_and_clear_buffer(
-                "create_fsm_spoken_reply", clear_twilio_playback=False, clear_local_audio_buffer=True
-            )
-        else:
-            logger.info("SPEAK_NO_CLEAR len=%d", len(spoken_reply))
-
-        await openai_ws.send(
-            json.dumps(
-                {
-                    "type": "response.create",
-                    "response": {"instructions": instructions},
-                }
-            )
-        )
-        logger.info("Sent FSM-driven spoken reply into Realtime session")
-
-    # --- Transcript handling -------------------------------------------------
-    async def handle_transcript_event(event: dict):
-        transcript: str = (event.get("transcript") or "").strip()
-        if not transcript:
-            return
-
-        await _cancel_backchannel("new_transcript")
-
-        if event.get("_await_more_flush"):
-            logger.info("USER Transcript merged (await_more_flush): %r", transcript)
-        else:
-            logger.info("USER Transcript completed: %r", transcript)
-
-
-        # Greeting protection: never let early caller speech cancel/clip the greeting.
-        nonlocal pending_transcript_during_greeting
-        if greeting_audio_protected:
-            pending_transcript_during_greeting = transcript
-            logger.info("DEFER_TRANSCRIPT_DURING_GREETING: %r", transcript)
-            return
-
-        # If we're currently holding the floor (await_more), treat any new completed transcript
-        # as a continuation fragment and extend the flush timer (unless we're resolving a discovery offer).
-        nonlocal pending_discovery_skill_id, pending_discovery_trigger_text
-        nonlocal await_more_task, await_more_text, await_more_current_ms, await_more_rounds
-        if await_more_task is not None and (pending_discovery_skill_id is None):
-            await_more_text = (await_more_text + " " + transcript).strip() if await_more_text else transcript
-            ms = await_more_current_ms or int(os.getenv("VOICE_AWAIT_MORE_DEFAULT_MS", "1200") or 1200)
-            await _schedule_await_more_flush(ms=ms, reason="continuation_fragment")
-            logger.info("VOICE_AWAIT_MORE_APPEND merged_len=%d", len(await_more_text))
-            return
-
-
-        # Resolve a pending discovery offer (Add-to-greeting) deterministically.
-        if pending_discovery_skill_id:
-            norm = _normalize_text(transcript)
-            first = norm.split(" ", 1)[0] if norm else ""
-
-            is_yes = (norm in AFFIRMATIVE_WORDS) or (first in AFFIRMATIVE_PREFIXES)
-            is_no = (norm in NEGATIVE_WORDS) or (first in NEGATIVE_PREFIXES)
-
-            if is_yes:
-                sid = pending_discovery_skill_id
-                trig = pending_discovery_trigger_text or sid.replace("_", " ")
-                pending_discovery_skill_id = None
-                pending_discovery_trigger_text = ""
-                logger.info("DISCOVERY_OFFER_ACCEPTED skill_id=%s trigger=%r", sid, trig)
-
-                spoken_reply = await route_to_fsm_and_get_reply(trig, account_id=default_gmail_account_id if sid == "gmail_summary" else None)
-                if spoken_reply:
-                    await create_fsm_spoken_reply(spoken_reply, clear_playback=False)
-                else:
-                    await create_generic_response()
-                return
-
-            if is_no:
-                sid = pending_discovery_skill_id
-                pending_discovery_skill_id = None
-                pending_discovery_trigger_text = ""
-                logger.info("DISCOVERY_OFFER_DECLINED skill_id=%s", sid)
-                await create_fsm_spoken_reply("No problem. What can I help you with today?", clear_playback=False)
-                return
-
-            logger.info("DISCOVERY_OFFER_UNCLEAR clearing pending offer; user said: %r", transcript)
-            pending_discovery_skill_id = None
-            pending_discovery_trigger_text = ""
-
-
-        is_email = looks_like_email_intent(transcript)
-        feature = "email" if is_email else "chitchat"
-        style = get_style_for_feature(feature)
-
-        if not should_reply(transcript, style, is_skill_intent=is_email):
-            logger.info("Ignoring transcript (style=%s feature=%s): %r", style, feature, transcript)
-            return
-
-        # Optional: skill-gated routing
-        if SKILL_GATED_ROUTING and not is_email:
             logger.info(
-                "Skill-gated routing: bypassing /assistant/route for non-email utterance: %r",
-                transcript,
+                "FSM_SPEECH_SEND_PATH use_ctrl=%s tool_only=%s ctrl_enabled=%s",
+                use_ctrl,
+                tool_only,
+                (getattr(speech_ctrl, "enabled", None) if speech_ctrl is not None else None),
             )
-            await create_generic_response()
-            return
 
-        fsm_payload = await route_to_fsm_and_get_payload(transcript)
-        spoken_reply = fsm_payload.get("spoken_reply") if isinstance(fsm_payload, dict) else None
-        suppress = bool(fsm_payload.get("suppress_response")) if isinstance(fsm_payload, dict) else False
+            if use_ctrl:
+                # Preserve existing behavior: cancel any active response first (same as legacy path).
+                if clear_playback:
+                    await _cancel_active_and_clear_buffer(
+                        "create_fsm_spoken_reply_ctrl", clear_twilio_playback=False, clear_local_audio_buffer=True
+                    )
 
-        if spoken_reply:
-            await _cancel_backchannel("spoken_reply")
-            await create_fsm_spoken_reply(spoken_reply)
-        else:
-            if suppress and (os.getenv("VOICE_SKIP_GENERIC_ON_SUPPRESS", "1").strip().lower() in ("1","true","yes","on")):
-                logger.info("VOICE_SUPPRESS_GENERIC_RESPONSE call_sid=%s", call_sid)
-                # Schedule a short acknowledgment so the caller doesn't feel dropped.
+                tenant_id = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
+                ctx = ExecutionContext(
+                    tenant_id=str(tenant_id),
+                    call_sid=call_sid,
+                    session_id=stream_sid,
+                    skill_key="fsm",
+                )
+
+                req = SpeechRequest(
+                    text=spoken_reply,
+                    reason=reason_tag,
+                    ctx=ctx,
+                    instructions_override=instructions,  # preserve legacy scaffolding
+                    content_text_override=spoken_reply,
+                )
                 try:
-                    fsm_obj = (fsm_payload.get("fsm") if isinstance(fsm_payload, dict) else None) or {}
-                    intent = fsm_obj.get("intent") or (fsm_payload.get("intent") if isinstance(fsm_payload, dict) else None)
+                    ok = await speech_ctrl.enqueue(req)
                 except Exception:
-                    intent = None
-                await _schedule_backchannel(intent=intent, reason="suppress_response")
-                await _cancel_await_more("suppress_response")
+                    logger.exception("FSM_SPEECH_CONTROLLER_ENQUEUE_EXCEPTION")
+                    ok = False
+
+                if ok:
+                    logger.info("FSM_SPEECH_CONTROLLER_ENQUEUED trace_id=%s reason=%s", req.trace_id, req.reason)
+                    return
+                logger.warning("FSM_SPEECH_CONTROLLER_FALLBACK_LEGACY")
+
+            # Legacy path (unchanged)
+            if clear_playback:
+                await _cancel_active_and_clear_buffer(
+                    "create_fsm_spoken_reply", clear_twilio_playback=False, clear_local_audio_buffer=True
+                )
+            else:
+                logger.info("SPEAK_NO_CLEAR len=%d", len(spoken_reply))
+
+            await openai_ws.send(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "response": {"instructions": instructions},
+                    }
+                )
+            )
+            logger.info("Sent FSM-driven spoken reply into Realtime session")
+
+        # --- Transcript handling -------------------------------------------------
+        async def handle_transcript_event(event: dict):
+            transcript: str = (event.get("transcript") or "").strip()
+            if not transcript:
                 return
-            await _cancel_backchannel("generic_fallback")
-            await create_generic_response()
+
+            await _cancel_backchannel("new_transcript")
+
+            if event.get("_await_more_flush"):
+                logger.info("USER Transcript merged (await_more_flush): %r", transcript)
+            else:
+                logger.info("USER Transcript completed: %r", transcript)
 
 
-    # --- Logging helpers -----------------------------------------------------
-    def _log_realtime_audio_transcript_delta(event: dict):
-        delta = event.get("delta")
-        if isinstance(delta, str) and delta.strip():
-            logger.info("Realtime assistant said (delta): %r", delta)
-
-    def _log_realtime_text_delta(event: dict):
-        delta = event.get("delta")
-        if isinstance(delta, dict):
-            txt = delta.get("text")
-            if isinstance(txt, str) and txt.strip():
-                logger.info("Realtime text delta: %r", txt)
+            # Greeting protection: never let early caller speech cancel/clip the greeting.
+            nonlocal pending_transcript_during_greeting
+            if greeting_audio_protected:
+                pending_transcript_during_greeting = transcript
+                logger.info("DEFER_TRANSCRIPT_DURING_GREETING: %r", transcript)
                 return
-        txt2 = event.get("text")
-        if isinstance(txt2, str) and txt2.strip():
-            logger.info("Realtime text delta: %r", txt2)
-            return
-        resp = event.get("response") or {}
-        if isinstance(resp, dict):
-            out = resp.get("output_text") or resp.get("text")
-            if isinstance(out, str) and out.strip():
-                logger.info("Realtime text delta: %r", out)
 
-    # --- OpenAI event loop ---------------------------------------------------
-    async def openai_loop():
-        nonlocal active_response_id, barge_in_enabled, user_speaking_vad, transcript_action_task, prebuffer_active
-        nonlocal initial_greeting_pending, greeting_response_id, auto_exec_fired, user_spoke_once, greeting_audio_protected, greeting_drain_task
-
-        try:
-            async for raw in openai_ws:
-                event = json.loads(raw)
-                # SpeechOutputController (Step 2): observe Realtime lifecycle events (shadow mode)
-                if speech_ctrl is not None:
-                    try:
-                        speech_ctrl.on_realtime_event(event)
-                    except Exception:
-                        logger.exception("SPEECH_CTRL_EVENT_INGEST_ERROR")
-
-                etype = event.get("type")
-
-                if REALTIME_LOG_ALL_EVENTS:
-                    logger.info("Realtime event: type=%s keys=%s", etype, list(event.keys()))
-
-                if etype == "response.created":
-                    resp = event.get("response", {}) or {}
-                    rid = resp.get("id")
-                    if rid:
-                        active_response_id = rid
-                        logger.info("Tracking allowed response_id: %s", rid)
-                        # Capture the initial greeting response id (first response created after connect)
-                        if initial_greeting_pending and greeting_response_id is None:
-                            greeting_response_id = rid
-                            initial_greeting_pending = False
-                            logger.info("Greeting response_id captured: %s", greeting_response_id)
-
-                elif etype in ("response.done", "response.completed", "response.failed", "response.canceled"):
-                    resp = event.get("response", {}) or {}
-                    rid = resp.get("id")
-                    if active_response_id is not None and rid == active_response_id:
-                        logger.info("Response %s finished with event '%s'; clearing active_response_id", rid, etype)
-                        active_response_id = None
-                        prebuffer_active = True
+            # If we're currently holding the floor (await_more), treat any new completed transcript
+            # as a continuation fragment and extend the flush timer (unless we're resolving a discovery offer).
+            nonlocal pending_discovery_skill_id, pending_discovery_trigger_text
+            nonlocal await_more_task, await_more_text, await_more_current_ms, await_more_rounds
+            if await_more_task is not None and (pending_discovery_skill_id is None):
+                await_more_text = (await_more_text + " " + transcript).strip() if await_more_text else transcript
+                ms = await_more_current_ms or int(os.getenv("VOICE_AWAIT_MORE_DEFAULT_MS", "1200") or 1200)
+                await _schedule_await_more_flush(ms=ms, reason="continuation_fragment")
+                logger.info("VOICE_AWAIT_MORE_APPEND merged_len=%d", len(await_more_text))
+                return
 
 
-                        # Greeting protection: don't allow barge-in or user transcripts to cancel/clip
-                        # the opening greeting. We keep a lock until the outbound Twilio audio buffer drains.
-                        if greeting_response_id and rid == greeting_response_id and greeting_audio_protected:
-                            if greeting_drain_task is None or greeting_drain_task.done():
-                                greeting_drain_task = asyncio.create_task(_after_greeting_drain())
-                                logger.info("GREETING_PROTECT: drain task scheduled")
+            # Resolve a pending discovery offer (Add-to-greeting) deterministically.
+            if pending_discovery_skill_id:
+                norm = _normalize_text(transcript)
+                first = norm.split(" ", 1)[0] if norm else ""
 
-                        # Auto-execute a configured skill after the greeting finishes (once per call).
-                        if (
-                            (not auto_exec_fired)
-                            and auto_execute_skill_id
-                            and greeting_response_id
-                            and rid == greeting_response_id
-                            and (not user_spoke_once)
-                        ):
-                            auto_exec_fired = True
-                            logger.info("AUTO_EXECUTE_AFTER_GREETING skill_id=%s", auto_execute_skill_id)
+                is_yes = (norm in AFFIRMATIVE_WORDS) or (first in AFFIRMATIVE_PREFIXES)
+                is_no = (norm in NEGATIVE_WORDS) or (first in NEGATIVE_PREFIXES)
 
-                            async def _auto_exec():
-                                try:
-                                    ctx = {"channel": "phone", "auto_execute": True, "forced_skill_id": auto_execute_skill_id}
-                                    if stream_sid:
-                                        ctx["stream_sid"] = stream_sid
-                                    if call_sid:
-                                        ctx["call_sid"] = call_sid
-                                    if from_number:
-                                        ctx["from_number"] = from_number
+                if is_yes:
+                    sid = pending_discovery_skill_id
+                    trig = pending_discovery_trigger_text or sid.replace("_", " ")
+                    pending_discovery_skill_id = None
+                    pending_discovery_trigger_text = ""
+                    logger.info("DISCOVERY_OFFER_ACCEPTED skill_id=%s trigger=%r", sid, trig)
 
-                                    data = await call_fsm_router((auto_execute_trigger_text or ""), context=ctx, account_id=(default_gmail_account_id if auto_execute_skill_id == "gmail_summary" else None))
-                                    spoken = None
-                                    if isinstance(data, dict):
-                                        spoken = (
-                                            data.get("spoken_reply")
-                                            or (data.get("result") or {}).get("spoken_reply")
-                                            or (data.get("skill_result") or {}).get("spoken_reply")
-                                        )
-                                    if isinstance(spoken, str) and spoken.strip():
-                                        # Use the existing "backend-produced speech" path
-                                        # Wait for any remaining greeting audio to finish sending before
-                                        # enqueuing the auto-exec reply (create_fsm_spoken_reply clears the buffer).
-                                        timeout_s = float(os.getenv("AUTO_EXEC_POST_GREETING_DRAIN_TIMEOUT_S", "2.5"))
-                                        grace_ms = float(os.getenv("POST_GREETING_GRACE_MS", "150") or 150)
-                                        await _wait_for_audio_drain("auto_exec_after_greeting", timeout_s=timeout_s, target_bytes=0, grace_ms=grace_ms)
-                                        clean = _strip_ack_preamble(spoken.strip())
-                                        await create_fsm_spoken_reply(clean, clear_playback=False, reason_tag="auto_exec_after_greeting", verbatim=True)
-                                    else:
-                                        logger.warning("AUTO_EXECUTE_AFTER_GREETING produced no spoken_reply")
-                                except Exception:
-                                    logger.exception("AUTO_EXECUTE_AFTER_GREETING failed")
-
-                            asyncio.create_task(_auto_exec())
-
-                    if not barge_in_enabled:
-                        barge_in_enabled = True
-                        logger.info("First response finished (event=%s, id=%s); barge-in is now ENABLED.", etype, rid)
-
-                elif etype == "response.audio_transcript.delta":
-                    if REALTIME_LOG_TEXT:
-                        _log_realtime_audio_transcript_delta(event)
-
-                elif etype == "response.audio_transcript.done":
-                    if REALTIME_LOG_TEXT:
-                        transcript = event.get("transcript")
-                        if transcript:
-                            logger.info("Realtime assistant said (final): %r", transcript)
-
-                elif etype in ("response.output_text.delta", "response.text.delta", "response.output_text"):
-                    if REALTIME_LOG_TEXT:
-                        _log_realtime_text_delta(event)
-
-                elif etype in ("response.output_text.done", "response.text.done"):
-                    if REALTIME_LOG_TEXT:
-                        logger.info("Realtime text done")
-
-                elif etype == "response.audio.delta":
-                    resp_id = event.get("response_id")
-                    delta_b64 = event.get("delta")
-
-                    # Pattern 1: ONLY accept audio for the active_response_id
-                    if resp_id != active_response_id:
-                        logger.info(
-                            "Dropping unsolicited audio for response_id=%s (active=%s)",
-                            resp_id,
-                            active_response_id,
-                        )
-                        continue
-
-                    if not delta_b64:
-                        continue
-
-                    try:
-                        delta_bytes = base64.b64decode(delta_b64)
-                    except Exception:
-                        logger.exception("Failed to decode response.audio.delta")
-                        continue
-
-                    audio_buffer.extend(delta_bytes)
-
-                elif etype == "input_audio_buffer.speech_started":
-                    user_speaking_vad = True
-                    logger.info("OpenAI VAD: user speech START")
-                    if not user_spoke_once:
-                        user_spoke_once = True
-                    if assistant_actively_speaking():
-                        await handle_barge_in()
-
-                elif etype == "input_audio_buffer.speech_stopped":
-                    user_speaking_vad = False
-                    logger.info("OpenAI VAD: user speech STOP")
-
-                elif etype == "conversation.item.input_audio_transcription.completed":
-                    if transcript_action_task and not transcript_action_task.done():
-                        transcript_action_task.cancel()
-                    transcript_action_task = asyncio.create_task(handle_transcript_event(event))
-
-                elif etype == "error":
-                    err = (event.get("error") or {})
-                    code = err.get("code")
-                    if code == "response_cancel_not_active":
-                        logger.info("OpenAI cancel race (expected): %s", event)
-                    elif code == "session_expired":
-                        # Realtime sessions have a max lifetime; treat as recoverable.
-                        logger.error("speech_ctrl_REALTIME_ERROR code=session_expired message=%s", err.get("message"))
-                        # Break out so the outer logic can close/reconnect cleanly.
-                        try:
-                            await openai_ws.close()
-                        except Exception:
-                            pass
-                        break
+                    spoken_reply = await route_to_fsm_and_get_reply(trig, account_id=default_gmail_account_id if sid == "gmail_summary" else None)
+                    if spoken_reply:
+                        await create_fsm_spoken_reply(spoken_reply, clear_playback=False)
                     else:
-                        logger.error("OpenAI error event: %s", event)
-                        # Attach last tool payload trace (if controller is wired) for immediate diagnosis.
-                        if speech_ctrl is not None:
-                            try:
-                                dbg = speech_ctrl.get_last_tool_payload_debug()
-                                logger.error("SPEECH_CTRL_LAST_TOOL_PAYLOAD_ON_ERROR %s", dbg)
-                            except Exception:
-                                logger.exception("SPEECH_CTRL_LAST_TOOL_PAYLOAD_ON_ERROR_FAILED")
+                        await create_generic_response()
+                    return
 
-        except websockets.ConnectionClosed:
-            logger.info("OpenAI Realtime WebSocket closed")
-        except Exception:
-            logger.exception("Error in OpenAI event loop")
+                if is_no:
+                    sid = pending_discovery_skill_id
+                    pending_discovery_skill_id = None
+                    pending_discovery_trigger_text = ""
+                    logger.info("DISCOVERY_OFFER_DECLINED skill_id=%s", sid)
+                    await create_fsm_spoken_reply("No problem. What can I help you with today?", clear_playback=False)
+                    return
 
-    # --- Twilio event loop ---------------------------------------------------
-    async def twilio_loop():
-        nonlocal stream_sid, call_sid, from_number, prebuffer_active, twilio_ws_closed
+                logger.info("DISCOVERY_OFFER_UNCLEAR clearing pending offer; user said: %r", transcript)
+                pending_discovery_skill_id = None
+                pending_discovery_trigger_text = ""
 
-        try:
-            async for msg in websocket.iter_text():
-                try:
-                    data = json.loads(msg)
-                except json.JSONDecodeError:
-                    logger.warning("Non-JSON frame from Twilio: %r", msg)
-                    continue
 
-                event_type = data.get("event")
+            is_email = looks_like_email_intent(transcript)
+            feature = "email" if is_email else "chitchat"
+            style = get_style_for_feature(feature)
 
-                if event_type == "connected":
-                    logger.info("Twilio stream event: connected")
-                    logger.info("Twilio reports call connected")
+            if not should_reply(transcript, style, is_skill_intent=is_email):
+                logger.info("Ignoring transcript (style=%s feature=%s): %r", style, feature, transcript)
+                return
 
-                elif event_type == "start":
-                    start = data.get("start", {})
-                    stream_sid = start.get("streamSid")
-                    call_sid = start.get("callSid") or start.get("call_sid")
-                    custom = start.get("customParameters") or {}
-                    from_number = custom.get("from") or custom.get("From") or start.get("from") or start.get("From")
-                    logger.info("Stream start call_sid=%s from_number=%s", call_sid, from_number)
+            # Optional: skill-gated routing
+            if SKILL_GATED_ROUTING and not is_email:
+                logger.info(
+                    "Skill-gated routing: bypassing /assistant/route for non-email utterance: %r",
+                    transcript,
+                )
+                await create_generic_response()
+                return
 
-                    # Concierge prefetch (async DB lookup, never blocks audio).
-                    if _concierge_enabled() and concierge_task is None and from_number:
+            fsm_payload = await route_to_fsm_and_get_payload(transcript)
+            spoken_reply = fsm_payload.get("spoken_reply") if isinstance(fsm_payload, dict) else None
+            suppress = bool(fsm_payload.get("suppress_response")) if isinstance(fsm_payload, dict) else False
+
+            if spoken_reply:
+                await _cancel_backchannel("spoken_reply")
+                await create_fsm_spoken_reply(spoken_reply)
+            else:
+                if suppress and (os.getenv("VOICE_SKIP_GENERIC_ON_SUPPRESS", "1").strip().lower() in ("1","true","yes","on")):
+                    logger.info("VOICE_SUPPRESS_GENERIC_RESPONSE call_sid=%s", call_sid)
+                    # Schedule a short acknowledgment so the caller doesn't feel dropped.
+                    try:
+                        fsm_obj = (fsm_payload.get("fsm") if isinstance(fsm_payload, dict) else None) or {}
+                        intent = fsm_obj.get("intent") or (fsm_payload.get("intent") if isinstance(fsm_payload, dict) else None)
+                    except Exception:
+                        intent = None
+                    await _schedule_backchannel(intent=intent, reason="suppress_response")
+                    await _cancel_await_more("suppress_response")
+                    return
+                await _cancel_backchannel("generic_fallback")
+                await create_generic_response()
+
+
+        # --- Logging helpers -----------------------------------------------------
+        def _log_realtime_audio_transcript_delta(event: dict):
+            delta = event.get("delta")
+            if isinstance(delta, str) and delta.strip():
+                logger.info("Realtime assistant said (delta): %r", delta)
+
+        def _log_realtime_text_delta(event: dict):
+            delta = event.get("delta")
+            if isinstance(delta, dict):
+                txt = delta.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    logger.info("Realtime text delta: %r", txt)
+                    return
+            txt2 = event.get("text")
+            if isinstance(txt2, str) and txt2.strip():
+                logger.info("Realtime text delta: %r", txt2)
+                return
+            resp = event.get("response") or {}
+            if isinstance(resp, dict):
+                out = resp.get("output_text") or resp.get("text")
+                if isinstance(out, str) and out.strip():
+                    logger.info("Realtime text delta: %r", out)
+
+        # --- OpenAI event loop ---------------------------------------------------
+        async def openai_loop():
+            nonlocal active_response_id, barge_in_enabled, user_speaking_vad, transcript_action_task, prebuffer_active
+            nonlocal initial_greeting_pending, greeting_response_id, auto_exec_fired, user_spoke_once, greeting_audio_protected, greeting_drain_task
+
+            try:
+                async for raw in openai_ws:
+                    event = json.loads(raw)
+                    # SpeechOutputController (Step 2): observe Realtime lifecycle events (shadow mode)
+                    if speech_ctrl is not None:
                         try:
-                            tenant_uuid = getattr(user, "tenant_id", None)
+                            speech_ctrl.on_realtime_event(event)
                         except Exception:
-                            tenant_uuid = None
-                        concierge_task = asyncio.create_task(
-                            _prefetch_concierge_text(
-                                tenant_id=tenant_uuid,
-                                caller_id=str(from_number),
-                                current_call_sid=call_sid,
+                            logger.exception("SPEECH_CTRL_EVENT_INGEST_ERROR")
+
+                    etype = event.get("type")
+
+                    if REALTIME_LOG_ALL_EVENTS:
+                        logger.info("Realtime event: type=%s keys=%s", etype, list(event.keys()))
+
+                    if etype == "response.created":
+                        resp = event.get("response", {}) or {}
+                        rid = resp.get("id")
+                        if rid:
+                            active_response_id = rid
+                            logger.info("Tracking allowed response_id: %s", rid)
+                            # Capture the initial greeting response id (first response created after connect)
+                            if initial_greeting_pending and greeting_response_id is None:
+                                greeting_response_id = rid
+                                initial_greeting_pending = False
+                                logger.info("Greeting response_id captured: %s", greeting_response_id)
+
+                    elif etype in ("response.done", "response.completed", "response.failed", "response.canceled"):
+                        resp = event.get("response", {}) or {}
+                        rid = resp.get("id")
+                        if active_response_id is not None and rid == active_response_id:
+                            logger.info("Response %s finished with event '%s'; clearing active_response_id", rid, etype)
+                            active_response_id = None
+                            prebuffer_active = True
+
+
+                            # Greeting protection: don't allow barge-in or user transcripts to cancel/clip
+                            # the opening greeting. We keep a lock until the outbound Twilio audio buffer drains.
+                            if greeting_response_id and rid == greeting_response_id and greeting_audio_protected:
+                                if greeting_drain_task is None or greeting_drain_task.done():
+                                    greeting_drain_task = asyncio.create_task(_after_greeting_drain())
+                                    logger.info("GREETING_PROTECT: drain task scheduled")
+
+                            # Auto-execute a configured skill after the greeting finishes (once per call).
+                            if (
+                                (not auto_exec_fired)
+                                and auto_execute_skill_id
+                                and greeting_response_id
+                                and rid == greeting_response_id
+                                and (not user_spoke_once)
+                            ):
+                                auto_exec_fired = True
+                                logger.info("AUTO_EXECUTE_AFTER_GREETING skill_id=%s", auto_execute_skill_id)
+
+                                async def _auto_exec():
+                                    try:
+                                        ctx = {"channel": "phone", "auto_execute": True, "forced_skill_id": auto_execute_skill_id}
+                                        if stream_sid:
+                                            ctx["stream_sid"] = stream_sid
+                                        if call_sid:
+                                            ctx["call_sid"] = call_sid
+                                        if from_number:
+                                            ctx["from_number"] = from_number
+
+                                        data = await call_fsm_router((auto_execute_trigger_text or ""), context=ctx, account_id=(default_gmail_account_id if auto_execute_skill_id == "gmail_summary" else None))
+                                        spoken = None
+                                        if isinstance(data, dict):
+                                            spoken = (
+                                                data.get("spoken_reply")
+                                                or (data.get("result") or {}).get("spoken_reply")
+                                                or (data.get("skill_result") or {}).get("spoken_reply")
+                                            )
+                                        if isinstance(spoken, str) and spoken.strip():
+                                            # Use the existing "backend-produced speech" path
+                                            # Wait for any remaining greeting audio to finish sending before
+                                            # enqueuing the auto-exec reply (create_fsm_spoken_reply clears the buffer).
+                                            timeout_s = float(os.getenv("AUTO_EXEC_POST_GREETING_DRAIN_TIMEOUT_S", "2.5"))
+                                            grace_ms = float(os.getenv("POST_GREETING_GRACE_MS", "150") or 150)
+                                            await _wait_for_audio_drain("auto_exec_after_greeting", timeout_s=timeout_s, target_bytes=0, grace_ms=grace_ms)
+                                            clean = _strip_ack_preamble(spoken.strip())
+                                            await create_fsm_spoken_reply(clean, clear_playback=False, reason_tag="auto_exec_after_greeting", verbatim=True)
+                                        else:
+                                            logger.warning("AUTO_EXECUTE_AFTER_GREETING produced no spoken_reply")
+                                    except Exception:
+                                        logger.exception("AUTO_EXECUTE_AFTER_GREETING failed")
+
+                                asyncio.create_task(_auto_exec())
+
+                        if not barge_in_enabled:
+                            barge_in_enabled = True
+                            logger.info("First response finished (event=%s, id=%s); barge-in is now ENABLED.", etype, rid)
+
+                    elif etype == "response.audio_transcript.delta":
+                        if REALTIME_LOG_TEXT:
+                            _log_realtime_audio_transcript_delta(event)
+
+                    elif etype == "response.audio_transcript.done":
+                        if REALTIME_LOG_TEXT:
+                            transcript = event.get("transcript")
+                            if transcript:
+                                logger.info("Realtime assistant said (final): %r", transcript)
+
+                    elif etype in ("response.output_text.delta", "response.text.delta", "response.output_text"):
+                        if REALTIME_LOG_TEXT:
+                            _log_realtime_text_delta(event)
+
+                    elif etype in ("response.output_text.done", "response.text.done"):
+                        if REALTIME_LOG_TEXT:
+                            logger.info("Realtime text done")
+
+                    elif etype == "response.audio.delta":
+                        resp_id = event.get("response_id")
+                        delta_b64 = event.get("delta")
+
+                        # Pattern 1: ONLY accept audio for the active_response_id
+                        if resp_id != active_response_id:
+                            logger.info(
+                                "Dropping unsolicited audio for response_id=%s (active=%s)",
+                                resp_id,
+                                active_response_id,
                             )
-                        )
-                        logger.info("CONCIERGE_PREFETCH_SCHEDULED caller_id=%s", from_number)
+                            continue
 
+                        if not delta_b64:
+                            continue
 
-                    prebuffer_active = True
-                    logger.info("Twilio stream event: start")
-                    logger.info("Stream started: %s", stream_sid)
+                        try:
+                            delta_bytes = base64.b64decode(delta_b64)
+                        except Exception:
+                            logger.exception("Failed to decode response.audio.delta")
+                            continue
 
-                elif event_type == "media":
-                    if not openai_ws:
-                        continue
-                    media = data.get("media", {})
-                    payload = media.get("payload")
-                    if not payload:
-                        continue
+                        audio_buffer.extend(delta_bytes)
 
+                    elif etype == "input_audio_buffer.speech_started":
+                        user_speaking_vad = True
+                        logger.info("OpenAI VAD: user speech START")
+                        if not user_spoke_once:
+                            user_spoke_once = True
+                        if assistant_actively_speaking():
+                            await handle_barge_in()
+
+                    elif etype == "input_audio_buffer.speech_stopped":
+                        user_speaking_vad = False
+                        logger.info("OpenAI VAD: user speech STOP")
+
+                    elif etype == "conversation.item.input_audio_transcription.completed":
+                        if transcript_action_task and not transcript_action_task.done():
+                            transcript_action_task.cancel()
+                        transcript_action_task = asyncio.create_task(handle_transcript_event(event))
+
+                    elif etype == "error":
+                        err = (event.get("error") or {})
+                        code = err.get("code")
+                        if code == "response_cancel_not_active":
+                            logger.info("OpenAI cancel race (expected): %s", event)
+                        elif code == "session_expired":
+                            # Realtime sessions have a max lifetime; treat as recoverable.
+                            logger.error("speech_ctrl_REALTIME_ERROR code=session_expired message=%s", err.get("message"))
+                            # Break out so the outer logic can close/reconnect cleanly.
+                            try:
+                                await openai_ws.close()
+                            except Exception:
+                                pass
+                            break
+                        else:
+                            logger.error("OpenAI error event: %s", event)
+                            # Attach last tool payload trace (if controller is wired) for immediate diagnosis.
+                            if speech_ctrl is not None:
+                                try:
+                                    dbg = speech_ctrl.get_last_tool_payload_debug()
+                                    logger.error("SPEECH_CTRL_LAST_TOOL_PAYLOAD_ON_ERROR %s", dbg)
+                                except Exception:
+                                    logger.exception("SPEECH_CTRL_LAST_TOOL_PAYLOAD_ON_ERROR_FAILED")
+
+            except websockets.ConnectionClosed:
+                logger.info("OpenAI Realtime WebSocket closed")
+            except Exception:
+                logger.exception("Error in OpenAI event loop")
+
+        # --- Twilio event loop ---------------------------------------------------
+        async def twilio_loop():
+            nonlocal stream_sid, call_sid, from_number, prebuffer_active, twilio_ws_closed
+
+            try:
+                async for msg in websocket.iter_text():
                     try:
-                        base64.b64decode(payload)
-                    except Exception:
-                        logger.exception("Failed to base64-decode Twilio payload")
+                        data = json.loads(msg)
+                    except json.JSONDecodeError:
+                        logger.warning("Non-JSON frame from Twilio: %r", msg)
                         continue
 
-                    try:
-                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": payload}))
-                    except Exception:
-                        logger.exception("OpenAI WS send failed while streaming audio; ending call loop")
+                    event_type = data.get("event")
+
+                    if event_type == "connected":
+                        logger.info("Twilio stream event: connected")
+                        logger.info("Twilio reports call connected")
+
+                    elif event_type == "start":
+                        start = data.get("start", {})
+                        stream_sid = start.get("streamSid")
+                        call_sid = start.get("callSid") or start.get("call_sid")
+                        custom = start.get("customParameters") or {}
+                        from_number = custom.get("from") or custom.get("From") or start.get("from") or start.get("From")
+                        logger.info("Stream start call_sid=%s from_number=%s", call_sid, from_number)
+
+                        # Concierge prefetch (async DB lookup, never blocks audio).
+                        if _concierge_enabled() and concierge_task is None and from_number:
+                            try:
+                                tenant_uuid = getattr(user, "tenant_id", None)
+                            except Exception:
+                                tenant_uuid = None
+                            concierge_task = asyncio.create_task(
+                                _prefetch_concierge_text(
+                                    tenant_id=tenant_uuid,
+                                    caller_id=str(from_number),
+                                    current_call_sid=call_sid,
+                                )
+                            )
+                            logger.info("CONCIERGE_PREFETCH_SCHEDULED caller_id=%s", from_number)
+
+
+                        prebuffer_active = True
+                        logger.info("Twilio stream event: start")
+                        logger.info("Stream started: %s", stream_sid)
+
+                    elif event_type == "media":
+                        if not openai_ws:
+                            continue
+                        media = data.get("media", {})
+                        payload = media.get("payload")
+                        if not payload:
+                            continue
+
+                        try:
+                            base64.b64decode(payload)
+                        except Exception:
+                            logger.exception("Failed to base64-decode Twilio payload")
+                            continue
+
+                        try:
+                            await openai_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": payload}))
+                        except Exception:
+                            logger.exception("OpenAI WS send failed while streaming audio; ending call loop")
+                            twilio_ws_closed = True
+                            break
+
+                    elif event_type == "stop":
+                        logger.info("Twilio stream event: stop")
+                        logger.info("Twilio sent stop; closing call.")
                         twilio_ws_closed = True
                         break
 
-                elif event_type == "stop":
-                    logger.info("Twilio stream event: stop")
-                    logger.info("Twilio sent stop; closing call.")
-                    twilio_ws_closed = True
-                    break
-
-        except WebSocketDisconnect:
-            logger.info("Twilio WebSocket disconnected")
-            twilio_ws_closed = True
-        except Exception:
-            logger.exception("Error in Twilio event loop")
+            except WebSocketDisconnect:
+                logger.info("Twilio WebSocket disconnected")
+                twilio_ws_closed = True
+            except Exception:
+                logger.exception("Error in Twilio event loop")
             
 
-    # --- Main orchestration --------------------------------------------------
-    try:
-        initial_greeting_pending = True
-        greeting_response_id: str | None = None
-        auto_exec_fired = False
-        user_spoke_once = False
-        pending_discovery_skill_id: str | None = (
-            discovery_offer_skill_id if (discovery_offer_skill_id and not auto_execute_skill_id) else None
-        )
-        pending_discovery_trigger_text: str = discovery_offer_trigger_text
-        openai_ws = await create_realtime_session(prompt_addendum, agent_greeting)
-        logger.info("connection open")
-
-        # -------------------------------------------------------------------
-        # SpeechOutputController (Step 2): shadow wiring (observe-only by default)
-        # No behavior changes: controller is disabled unless SPEECH_CONTROLLER_ENABLED=1
-        # -------------------------------------------------------------------
-        async def _send_realtime_json(payload: dict):
-            await openai_ws.send(json.dumps(payload))
-
-        speech_ctrl = SpeechOutputController(
-            tenant_defaults_provider=_tenant_policy_provider,
-            send_realtime_json=_send_realtime_json,
-            cancel_active_cb=_cancel_active_and_clear_buffer,
-            clear_audio_buffer_cb=None,
-            name="speech_ctrl",
-        )
-        speech_ctrl.start()
-        logger.info(
-            "SPEECH_CTRL_WIRED enabled=%s shadow=%s fail_open=%s",
-            os.getenv("SPEECH_CONTROLLER_ENABLED", "0"),
-            os.getenv("SPEECH_CONTROLLER_SHADOW", "1"),
-            os.getenv("SPEECH_CONTROLLER_FAILOPEN", "1"),
-        )
-
-
-        # Run both loops, but ensure we ALWAYS exit if either side ends (e.g. Twilio sends stop).
-        # asyncio.gather() can hang if one loop is still awaiting (e.g. OpenAI WS idle) after the other ended.
-        openai_task = asyncio.create_task(openai_loop(), name="openai_loop")
-        twilio_task = asyncio.create_task(twilio_loop(), name="twilio_loop")
-        done, pending = await asyncio.wait({openai_task, twilio_task}, return_when=asyncio.FIRST_COMPLETED)
-
-        # Cancel the remaining loop so we reach cleanup + call summary reliably.
-        for t in pending:
-            t.cancel()
-        with suppress(asyncio.CancelledError):
-            await asyncio.gather(*pending, return_exceptions=True)
-
-        # If the completed task raised, surface it (except cancellation).
-        for t in done:
-            exc = t.exception()
-            if exc is not None and not isinstance(exc, asyncio.CancelledError):
-                raise exc
-
-
-    finally:
+        # --- Main orchestration --------------------------------------------------
         try:
-            if transcript_action_task and not transcript_action_task.done():
-                transcript_action_task.cancel()
-        except Exception:
-            pass
+            initial_greeting_pending = True
+            greeting_response_id: str | None = None
+            auto_exec_fired = False
+            user_spoke_once = False
+            pending_discovery_skill_id: str | None = (
+                discovery_offer_skill_id if (discovery_offer_skill_id and not auto_execute_skill_id) else None
+            )
+            pending_discovery_trigger_text: str = discovery_offer_trigger_text
+            openai_ws = await create_realtime_session(prompt_addendum, agent_greeting)
+            logger.info("connection open")
 
-        try:
-            if speech_ctrl is not None:
-                await speech_ctrl.stop()
-        except Exception:
-            logger.exception("SPEECH_CTRL_STOP_ERROR")
+            # -------------------------------------------------------------------
+            # SpeechOutputController (Step 2): shadow wiring (observe-only by default)
+            # No behavior changes: controller is disabled unless SPEECH_CONTROLLER_ENABLED=1
+            # -------------------------------------------------------------------
+            async def _send_realtime_json(payload: dict):
+                await openai_ws.send(json.dumps(payload))
+
+            speech_ctrl = SpeechOutputController(
+                tenant_defaults_provider=_tenant_policy_provider,
+                send_realtime_json=_send_realtime_json,
+                cancel_active_cb=_cancel_active_and_clear_buffer,
+                clear_audio_buffer_cb=None,
+                name="speech_ctrl",
+            )
+            speech_ctrl.start()
+            logger.info(
+                "SPEECH_CTRL_WIRED enabled=%s shadow=%s fail_open=%s",
+                os.getenv("SPEECH_CONTROLLER_ENABLED", "0"),
+                os.getenv("SPEECH_CONTROLLER_SHADOW", "1"),
+                os.getenv("SPEECH_CONTROLLER_FAILOPEN", "1"),
+            )
 
 
-        try:
-            sender_task.cancel()
+            # Run both loops, but ensure we ALWAYS exit if either side ends (e.g. Twilio sends stop).
+            # asyncio.gather() can hang if one loop is still awaiting (e.g. OpenAI WS idle) after the other ended.
+            openai_task = asyncio.create_task(openai_loop(), name="openai_loop")
+            twilio_task = asyncio.create_task(twilio_loop(), name="twilio_loop")
+            done, pending = await asyncio.wait({openai_task, twilio_task}, return_when=asyncio.FIRST_COMPLETED)
+
+            # Cancel the remaining loop so we reach cleanup + call summary reliably.
+            for t in pending:
+                t.cancel()
             with suppress(asyncio.CancelledError):
-                await sender_task
-        except Exception:
-            pass
+                await asyncio.gather(*pending, return_exceptions=True)
 
-        try:
-            if openai_ws is not None:
-                await openai_ws.close()
-        except Exception:
-            logger.exception("Error closing OpenAI WebSocket")
+            # If the completed task raised, surface it (except cancellation).
+            for t in done:
+                exc = t.exception()
+                if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                    raise exc
 
-        try:
-            await websocket.close()
-        except Exception:
-            logger.exception("Error closing Twilio WebSocket")
 
-        # --- Call summary (end-of-call) ----------------------------------------
-        try:
-            enabled = (os.getenv("CALL_SUMMARY_ENABLED", "0").strip() == "1")
-            logger.info("CALL_SUMMARY_FINALIZE_ENTER enabled=%s call_sid=%s", enabled, call_sid)
-            if enabled and call_sid:
-                db2 = SessionLocal()
-                try:
-                    # caller_id is inferred inside ensure_call_summary_for_call from existing events for this call_sid
-                    ensure_call_summary_for_call(db2, call_sid=str(call_sid))
-                finally:
-                    db2.close()
+        finally:
+            try:
+                if transcript_action_task and not transcript_action_task.done():
+                    transcript_action_task.cancel()
+            except Exception:
+                pass
 
-        except Exception:
-            logger.exception("CALL_SUMMARY_FINALIZE_ERROR call_sid=%s from=%s", call_sid, from_number)
+            try:
+                if speech_ctrl is not None:
+                    await speech_ctrl.stop()
+            except Exception:
+                logger.exception("SPEECH_CTRL_STOP_ERROR")
 
-        logger.info("WebSocket disconnected while sending audio")
+
+            try:
+                sender_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await sender_task
+            except Exception:
+                pass
+
+            try:
+                if openai_ws is not None:
+                    await openai_ws.close()
+            except Exception:
+                logger.exception("Error closing OpenAI WebSocket")
+
+            try:
+                await websocket.close()
+            except Exception:
+                logger.exception("Error closing Twilio WebSocket")
+
+            # --- Call summary (end-of-call) ----------------------------------------
+            try:
+                enabled = (os.getenv("CALL_SUMMARY_ENABLED", "0").strip() == "1")
+                logger.info("CALL_SUMMARY_FINALIZE_ENTER enabled=%s call_sid=%s", enabled, call_sid)
+                if enabled and call_sid:
+                    db2 = SessionLocal()
+                    try:
+                        # caller_id is inferred inside ensure_call_summary_for_call from existing events for this call_sid
+                        ensure_call_summary_for_call(db2, call_sid=str(call_sid))
+                    finally:
+                        db2.close()
+
+            except Exception:
+                logger.exception("CALL_SUMMARY_FINALIZE_ERROR call_sid=%s from=%s", call_sid, from_number)
+
+            logger.info("WebSocket disconnected while sending audio")
