@@ -9,6 +9,10 @@ import time
 import re
 from typing import Optional
 from contextlib import suppress
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import uuid as _uuid
+from sqlalchemy import func, desc
 from db import SessionLocal
 from models import CallerMemoryEvent
 from services.user_service import get_or_create_primary_user
@@ -474,6 +478,11 @@ async def twilio_stream(websocket: WebSocket):
     backchannel_task: Optional[asyncio.Task] = None
     backchannel_pending: bool = False
 
+    # Concierge greeting: optional welcome-back line after the opening greeting.
+    concierge_task: Optional[asyncio.Task] = None
+    concierge_text: Optional[str] = None
+    concierge_said: bool = False
+
 
 
     barge_in_enabled: bool = False
@@ -674,6 +683,14 @@ async def twilio_stream(websocket: WebSocket):
         greeting_audio_protected = False
         logger.info("GREETING_PROTECT: released (audio drained or timeout)")
 
+        # Optional concierge welcome-back line (non-blocking).
+        if _concierge_enabled():
+            try:
+                await _maybe_say_concierge_after_greeting()
+            except Exception:
+                logger.exception("CONCIERGE_AFTER_GREETING_ERROR")
+
+
         # Process the latest transcript captured during the greeting (if any).
         if pending_transcript_during_greeting:
             t = pending_transcript_during_greeting
@@ -822,6 +839,179 @@ async def twilio_stream(websocket: WebSocket):
                 return
         except Exception:
             logger.exception("Failed to send Twilio clear")
+
+
+# --- Concierge greeting -------------------------------------------------
+def _concierge_enabled() -> bool:
+    return (os.getenv("VOICE_CONCIERGE_GREETING", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+
+def _concierge_max_calls() -> int:
+    try:
+        return int(os.getenv("VOICE_CONCIERGE_MAX_CALLS", "3") or 3)
+    except Exception:
+        return 3
+
+def _concierge_max_wait_ms() -> int:
+    try:
+        return int(os.getenv("VOICE_CONCIERGE_MAX_WAIT_MS", "250") or 250)
+    except Exception:
+        return 250
+
+def _safe_topic_from_tags(tags_json) -> Optional[str]:
+    """Return a short safe topic string if tags_json contains a known keyword."""
+    if not tags_json:
+        return None
+    try:
+        tags = tags_json
+        # tags_json is jsonb; it should deserialize to list/dict already when loaded by SQLAlchemy.
+        if isinstance(tags, dict):
+            # accept {"tags": [...]} or {"kw:cats": true} shapes
+            if "tags" in tags and isinstance(tags["tags"], list):
+                tags = tags["tags"]
+            else:
+                tags = list(tags.keys())
+        if not isinstance(tags, list):
+            return None
+        safe = {"cats", "cat", "dogs", "dog", "email", "emails", "pricing", "quote", "menu", "order", "orders", "hours", "location", "locations"}
+        for t in tags:
+            if not isinstance(t, str):
+                continue
+            s = t.strip().lower()
+            if s.startswith("kw:"):
+                s = s[3:]
+            if s in safe:
+                # normalize plurals for speech
+                if s == "cat":
+                    return "cats"
+                if s == "dog":
+                    return "dogs"
+                if s == "emails":
+                    return "email"
+                if s == "orders":
+                    return "orders"
+                if s == "locations":
+                    return "locations"
+                return s
+    except Exception:
+        return None
+    return None
+
+async def _prefetch_concierge_text(*, tenant_id, caller_id: str, current_call_sid: Optional[str]):
+    """Compute concierge_text in a background task. Never blocks audio hot paths."""
+    nonlocal concierge_text
+    if not caller_id:
+        return
+    db2 = SessionLocal()
+    try:
+        # Parse tenant UUID if needed (model column is uuid)
+        tid = tenant_id
+        if isinstance(tid, str):
+            try:
+                tid = _uuid.UUID(tid)
+            except Exception:
+                pass
+
+        # Last N prior calls (exclude current call_sid)
+        q = (
+            db2.query(CallerMemoryEvent.call_sid, func.max(CallerMemoryEvent.created_at).label("last_at"))
+            .filter(CallerMemoryEvent.tenant_id == tid)
+            .filter(CallerMemoryEvent.caller_id == caller_id)
+            .filter(CallerMemoryEvent.call_sid.isnot(None))
+        )
+        if current_call_sid:
+            q = q.filter(CallerMemoryEvent.call_sid != current_call_sid)
+
+        rows = (
+            q.group_by(CallerMemoryEvent.call_sid)
+            .order_by(desc(func.max(CallerMemoryEvent.created_at)))
+            .limit(_concierge_max_calls())
+            .all()
+        )
+
+        if not rows:
+            concierge_text = None
+            return
+
+        # Format the most recent prior call timestamp for speech
+        last_at = rows[0][1]
+        if last_at is None:
+            concierge_text = None
+            return
+
+        # created_at is stored without tz; treat as UTC and convert to NY
+        dt_utc = last_at.replace(tzinfo=timezone.utc)
+        dt_local = dt_utc.astimezone(ZoneInfo("America/New_York"))
+        tstr = dt_local.strftime("%I:%M %p").lstrip("0")
+        when = f"{dt_local.strftime('%a')} at {tstr}"
+
+        topic: Optional[str] = None
+        try:
+            prior_call_sid = rows[0][0]
+            # Pull recent tags_json from the prior call for a safe topic nod
+            tag_rows = (
+                db2.query(CallerMemoryEvent.tags_json)
+                .filter(CallerMemoryEvent.tenant_id == tid)
+                .filter(CallerMemoryEvent.caller_id == caller_id)
+                .filter(CallerMemoryEvent.call_sid == prior_call_sid)
+                .filter(CallerMemoryEvent.tags_json.isnot(None))
+                .order_by(desc(CallerMemoryEvent.created_at))
+                .limit(50)
+                .all()
+            )
+            for (tj,) in tag_rows:
+                topic = _safe_topic_from_tags(tj)
+                if topic:
+                    break
+        except Exception:
+            topic = None
+
+        if topic:
+            concierge_text = f"Welcome back. I see you called {when}. Last time we chatted about {topic}. How can I help today?"
+        else:
+            concierge_text = f"Welcome back. I see you called {when}. How can I help today?"
+    except Exception:
+        logger.exception("CONCIERGE_PREFETCH_ERROR")
+        concierge_text = None
+    finally:
+        try:
+            db2.close()
+        except Exception:
+            pass
+
+async def _maybe_say_concierge_after_greeting():
+    """Speak concierge_text once after greeting, if ready and appropriate."""
+    nonlocal concierge_said, concierge_task, concierge_text
+
+    if concierge_said or not _concierge_enabled():
+        return
+    # If user spoke during greeting or we captured deferred transcript, skip concierge.
+    if pending_transcript_during_greeting:
+        return
+    # user_spoke_once is set by VAD; if they spoke already, don't interrupt.
+    try:
+        if user_spoke_once:
+            return
+    except Exception:
+        pass
+
+    # Wait briefly for prefetch to finish (don't stall call start)
+    if concierge_task is not None and not concierge_task.done():
+        max_wait = _concierge_max_wait_ms()
+        if max_wait > 0:
+            try:
+                await asyncio.wait_for(concierge_task, timeout=max_wait / 1000.0)
+            except Exception:
+                pass
+
+    text = (concierge_text or "").strip()
+    if not text:
+        return
+
+    concierge_said = True
+    try:
+        await create_fsm_spoken_reply(text, reason_tag="concierge")
+    except Exception:
+        logger.exception("CONCIERGE_SPEAK_ERROR")
 
     # --- Barge-in: local mute only ------------------------------------------
     async def handle_barge_in():
@@ -1480,6 +1670,22 @@ async def twilio_stream(websocket: WebSocket):
                     custom = start.get("customParameters") or {}
                     from_number = custom.get("from") or custom.get("From") or start.get("from") or start.get("From")
                     logger.info("Stream start call_sid=%s from_number=%s", call_sid, from_number)
+
+                    # Concierge prefetch (async DB lookup, never blocks audio).
+                    if _concierge_enabled() and concierge_task is None and from_number:
+                        try:
+                            tenant_uuid = getattr(user, "tenant_id", None)
+                        except Exception:
+                            tenant_uuid = None
+                        concierge_task = asyncio.create_task(
+                            _prefetch_concierge_text(
+                                tenant_id=tenant_uuid,
+                                caller_id=str(from_number),
+                                current_call_sid=call_sid,
+                            )
+                        )
+                        logger.info("CONCIERGE_PREFETCH_SCHEDULED caller_id=%s", from_number)
+
 
                     prebuffer_active = True
                     logger.info("Twilio stream event: start")
