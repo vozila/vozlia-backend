@@ -951,7 +951,7 @@ def run_assistant_route(
         # 1) Vector search over call_summary rows (best quality)
 
         # 1) Vector search over call_summary rows (best quality)
-        if use_vector and qmem is not None:
+        if use_vector and qmem is not None and not rows:
             try:
                 from services.embeddings_service import embed_texts
                 emb = embed_texts([q_raw])[0]
@@ -1028,7 +1028,26 @@ def run_assistant_route(
             txt = (r.text or "").strip().replace("\n", " ")
             if len(txt) > 420:
                 txt = txt[:420] + "…"
-            evidence_lines.append(f"- ({ts}) [{label}] {txt}")
+            include_sid = os.getenv("MEMORY_EVIDENCE_INCLUDE_CALL_SID", "1").strip() == "1"
+            sid = ""
+            if include_sid:
+                try:
+                    sid_val = getattr(r, "call_sid", None)
+                    sid = f" sid={sid_val}" if sid_val else ""
+                except Exception:
+                    sid = ""
+            evidence_lines.append(f"- ({ts}){sid} [{label}] {txt}")
+
+            # Optional: trace exactly what we are sending into the memory-answer LLM
+            if os.getenv("MEMORY_EVIDENCE_TRACE", "0").strip() == "1":
+                preview = "\n".join(evidence_lines[:5])
+                logger.info(
+                    "MEMORY_EVIDENCE_TRACE tenant_id=%s caller_id=%s q=%r evidence_top5=%s",
+                    tenant_id,
+                    caller_id,
+                    (q_raw or "")[:160],
+                    preview[:1800],
+                )
 
         if os.getenv("MEMORY_LLM_ANSWER_ENABLED", "1").strip() == "1":
             spoken = llm_answer_from_memory(q_raw, evidence_lines)
