@@ -874,6 +874,33 @@ def run_assistant_route(
         q_raw = raw_user_text or ""
         qmem = None
         rows: list[Any] = []
+        # Deterministic previous-call shortcut (skip vector)
+        det_prev_call = os.getenv("LONGTERM_MEMORY_DETERMINISTIC_PREV_CALL", "0").strip() == "1"
+        ql = (q_raw or "").lower()
+        if det_prev_call and any(p in ql for p in ("previous call", "last call", "prior call", "our last call", "the call before")):
+            try:
+                exclude_sid = str(call_id) if call_id else ""
+                rows = (
+                    db.query(CallerMemoryEvent)
+                    .filter(CallerMemoryEvent.tenant_id == str(tenant_uuid))
+                    .filter(CallerMemoryEvent.caller_id == str(caller_id))
+                    .filter(CallerMemoryEvent.skill_key == "call_summary")
+                    .filter(CallerMemoryEvent.call_sid.isnot(None))
+                    .filter(CallerMemoryEvent.call_sid != exclude_sid)
+                    .order_by(CallerMemoryEvent.created_at.desc())
+                    .limit(1)
+                    .all()
+                )
+                if debug:
+                    picked = rows[0].call_sid if rows else None
+                    logger.info(
+                        "AUTO_MEMORY_PREV_CALL_PICK tenant_id=%s caller_id=%s picked_call_sid=%s found=%s",
+                        tenant_id, caller_id, picked, bool(rows)
+                    )
+            except Exception:
+                logger.exception("AUTO_MEMORY_PREV_CALL_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+                rows = []
+
         use_turns_bridge = bool(int(os.getenv("LONGTERM_MEMORY_USE_TURNS_FOR_RECALL", "0") or "0"))
         use_vector = os.getenv("VECTOR_MEMORY_ENABLED", "0").strip() == "1"
 
@@ -1005,6 +1032,13 @@ def run_assistant_route(
 
         if os.getenv("MEMORY_LLM_ANSWER_ENABLED", "1").strip() == "1":
             spoken = llm_answer_from_memory(q_raw, evidence_lines)
+            if not (spoken or "").strip():
+                # Hard grounded fallback: read the top note instead of sending empty output.
+                top = evidence_lines[0] if evidence_lines else ""
+                spoken = top.replace("- ", "", 1) if top else "I couldn’t find that in my notes yet."
+                if debug:
+                    logger.info("AUTO_MEMORY_EMPTY_LLM_FALLBACK tenant_id=%s caller_id=%s", tenant_id, caller_id)
+
             payload = {
                 "spoken_reply": spoken,
                 "fsm": {
