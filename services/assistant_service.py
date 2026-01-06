@@ -882,6 +882,47 @@ def run_assistant_route(
         except Exception:
             logger.exception("AUTO_MEMORY_PARSE_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
 
+        # Optional: LLM timeframe intent → override qmem window (no behavior change unless enabled)
+        try:
+            use_timeframe_llm = os.getenv("TIMEFRAME_INTENT_LLM", "0").strip() == "1"
+            if use_timeframe_llm and qmem is not None:
+                from services.timeframe_intent import (
+                    looks_like_timeframe,
+                    extract_timeframe_intent_llm,
+                    resolve_timeframe_intent,
+                )
+
+                if looks_like_timeframe(q_raw):
+                    tz_name = (os.getenv("APP_TZ") or "America/New_York").strip()
+                    spec = extract_timeframe_intent_llm(q_raw, tz_name=tz_name)
+                    win = resolve_timeframe_intent(spec, tz_name=tz_name)
+                    if win:
+                        start_utc, end_utc, label = win
+                        qmem.start_ts = start_utc
+                        qmem.end_ts = end_utc
+                        if debug:
+                            logger.info(
+                                "AUTO_TIMEFRAME_LLM_OK tenant_id=%s caller_id=%s label=%s start=%s end=%s spec=%s",
+                                tenant_id,
+                                caller_id,
+                                label,
+                                start_utc.isoformat(timespec="seconds"),
+                                end_utc.isoformat(timespec="seconds"),
+                                spec,
+                            )
+                    else:
+                        if debug and spec:
+                            logger.info(
+                                "AUTO_TIMEFRAME_LLM_NO_WINDOW tenant_id=%s caller_id=%s spec=%s",
+                                tenant_id,
+                                caller_id,
+                                spec,
+                            )
+        except Exception:
+            logger.exception("AUTO_TIMEFRAME_LLM_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+
+        # 1) Vector search over call_summary rows (best quality)
+
         # 1) Vector search over call_summary rows (best quality)
         if use_vector and qmem is not None:
             try:
