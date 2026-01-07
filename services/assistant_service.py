@@ -885,6 +885,29 @@ def run_assistant_route(
                     tz_name = (os.getenv("APP_TZ") or "America/New_York").strip()
                     spec = extract_timeframe_intent_llm(q_raw, tz_name=tz_name)
                     win = resolve_timeframe_intent(spec, tz_name=tz_name)
+                    # Trace the time-intent response (spec + resolved window) in one line
+                    if os.getenv("TIMEFRAME_INTENT_TRACE", "0").strip() == "1":
+                        try:
+                            trace = {
+                                "tenant_id": tenant_id,
+                                "caller_id": caller_id,
+                                "q_preview": (q_raw or "")[:160],
+                                "tz": tz_name,
+                                "spec": spec,
+                                "resolved": (
+                                    {
+                                        "label": label,
+                                        "start_utc": start_utc.isoformat(timespec="seconds"),
+                                        "end_utc": end_utc.isoformat(timespec="seconds"),
+                                    }
+                                    if win
+                                    else None
+                                ),
+                            }
+                            logger.info("TIMEFRAME_INTENT_TRACE %s", json.dumps(trace, ensure_ascii=False))
+                        except Exception:
+                            logger.exception("TIMEFRAME_INTENT_TRACE_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+
                     if win:
                         start_utc, end_utc, label = win
                         qmem.start_ts = start_utc
