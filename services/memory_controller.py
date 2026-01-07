@@ -43,6 +43,127 @@ _TIME_PATTERNS = [
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
+def _resolve_time_window_v2(text: str, *, now_utc: datetime) -> tuple[datetime, datetime] | None:
+    """
+    Deterministic, calendar-based timeframe resolver for memory queries.
+
+    Returns (start_utc_naive, end_utc_naive) in UTC with tzinfo=None to match DB timestamps.
+
+    Supported phrases:
+      - today (local midnight -> now)
+      - yesterday / a day ago / day ago (previous local day)
+      - few/couple days ago (48h window ending at today's local midnight)
+      - a week ago / week ago (calendar day 7 days ago)
+      - N days ago, N weeks ago (calendar day windows)
+      - this week (Mon 00:00 -> midnight today by default)
+      - last week (previous Mon 00:00 -> this Mon 00:00)
+      - this month (1st -> now)
+      - last month (previous month 1st -> this month 1st)
+      - weekdays (monday..sunday): most recent previous occurrence (if today matches, use previous week)
+    """
+    raw = (text or "").strip().lower()
+    if not raw:
+        return None
+
+    # Normalize now_utc to aware UTC
+    if getattr(now_utc, "tzinfo", None) is None:
+        now_aware = now_utc.replace(tzinfo=timezone.utc)
+        now_utc_naive = now_utc
+    else:
+        now_aware = now_utc.astimezone(timezone.utc)
+        now_utc_naive = now_aware.replace(tzinfo=None)
+
+    tz_name = (os.getenv("APP_TZ") or "America/New_York").strip()
+    tz = ZoneInfo(tz_name)
+
+    now_local = now_aware.astimezone(tz)
+    start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_week = start_of_today - timedelta(days=start_of_today.weekday())  # Monday
+    start_of_month = start_of_today.replace(day=1)
+
+    def _to_utc_naive(dt_local: datetime) -> datetime:
+        return dt_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def _day_window(target_local_date: date) -> tuple[datetime, datetime]:
+        s_local = datetime(target_local_date.year, target_local_date.month, target_local_date.day, 0, 0, 0, tzinfo=tz)
+        e_local = s_local + timedelta(days=1)
+        return (_to_utc_naive(s_local), _to_utc_naive(e_local))
+
+    # today
+    if "today" in raw:
+        return (_to_utc_naive(start_of_today), now_utc_naive)
+
+    # yesterday / day ago
+    if "yesterday" in raw or "a day ago" in raw or re.search(r"\bday\s+ago\b", raw):
+        d = (start_of_today - timedelta(days=1)).date()
+        return _day_window(d)
+
+    # few/couple days ago => 48h window ending at today's midnight
+    if any(p in raw for p in ("few days ago", "a few days ago", "couple days ago", "a couple days ago")):
+        s_local = start_of_today - timedelta(days=2)
+        e_local = start_of_today
+        return (_to_utc_naive(s_local), _to_utc_naive(e_local))
+
+    # a week ago / week ago => calendar day 7 days ago
+    if "a week ago" in raw or re.search(r"\bweek\s+ago\b", raw):
+        d = (start_of_today - timedelta(days=7)).date()
+        return _day_window(d)
+
+    # N days ago
+    m = re.search(r"\b(\d+)\s+days?\s+ago\b", raw)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 365:
+            d = (start_of_today - timedelta(days=n)).date()
+            return _day_window(d)
+
+    # N weeks ago (as calendar day window at 7n days ago)
+    m = re.search(r"\b(\d+)\s+weeks?\s+ago\b", raw)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 52:
+            d = (start_of_today - timedelta(days=7 * n)).date()
+            return _day_window(d)
+
+    # this week
+    if "this week" in raw:
+        exclude_today = (os.getenv("TIMEFRAME_THIS_WEEK_EXCLUDE_TODAY", "1") or "1").strip().lower() in ("1","true","yes","on")
+        end_local = start_of_today if exclude_today else now_local
+        return (_to_utc_naive(start_of_week), _to_utc_naive(end_local))
+
+    # last week (previous Mon->Mon)
+    if "last week" in raw:
+        s_local = start_of_week - timedelta(days=7)
+        e_local = start_of_week
+        return (_to_utc_naive(s_local), _to_utc_naive(e_local))
+
+    # this month
+    if "this month" in raw:
+        return (_to_utc_naive(start_of_month), now_utc_naive)
+
+    # last month (previous calendar month)
+    if "last month" in raw:
+        # first of this month -> subtract one day -> first of previous month
+        prev_month_last_day = start_of_month - timedelta(days=1)
+        prev_month_start = prev_month_last_day.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return (_to_utc_naive(prev_month_start), _to_utc_naive(start_of_month))
+
+    # Weekday names (most recent previous occurrence)
+    weekday_map = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
+    for name, idx in weekday_map.items():
+        if name in raw:
+            days_ago = (now_local.weekday() - idx) % 7
+            if days_ago == 0:
+                days_ago = 7
+            d = (start_of_today - timedelta(days=days_ago)).date()
+            return _day_window(d)
+
+    return None
+
 def parse_memory_query(text: str) -> MemoryQuery:
     raw = (text or "").strip()
     now = _utcnow()
