@@ -120,9 +120,6 @@ def extract_timeframe_intent_llm(
             timeout=timeout_s,
         )
         content = (resp.choices[0].message.content or "").strip()
-        spec = json.loads(content)
-        if not isinstance(spec, dict):
-            return None
 
         # normalize
         tf = str(spec.get("timeframe_type") or "none").strip().lower()
