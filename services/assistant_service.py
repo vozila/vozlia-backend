@@ -21,6 +21,7 @@ import re
 import json
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from typing import Any
 from core.logging import logger
 from skills.registry import skill_registry
 from sqlalchemy.orm import Session
@@ -398,43 +399,6 @@ def _is_next_cmd(text: str) -> bool:
 def _is_stop_cmd(text: str) -> bool:
     t = _normalize_cmd(text)
     return t in _STOP_PHRASES
-    # Strong recall phrasing
-    if any(p in t for p in [
-        "what did i say",
-        "remind me",
-        "last time",
-        "previous call",
-        "earlier today",
-        "earlier on",
-        "mentioned earlier",
-        "that i mentioned",
-        "you mentioned",
-        "did i mention",
-    ]):
-        return True
-
-    # Favorite color recall (question-like only)
-    if ("favorite color" in t or "favourite colour" in t):
-        # avoid treating store utterances as recall
-        if any(p in t for p in [
-            "my favorite color is",
-            "my favourite colour is",
-            "remember that my favorite color is",
-            "remember my favorite color is",
-        ]):
-            return False
-        if "what" in t or "which" in t or "remind" in t or t.endswith("?"):
-            return True
-
-    # Generic "what X was" questions often imply recall
-    if t.endswith("?") and any(q in t for q in ["what", "which", "where", "when", "who", "how"]):
-        if any(p in t for p in ["mentioned", "said", "told you", "earlier", "before"]):
-            return True
-
-    return False
-
-
-
 
 def _answer_favorite_color(rows) -> str | None:
     # rows are CallerMemoryEvent ordered newest-first
@@ -548,7 +512,6 @@ def run_assistant_route(
     def _standby_phrase() -> str:
         import random as _random
         forced = (ctx_flags.get("forced_skill_id") if isinstance(ctx_flags, dict) else None) or ""
-        import random as _random
         if forced == "investment_reporting":
             choices = [
                 "One moment — I'm pulling up your stock report now.",
@@ -564,7 +527,6 @@ def run_assistant_route(
             ]
         return _random.choice(choices)
         return _random.choice(choices)
-
     # Skill engagement phrases (Gmail Summary)
     force_gmail_summary = False
     try:
@@ -1019,15 +981,15 @@ def run_assistant_route(
         # Build compact evidence lines for the LLM
         evidence_lines: list[str] = []
         for r in rows[:12]:
-            ts = ""
             try:
                 ts = r.created_at.isoformat()
             except Exception:
                 ts = ""
-            label = (r.skill_key or r.kind or "note")
-            txt = (r.text or "").strip().replace("\n", " ")
+            label = (getattr(r, "skill_key", None) or getattr(r, "kind", None) or "note")
+            txt = (getattr(r, "text", "") or "").strip().replace("\n", " ")
             if len(txt) > 420:
                 txt = txt[:420] + "…"
+
             include_sid = os.getenv("MEMORY_EVIDENCE_INCLUDE_CALL_SID", "1").strip() == "1"
             sid = ""
             if include_sid:
@@ -1038,17 +1000,57 @@ def run_assistant_route(
                     sid = ""
             evidence_lines.append(f"- ({ts}){sid} [{label}] {txt}")
 
-            # Optional: trace exactly what we are sending into the memory-answer LLM
-            if os.getenv("MEMORY_EVIDENCE_TRACE", "0").strip() == "1":
-                preview = "\n".join(evidence_lines[:5])
-                logger.info(
-                    "MEMORY_EVIDENCE_TRACE tenant_id=%s caller_id=%s q=%r evidence_top5=%s",
-                    tenant_id,
-                    caller_id,
-                    (q_raw or "")[:160],
-                    preview[:1800],
-                )
+        # Optional: trace what we send into the memory-answer LLM (can contain PII; keep OFF by default)
+        if os.getenv("MEMORY_EVIDENCE_TRACE", "0").strip() == "1":
+            preview = "\n".join(evidence_lines[:5])
+            logger.info(
+                "MEMORY_EVIDENCE_TRACE tenant_id=%s caller_id=%s q=%r evidence_top5=%s",
+                tenant_id,
+                caller_id,
+                (q_raw or "")[:160],
+                preview[:1800],
+            )
 
+        # Debug: trace DB rows used for memory answers (single-line JSON).
+        if os.getenv("MEMORY_DB_TRACE", "0").strip() == "1":
+            try:
+                include_text = os.getenv("MEMORY_DB_TRACE_INCLUDE_TEXT", "0").strip() == "1"
+
+                def _iso(dt) -> str | None:
+                    try:
+                        return dt.isoformat()
+                    except Exception:
+                        return None
+
+                top_rows = []
+                for rr in rows[:8]:
+                    item = {
+                        "created_at": _iso(getattr(rr, "created_at", None)),
+                        "call_sid": getattr(rr, "call_sid", None),
+                        "skill_key": getattr(rr, "skill_key", None),
+                        "kind": getattr(rr, "kind", None),
+                    }
+                    if include_text:
+                        t = (getattr(rr, "text", "") or "").replace("\n", " ").strip()
+                        item["text_preview"] = t[:220]
+                    top_rows.append(item)
+
+                trace_obj = {
+                    "tenant_id": tenant_id,
+                    "caller_id": caller_id,
+                    "q_preview": (q_raw or "")[:200],
+                    "window": {
+                        "start_ts": _iso(getattr(qmem, "start_ts", None)),
+                        "end_ts": _iso(getattr(qmem, "end_ts", None)),
+                        "skill_key": getattr(qmem, "skill_key", None),
+                        "keywords": getattr(qmem, "keywords", None),
+                    },
+                    "hits": len(rows),
+                    "top_rows": top_rows,
+                }
+                logger.info("MEMORY_DB_TRACE %s", json.dumps(trace_obj, ensure_ascii=False))
+            except Exception:
+                logger.exception("MEMORY_DB_TRACE_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
         if os.getenv("MEMORY_LLM_ANSWER_ENABLED", "1").strip() == "1":
             spoken = llm_answer_from_memory(q_raw, evidence_lines)
             if not (spoken or "").strip():
@@ -1057,6 +1059,18 @@ def run_assistant_route(
                 spoken = top.replace("- ", "", 1) if top else "I couldn’t find that in my notes yet."
                 if debug:
                     logger.info("AUTO_MEMORY_EMPTY_LLM_FALLBACK tenant_id=%s caller_id=%s", tenant_id, caller_id)
+
+            if os.getenv("MEMORY_SPOKEN_TRACE", "0").strip() == "1":
+                try:
+                    logger.info(
+                        "MEMORY_SPOKEN_TRACE tenant_id=%s caller_id=%s spoken_len=%s spoken_preview=%r",
+                        tenant_id,
+                        caller_id,
+                        len(spoken or ''),
+                        (spoken or '')[:260],
+                    )
+                except Exception:
+                    logger.exception("MEMORY_SPOKEN_TRACE_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
 
             payload = {
                 "spoken_reply": spoken,
@@ -1142,6 +1156,7 @@ def run_assistant_route(
     fsm_result: dict = fsm.handle_utterance(text, context=fsm_context)
 
     spoken_reply: str = fsm_result.get("spoken_reply") or ""
+    backend_call: dict | None = fsm_result.get("backend_call") or None
 
     # Silence annoying clarifying / uncertain fallbacks (user preference).
     def _truthy_env(name: str, default: str = "1") -> bool:
@@ -1183,7 +1198,6 @@ def run_assistant_route(
             sorted(list(fsm_result.keys())) if isinstance(fsm_result, dict) else None,
             int((_time.perf_counter() - t0) * 1000),
         )
-    backend_call: dict | None = fsm_result.get("backend_call") or None
     gmail_data: dict | None = None
     if (not backend_call) and force_gmail_summary:
         backend_call = {
