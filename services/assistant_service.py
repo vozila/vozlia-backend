@@ -829,7 +829,7 @@ def run_assistant_route(
 
     # Capture the user turn early so even early returns preserve the question.
     if not (exclude_mem_recall_turns and _is_memory_recall_turn(raw_user_text)):
-    _capture_turn("user", raw_user_text)
+        _capture_turn("user", raw_user_text)
     else:
         if debug:
             logger.info("TURN_CAPTURE_SKIP role=user reason=memory_recall tenant_id=%s caller_id=%s", tenant_id, caller_id)
