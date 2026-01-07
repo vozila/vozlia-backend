@@ -655,6 +655,15 @@ def run_assistant_route(
             )
         except Exception:
             logger.exception("TURN_CAPTURE_FAIL tenant_id=%s caller_id=%s role=%s", tenant_id, caller_id, role)
+    # If enabled, do NOT persist memory-recall questions or memory-recall answers as turn events.
+    exclude_mem_recall_turns = (os.getenv("LONGTERM_MEMORY_EXCLUDE_MEMORY_RECALL_TURNS", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+    def _is_memory_recall_turn(user_text: str) -> bool:
+        # Use the same detection that triggers memory routing
+        try:
+            return bool(force_memory or _looks_like_memory_question(user_text))
+        except Exception:
+            return False
 
 
     # --------------------------------------------
@@ -819,7 +828,12 @@ def run_assistant_route(
         return payload
 
     # Capture the user turn early so even early returns preserve the question.
+    if not (exclude_mem_recall_turns and _is_memory_recall_turn(raw_user_text)):
     _capture_turn("user", raw_user_text)
+    else:
+        if debug:
+            logger.info("TURN_CAPTURE_SKIP role=user reason=memory_recall tenant_id=%s caller_id=%s", tenant_id, caller_id)
+
 
 # Pull small recent context for prompt grounding (keep short; no hot-path bloat)
 
@@ -1002,8 +1016,13 @@ def run_assistant_route(
                 "fsm": {"mode": "memory_recall", "status": "no_hits"},
                 "gmail": None,
             }
-            _capture_turn("assistant", payload.get("spoken_reply"))
+            if not exclude_mem_recall_turns:
+                _capture_turn("assistant", payload.get("spoken_reply"))
+            else:
+                if debug:
+                    logger.info("TURN_CAPTURE_SKIP role=assistant reason=memory_recall tenant_id=%s caller_id=%s", tenant_id, caller_id)
             return payload
+
 
         # Build compact evidence lines for the LLM
         evidence_lines: list[str] = []
