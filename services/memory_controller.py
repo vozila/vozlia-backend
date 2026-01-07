@@ -9,6 +9,15 @@ from zoneinfo import ZoneInfo
 from typing import Any, Iterable, Optional
 
 from core.logging import logger
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    """Parse env var as a boolean.
+
+    Accepts 1/true/yes/on (case-insensitive) as True.
+    """
+    v = (os.getenv(name, default) or default).strip().lower()
+    return v in ("1", "true", "yes", "on")
 from models import CallerMemoryEvent
 from sqlalchemy import text
 
@@ -371,12 +380,3 @@ def vector_search_call_summaries(
     except Exception:
         logger.exception("VECTOR_SEARCH_SQL_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
         return []
-
-# Public API (explicit)
-__all__ = [
-    'MemoryQuery',
-    'parse_memory_query',
-    'search_memory_events',
-    'vector_search_call_summaries',
-    'fetch_fact_history',
-]
