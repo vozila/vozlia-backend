@@ -1,9 +1,11 @@
 # services/memory_controller.py
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo
 from typing import Any, Iterable, Optional
 
 from core.logging import logger
@@ -32,36 +34,34 @@ _TIME_PATTERNS = [
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def parse_memory_query(text: str) -> MemoryQuery:
     raw = (text or "").strip()
     now = _utcnow()
     start = now - timedelta(days=30)
     end = now
 
-
-    # Minutes / hours parsing (MVP)
+    # Minutes / hours parsing (MVP, rolling UTC)
     m = re.search(r"\b(last)\s+(\d+)\s+minutes\b", raw, re.I)
     if m:
         n = int(m.group(2))
-        start = now - timedelta(minutes=min(max(n, 1), 60*24*7))
+        start = now - timedelta(minutes=min(max(n, 1), 60 * 24 * 7))
     else:
         m = re.search(r"\b(\d+)\s+minutes?\s+ago\b", raw, re.I)
         if m:
             n = int(m.group(1))
-            start = now - timedelta(minutes=min(max(n * 3, 10), 60*24*7))
+            start = now - timedelta(minutes=min(max(n * 3, 10), 60 * 24 * 7))
         else:
             m = re.search(r"\b(last)\s+(\d+)\s+hours\b", raw, re.I)
             if m:
                 n = int(m.group(2))
-                start = now - timedelta(hours=min(max(n, 1), 24*30))
+                start = now - timedelta(hours=min(max(n, 1), 24 * 30))
             else:
                 m = re.search(r"\b(\d+)\s+hours?\s+ago\b", raw, re.I)
                 if m:
                     n = int(m.group(1))
-                    start = now - timedelta(hours=min(max(n * 2, 2), 24*30))
+                    start = now - timedelta(hours=min(max(n * 2, 2), 24 * 30))
 
-    # Time parsing (MVP)
+    # Time parsing (legacy rolling UTC)
     m = re.search(r"\b(last)\s+(\d+)\s+days\b", raw, re.I)
     if m:
         n = int(m.group(2))
@@ -73,6 +73,23 @@ def parse_memory_query(text: str) -> MemoryQuery:
                     start = now - timedelta(days=days)
                 break
 
+    # Deterministic calendar parsing (Phase 2) — feature-flagged
+    # Default ON so time questions stop falling back to the 30-day window.
+    if _truthy_env("TIMEFRAME_PARSER_V2", "1"):
+        win = _resolve_time_window_v2(raw, now_utc=now)
+        if win:
+            start, end = win
+            if _truthy_env("MEMORY_TIME_WINDOW_TRACE", "0"):
+                try:
+                    logger.info(
+                        "MEMORY_TIME_WINDOW_V2 raw=%r start=%s end=%s",
+                        raw[:200],
+                        start.isoformat(timespec="seconds"),
+                        end.isoformat(timespec="seconds"),
+                    )
+                except Exception:
+                    pass
+
     # Topic inference (MVP)
     skill = None
     low = raw.lower()
@@ -83,7 +100,41 @@ def parse_memory_query(text: str) -> MemoryQuery:
 
     # Keyword extraction (cheap)
     tokens = re.findall(r"[a-zA-Z0-9_]{3,}", low)
-    stop = {"what","did","say","about","that","this","last","week","yesterday","remind","me","we","talked","previous","call","report"}
+    stop = {
+        "what",
+        "did",
+        "say",
+        "about",
+        "that",
+        "this",
+        "last",
+        "time",
+        "when",
+        "where",
+        "who",
+        "how",
+        "was",
+        "were",
+        "you",
+        "i",
+        "me",
+        "we",
+        "talked",
+        "previous",
+        "call",
+        "report",
+        "week",
+        "month",
+        "today",
+        "yesterday",
+        "ago",
+        "days",
+        "hours",
+        "minutes",
+        "few",
+        "couple",
+        "remind",
+    }
     kws = [t for t in tokens if t not in stop][:12]
 
     return MemoryQuery(start_ts=start, end_ts=end, skill_key=skill, keywords=kws, raw_text=raw)
