@@ -1,5 +1,7 @@
-import logging
+# main.py
 from fastapi import FastAPI
+
+from core.logging import logger  # IMPORTANT: initializes logging early
 
 from db import Base, engine
 from skills.loader import load_skills_from_disk
@@ -10,8 +12,6 @@ from api.routers.assistant import router as assistant_router
 from api.routers.gmail_api import router as gmail_api_router
 from api.routers.user_settings import router as user_settings_router
 from api.routers.kb import router as kb_router
-
-logger = logging.getLogger("vozlia")
 
 
 def create_app() -> FastAPI:
@@ -28,6 +28,8 @@ def create_app() -> FastAPI:
 
     # Settings routes (restores /me/settings/* endpoints used by the stream)
     app.include_router(user_settings_router)
+
+    # KB router (placeholder health route + future KB endpoints)
     app.include_router(kb_router)
 
     @app.on_event("startup")
@@ -45,4 +47,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-
