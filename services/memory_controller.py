@@ -111,6 +111,19 @@ def _resolve_time_window_v2(text: str, *, now_utc: datetime) -> tuple[datetime, 
         return _day_window(d)
 
     # N days ago
+
+    # Word-number days ago (e.g., "three days ago")
+    word_nums = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    m = re.search(r"\b(" + "|".join(word_nums.keys()) + r")\s+days?\s+ago\b", raw)
+    if m:
+        n = int(word_nums.get(m.group(1), 0))
+        if 1 <= n <= 365:
+            d = (start_of_today - timedelta(days=n)).date()
+            return _day_window(d)
+
     m = re.search(r"\b(\d+)\s+days?\s+ago\b", raw)
     if m:
         n = int(m.group(1))
