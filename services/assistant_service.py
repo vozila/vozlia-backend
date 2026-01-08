@@ -1183,6 +1183,25 @@ def run_assistant_route(
 
     base_greeting = get_agent_greeting(db, current_user)
     greeting = base_greeting
+    # Returning caller preface (previous call summary)
+    try:
+        # Only attempt at call start: if we have a call_id and no meaningful user text yet,
+        # or if the caller just said hello (keeps latency minimal).
+        is_call_startish = bool(call_id) and (not (raw_user_text or "").strip() or (raw_user_text or "").strip().lower() in ("hi", "hello", "hey"))
+        if is_call_startish:
+            from services.greeting_memory import build_prev_call_preface
+            pre = build_prev_call_preface(
+                db,
+                tenant_id=str(tenant_uuid),
+                caller_id=str(caller_id),
+                current_call_sid=str(call_id) if call_id else None,
+            )
+            if pre:
+                greeting = (pre + " " + (greeting or "")).strip()
+                if debug:
+                    logger.info("GREETING_PREV_CALL_USED tenant_id=%s caller_id=%s call_sid=%s", tenant_id, caller_id, call_id)
+    except Exception:
+        logger.exception("GREETING_PREV_CALL_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
 
     # Optional: append the Gmail Summary skill greeting line to the greeting
     try:
