@@ -1129,8 +1129,13 @@ def run_assistant_route(
                 },
                 "gmail": None,
             }
-            _capture_turn("assistant", payload.get("spoken_reply"))
+            if not exclude_mem_recall_turns:
+                _capture_turn("assistant", payload.get("spoken_reply"))
+            else:
+                if debug:
+                    logger.info("TURN_CAPTURE_SKIP role=assistant reason=memory_recall tenant_id=%s caller_id=%s", tenant_id, caller_id)
             return payload
+
 
         # Fail-soft fallback: old snippet style (should be rarely used)
         spoken = "Here’s what I found in your notes: " + " ".join([ln.split('] ',1)[-1] for ln in evidence_lines[:3]])
@@ -1139,8 +1144,13 @@ def run_assistant_route(
             "fsm": {"mode": "memory_recall", "has_evidence": True, "hits": len(rows)},
             "gmail": None,
         }
-        _capture_turn("assistant", payload.get("spoken_reply"))
+        if not exclude_mem_recall_turns:
+            _capture_turn("assistant", payload.get("spoken_reply"))
+        else:
+            if debug:
+                logger.info("TURN_CAPTURE_SKIP role=assistant reason=memory_recall tenant_id=%s caller_id=%s", tenant_id, caller_id)
         return payload
+
 
 
         # Evidence-first summary (MVP, deterministic)
