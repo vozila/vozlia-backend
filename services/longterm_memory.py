@@ -163,6 +163,8 @@ def fetch_recent_memory_text(
             db.query(CallerMemoryEvent)
             .filter(CallerMemoryEvent.tenant_id == tenant_id)
             .filter(CallerMemoryEvent.caller_id == str(caller_id))
+            # Exclude internal trace/audit rows (not real caller memory)
+            .filter(CallerMemoryEvent.skill_key.notin_(["memory_recall_audit", "memory_context_audit"]))
             .order_by(CallerMemoryEvent.created_at.desc())
             .limit(int(limit or 8))
             .all()
