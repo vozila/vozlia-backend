@@ -63,6 +63,11 @@ def _chat_json(messages: List[Dict[str, str]]) -> Dict[str, Any]:
 def build_transcript(events: List[CallerMemoryEvent]) -> str:
     lines: List[str] = []
     for e in events:
+        # Skip internal trace/audit rows so they don't pollute call summaries
+        sk_norm = (getattr(e, "skill_key", "") or "").strip().lower()
+        if sk_norm in {"memory_recall_audit", "memory_context_audit"}:
+            continue
+
         txt = (e.text or "").strip()
         if not txt:
             continue
