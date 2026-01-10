@@ -1024,7 +1024,61 @@ def run_assistant_route(
             return payload
 
 
-        # Build compact evidence lines for the LLM
+        
+        # Optional: persist an audit row that records which memory entries were provided
+        # to the LLM for this "memory recall" answer. This is intended for debugging
+        # via the Admin → Memory Bank UI (search: "memory_recall_audit").
+        if os.getenv("MEMORY_AUDIT_DB", "0").strip() == "1":
+            try:
+                def _iso_dt(dt: Any) -> str | None:
+                    try:
+                        return dt.isoformat()
+                    except Exception:
+                        return None
+
+                max_audit_rows = int(os.getenv("MEMORY_AUDIT_MAX_ROWS", "12") or 12)
+                include_text = os.getenv("MEMORY_AUDIT_INCLUDE_TEXT", "1").strip() == "1"
+
+                returned = []
+                for rr in rows[:max_audit_rows]:
+                    item = {
+                        "id": getattr(rr, "id", None),
+                        "created_at": _iso_dt(getattr(rr, "created_at", None)),
+                        "call_sid": getattr(rr, "call_sid", None),
+                        "skill_key": getattr(rr, "skill_key", None),
+                        "kind": getattr(rr, "kind", None),
+                    }
+                    if include_text:
+                        t = (getattr(rr, "text", "") or "").replace("\n", " ").strip()
+                        item["text_preview"] = t[:380]
+                    returned.append(item)
+
+                audit = CallerMemoryEvent(
+                    tenant_id=str(tenant_id or ""),
+                    caller_id=str(caller_id or ""),
+                    call_sid=(str(call_id) if call_id else None),
+                    kind="event",
+                    skill_key="memory_recall_audit",
+                    text=f"memory_recall_audit hits={len(rows)} q={(q_raw or '')[:220]}",
+                    data_json={
+                        "q": (q_raw or ""),
+                        "window": {
+                            "start_ts": _iso_dt(getattr(qmem, "start_ts", None)),
+                            "end_ts": _iso_dt(getattr(qmem, "end_ts", None)),
+                            "skill_key": getattr(qmem, "skill_key", None),
+                            "keywords": getattr(qmem, "keywords", None),
+                        },
+                        "hits": len(rows),
+                        "returned": returned,
+                    },
+                    tags_json=["trace:memory_recall_audit", "trace:llm_context"],
+                )
+                db.add(audit)
+                db.commit()
+            except Exception:
+                logger.exception("MEMORY_AUDIT_DB_WRITE_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
+
+# Build compact evidence lines for the LLM
         evidence_lines: list[str] = []
         for r in rows[:12]:
             try:
