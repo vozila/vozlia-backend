@@ -207,12 +207,19 @@ def write_call_summary_event(
     return True
 
 
-def ensure_call_summary_for_call(db: Any, *, call_sid: str) -> None:
+def ensure_call_summary_for_call(
+    db: Any,
+    *,
+    call_sid: str,
+    tenant_id: str | None = None,
+    caller_id: str | None = None,
+) -> None:
     """Idempotent: creates call_summary for call_sid if enabled and not present.
 
-    IMPORTANT: caller_id is inferred from existing events for this call_sid so the
-    stream handler does not need to pass it (and cannot accidentally pass a phone
-    number instead of the UUID).
+    Identity strategy:
+    - Preferred: (tenant_id, caller_id) passed in from Twilio Media Stream customParameters
+      so finalize-time does not depend on best-effort inference.
+    - Fallback: infer from existing memory events for this call_sid.
     """
     enabled = (os.getenv("CALL_SUMMARY_ENABLED", "0").strip() == "1")
     if not enabled:
@@ -220,19 +227,27 @@ def ensure_call_summary_for_call(db: Any, *, call_sid: str) -> None:
     if not call_sid:
         return
 
-    # Find tenant_id + caller_id from existing events for this call
-    row = (
-        db.query(CallerMemoryEvent.tenant_id, CallerMemoryEvent.caller_id)
-        .filter(CallerMemoryEvent.call_sid == call_sid)
-        .order_by(CallerMemoryEvent.created_at.desc())
-        .first()
-    )
-    if not row or not row[0] or not row[1]:
-        logger.warning("CALL_SUMMARY_SKIP no tenant/caller for call_sid=%s", call_sid)
-        return
+    tenant_id_resolved = (tenant_id or "").strip()
+    caller_id_resolved = (caller_id or "").strip()
 
-    tenant_id = str(row[0])
-    caller_id = str(row[1])
+    if tenant_id_resolved and caller_id_resolved:
+        logger.info("CALL_SUMMARY_IDENTITY_FROM_STREAM tenant_id=%s caller_id=%s call_sid=%s", tenant_id_resolved, caller_id_resolved, call_sid)
+    else:
+        # Find tenant_id + caller_id from existing events for this call
+        row = (
+            db.query(CallerMemoryEvent.tenant_id, CallerMemoryEvent.caller_id)
+            .filter(CallerMemoryEvent.call_sid == call_sid)
+            .order_by(CallerMemoryEvent.created_at.desc())
+            .first()
+        )
+        if not row or not row[0] or not row[1]:
+            logger.warning("CALL_SUMMARY_SKIP no tenant/caller for call_sid=%s", call_sid)
+            return
+        tenant_id_resolved = str(row[0])
+        caller_id_resolved = str(row[1])
+
+    tenant_id = tenant_id_resolved
+    caller_id = caller_id_resolved
 
     # Already summarized?
     existing = (
