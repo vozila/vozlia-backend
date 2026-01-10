@@ -1030,6 +1030,11 @@ def run_assistant_route(
         # via the Admin → Memory Bank UI (search: "memory_recall_audit").
         if os.getenv("MEMORY_AUDIT_DB", "0").strip() == "1":
             try:
+                # Local imports so audit is truly optional and doesn't affect cold start.
+                # Also ensures failures here never poison the main request DB session.
+                from db import SessionLocal
+                from fastapi.encoders import jsonable_encoder
+
                 def _iso_dt(dt: Any) -> str | None:
                     try:
                         return dt.isoformat()
@@ -1039,12 +1044,13 @@ def run_assistant_route(
                 max_audit_rows = int(os.getenv("MEMORY_AUDIT_MAX_ROWS", "12") or 12)
                 include_text = os.getenv("MEMORY_AUDIT_INCLUDE_TEXT", "1").strip() == "1"
 
-                returned = []
+                returned: list[dict[str, Any]] = []
                 for rr in rows[:max_audit_rows]:
-                    item = {
-                        "id": getattr(rr, "id", None),
+                    rid = getattr(rr, "id", None)
+                    item: dict[str, Any] = {
+                        "id": str(rid) if rid is not None else None,
                         "created_at": _iso_dt(getattr(rr, "created_at", None)),
-                        "call_sid": getattr(rr, "call_sid", None),
+                        "call_sid": (str(getattr(rr, "call_sid")) if getattr(rr, "call_sid", None) is not None else None),
                         "skill_key": getattr(rr, "skill_key", None),
                         "kind": getattr(rr, "kind", None),
                     }
@@ -1053,6 +1059,18 @@ def run_assistant_route(
                         item["text_preview"] = t[:380]
                     returned.append(item)
 
+                audit_payload: dict[str, Any] = {
+                    "q": (q_raw or ""),
+                    "window": {
+                        "start_ts": _iso_dt(getattr(qmem, "start_ts", None)),
+                        "end_ts": _iso_dt(getattr(qmem, "end_ts", None)),
+                        "skill_key": getattr(qmem, "skill_key", None),
+                        "keywords": getattr(qmem, "keywords", None),
+                    },
+                    "hits": len(rows),
+                    "returned": returned,
+                }
+
                 audit = CallerMemoryEvent(
                     tenant_id=str(tenant_id or ""),
                     caller_id=str(caller_id or ""),
@@ -1060,24 +1078,19 @@ def run_assistant_route(
                     kind="event",
                     skill_key="memory_recall_audit",
                     text=f"memory_recall_audit hits={len(rows)} q={(q_raw or '')[:220]}",
-                    data_json={
-                        "q": (q_raw or ""),
-                        "window": {
-                            "start_ts": _iso_dt(getattr(qmem, "start_ts", None)),
-                            "end_ts": _iso_dt(getattr(qmem, "end_ts", None)),
-                            "skill_key": getattr(qmem, "skill_key", None),
-                            "keywords": getattr(qmem, "keywords", None),
-                        },
-                        "hits": len(rows),
-                        "returned": returned,
-                    },
-                    tags_json=["trace:memory_recall_audit", "trace:llm_context"],
+                    data_json=jsonable_encoder(audit_payload),
+                    tags_json=jsonable_encoder(["trace:memory_recall_audit", "trace:llm_context"]),
                 )
-                db.add(audit)
-                db.commit()
+
+                # Write audit in a separate DB session so an audit failure can never break /assistant/route.
+                audit_db = SessionLocal()
+                try:
+                    audit_db.add(audit)
+                    audit_db.commit()
+                finally:
+                    audit_db.close()
             except Exception:
                 logger.exception("MEMORY_AUDIT_DB_WRITE_FAIL tenant_id=%s caller_id=%s", tenant_id, caller_id)
-
 # Build compact evidence lines for the LLM
         evidence_lines: list[str] = []
         for r in rows[:12]:
