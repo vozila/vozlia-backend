@@ -456,6 +456,8 @@ async def twilio_stream(websocket: WebSocket):
     stream_sid: Optional[str] = None
     call_sid: Optional[str] = None
     from_number: Optional[str] = None
+    tenant_id: Optional[str] = None
+    caller_id: Optional[str] = None
 
     # Greeting protection: barge-in should never clip or cancel the opening greeting.
     greeting_audio_protected: bool = True
@@ -942,6 +944,10 @@ async def twilio_stream(websocket: WebSocket):
                 ctx["call_sid"] = call_sid
             if from_number:
                 ctx["from_number"] = from_number
+            if tenant_id:
+                ctx["tenant_id"] = tenant_id
+            if caller_id:
+                ctx["caller_id"] = caller_id
 
             data = await call_fsm_router(transcript, context=ctx, account_id=account_id)
             if isinstance(data, dict):
@@ -1095,9 +1101,9 @@ async def twilio_stream(websocket: WebSocket):
                     "create_fsm_spoken_reply_ctrl", clear_twilio_playback=False, clear_local_audio_buffer=True
                 )
 
-            tenant_id = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
+            tenant_for_ctx = (tenant_id or os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default")
             ctx = ExecutionContext(
-                tenant_id=str(tenant_id),
+                tenant_id=str(tenant_for_ctx),
                 call_sid=call_sid,
                 session_id=stream_sid,
                 skill_key="fsm",
@@ -1457,7 +1463,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Twilio event loop ---------------------------------------------------
     async def twilio_loop():
-        nonlocal stream_sid, call_sid, from_number, prebuffer_active, twilio_ws_closed
+        nonlocal stream_sid, call_sid, from_number, tenant_id, caller_id, prebuffer_active, twilio_ws_closed
 
         try:
             async for msg in websocket.iter_text():
@@ -1474,12 +1480,42 @@ async def twilio_stream(websocket: WebSocket):
                     logger.info("Twilio reports call connected")
 
                 elif event_type == "start":
-                    start = data.get("start", {})
+                    start = data.get("start", {}) or {}
                     stream_sid = start.get("streamSid")
                     call_sid = start.get("callSid") or start.get("call_sid")
                     custom = start.get("customParameters") or {}
+
+                    # Identity from Twilio <Stream><Parameter> (start.customParameters)
+                    tenant_id = (
+                        custom.get("tenant_id")
+                        or custom.get("tenantId")
+                        or custom.get("tenant")
+                        or start.get("tenant_id")
+                        or start.get("tenantId")
+                    )
+                    if not tenant_id:
+                        tenant_id = os.getenv("VOZLIA_TENANT_ID") or os.getenv("TENANT_ID") or "default"
+
+                    # Back-compat / legacy variable name used elsewhere for logs.
                     from_number = custom.get("from") or custom.get("From") or start.get("from") or start.get("From")
-                    logger.info("Stream start call_sid=%s from_number=%s", call_sid, from_number)
+
+                    caller_id = (
+                        custom.get("caller_id")
+                        or custom.get("callerId")
+                        or custom.get("caller")
+                        or custom.get("from")
+                        or custom.get("From")
+                        or from_number
+                    )
+
+                    logger.info(
+                        "Stream start call_sid=%s stream_sid=%s tenant_id=%s caller_id=%s from_number=%s",
+                        call_sid,
+                        stream_sid,
+                        tenant_id,
+                        caller_id,
+                        from_number,
+                    )
 
                     prebuffer_active = True
                     logger.info("Twilio stream event: start")
@@ -1609,12 +1645,17 @@ async def twilio_stream(websocket: WebSocket):
         # --- Call summary (end-of-call) ----------------------------------------
         try:
             enabled = (os.getenv("CALL_SUMMARY_ENABLED", "0").strip() == "1")
-            logger.info("CALL_SUMMARY_FINALIZE_ENTER enabled=%s call_sid=%s", enabled, call_sid)
+            logger.info("CALL_SUMMARY_FINALIZE_ENTER enabled=%s call_sid=%s tenant_id=%s caller_id=%s", enabled, call_sid, tenant_id, caller_id or from_number)
             if enabled and call_sid:
                 db2 = SessionLocal()
                 try:
-                    # caller_id is inferred inside ensure_call_summary_for_call from existing events for this call_sid
-                    ensure_call_summary_for_call(db2, call_sid=str(call_sid))
+                    # Prefer identity from Twilio stream customParameters; fallback to inference if missing.
+                    ensure_call_summary_for_call(
+                        db2,
+                        call_sid=str(call_sid),
+                        tenant_id=tenant_id,
+                        caller_id=(caller_id or from_number),
+                    )
                 finally:
                     db2.close()
 
