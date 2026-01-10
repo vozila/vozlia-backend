@@ -295,6 +295,8 @@ def search_memory_events(
         # Guard against historical bad rows
         .filter(CallerMemoryEvent.text.isnot(None))
         .filter(CallerMemoryEvent.text != "")
+        # Exclude internal trace/audit rows (not real caller memory)
+        .filter(CallerMemoryEvent.skill_key.notin_(["memory_recall_audit", "memory_context_audit"]))
     )
 
     # include_turns param forces turn rows; a 'turn_*' skill_key also forces it.
