@@ -162,6 +162,80 @@ def _tool_to_canonical_phrase(tool: str) -> str | None:
     return None
 
 
+
+
+# ----------------------------
+# Investment Reporting: requested ticker extraction (dynamic overrides)
+# ----------------------------
+
+_TICKER_STOPWORDS = {
+    # Common non-ticker tokens that sometimes appear in all-caps transcripts
+    "USD", "US", "USA", "CEO", "CFO", "FOMC", "SEC", "ETF", "ETFS", "IRA", "ROTH",
+    "APR", "API", "AI", "LLM", "IPO", "EPS", "PE", "P/E",
+    "WHAT", "WHEN", "WHERE", "WHY", "HOW", "THIS", "THAT", "THE", "AND", "OR", "BUT",
+    "PLEASE", "PRICE", "QUOTE", "STOCK", "MARKET", "NEWS", "TODAY", "TOMORROW", "YESTERDAY",
+}
+
+_TICKER_ALLOWED_RE = re.compile(r"^[A-Z0-9^]{1,10}(?:[.\-][A-Z0-9]{1,5})?$")
+
+def _normalize_ticker_symbols(raw: Any) -> list[str]:
+    """Normalize a ticker arg into a de-duped list of symbol strings."""
+    if raw is None:
+        return []
+
+    parts: list[str] = []
+    if isinstance(raw, list):
+        parts = [str(x) for x in raw if x is not None]
+    elif isinstance(raw, str):
+        # Split on commas/spaces to support "AAPL, TSLA" and "AAPL TSLA"
+        parts = [p for p in re.split(r"[\s,]+", raw) if p]
+    else:
+        parts = [str(raw)]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        s = (p or "").strip().upper()
+        if not s:
+            continue
+        s = s.replace("$", "")
+        s = s.strip(".,!?;:()[]{}<>\"'")
+
+        # Filter obvious non-ticker tokens (only for 2+ chars to preserve 1-letter tickers when explicit)
+        if len(s) >= 2 and s in _TICKER_STOPWORDS:
+            continue
+        if not _TICKER_ALLOWED_RE.match(s):
+            continue
+
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _extract_tickers_from_text(raw_text: str) -> list[str]:
+    """Best-effort extraction of ticker-like tokens from a transcript.
+
+    We keep this intentionally conservative to avoid false positives.
+    Primary signals:
+      - $TSLA / $AAPL
+      - 'ticker TSLA' / 'symbol AAPL'
+      - ALL-CAPS tokens like TSLA, AAPL
+    """
+    t = raw_text or ""
+    found: list[str] = []
+
+    # $TSLA style
+    found.extend(re.findall(r"\$([A-Za-z0-9]{1,10}(?:[.\-][A-Za-z0-9]{1,5})?)", t))
+
+    # "ticker TSLA" / "symbol TSLA"
+    found.extend(re.findall(r"\b(?:ticker|symbol)\s+([A-Za-z0-9]{1,10}(?:[.\-][A-Za-z0-9]{1,5})?)\b", t, flags=re.I))
+
+    # ALL-CAPS tokens 2-5 chars (avoid capturing 'I', 'A' etc)
+    found.extend(re.findall(r"\b([A-Z]{2,5}(?:[.\-][A-Z0-9]{1,2})?)\b", t))
+
+    return _normalize_ticker_symbols(found)
+
 def _emit_await_more_enabled() -> bool:
     return (os.getenv("ROUTER_EMIT_AWAIT_MORE", "0") or "").strip().lower() in ("1","true","yes","on")
 
@@ -256,8 +330,11 @@ def llm_plan_route(text: str, *, ctx: dict | None = None) -> dict | None:
         "You are an intent router for a real-time voice assistant. "
         "Given the user's utterance, choose ONE tool to call next (or 'none'). "
         "Be decisive: if the user asks to check emails/inbox/unread emails, choose gmail_summary. "
-        "If the user asks about stocks/tickers/portfolio/market, choose investment_reporting. "
+        "If the user asks about stocks/tickers/portfolio/market OR asks for a stock quote/price/news, choose investment_reporting. "
         "If the user asks about something previously discussed (last call/last week/before), choose memory_lookup. "
+        "IMPORTANT: If you choose investment_reporting and the user mentioned a specific stock or company, "
+        "populate args.tickers with the stock ticker symbols (e.g. ['AAPL'] or ['TSLA']). "
+        "If the user did not specify a stock, use an empty list for args.tickers. "
         "Return STRICT JSON only (no markdown)."
     )
     tools = [
@@ -600,6 +677,21 @@ def run_assistant_route(
             # Still useful to see this in debug traces, but avoid noisy info logs.
             if debug:
                 logger.info("LLM_ROUTER_SKIP_JUNK transcript=%r", (text or ""))
+
+
+    # Investment Reporting: allow dynamic tickers from the caller's utterance.
+    # Priority: (1) LLM router args.tickers (best for company-name -> ticker mapping),
+    #           (2) conservative regex extraction from raw transcript.
+    inv_tickers_override: list[str] = []
+    try:
+        if isinstance(llm_plan, dict):
+            args = llm_plan.get("args") if isinstance(llm_plan.get("args"), dict) else {}
+            inv_tickers_override = _normalize_ticker_symbols(args.get("tickers"))
+    except Exception:
+        inv_tickers_override = []
+
+    if not inv_tickers_override:
+        inv_tickers_override = _extract_tickers_from_text(raw_user_text)
 
     if debug:
         logger.info(
@@ -1357,11 +1449,19 @@ def run_assistant_route(
 
 
     if (not backend_call) and force_investment_reporting:
+        params = {}
+        if inv_tickers_override:
+            params["tickers"] = inv_tickers_override
+
         backend_call = {
             "type": "investment_reporting",
-            "params": {},
+            "params": params,
         }
-        spoken_reply = _standby_phrase() if wants_standby_ack else "Sure — I can give you a stock report."
+
+        if inv_tickers_override:
+            spoken_reply = _standby_phrase() if wants_standby_ack else f"Sure — here’s an update on {', '.join(inv_tickers_override)}."
+        else:
+            spoken_reply = _standby_phrase() if wants_standby_ack else "Sure — I can give you a stock report."
         try:
             fsm_result = dict(fsm_result)
             fsm_result["backend_call"] = backend_call
@@ -1702,9 +1802,22 @@ def run_assistant_route(
             _capture_turn("assistant", payload.get("spoken_reply"))
             return payload
 
-        tickers = get_investment_reporting_tickers(db, current_user)
+        # Allow caller-requested tickers (dynamic override) via backend_call.params OR transcript/router extraction.
+        params = backend_call.get("params") if isinstance(backend_call, dict) else None
+        override_raw = None
+        if isinstance(params, dict):
+            override_raw = params.get("tickers") or params.get("ticker") or params.get("symbols")
+
+        tickers = _normalize_ticker_symbols(override_raw) or (inv_tickers_override or [])
         if not tickers:
-            payload = {"spoken_reply": "Investment reporting is enabled, but no tickers are configured yet.", "fsm": fsm_result, "gmail": None}
+            tickers = get_investment_reporting_tickers(db, current_user)
+
+        if not tickers:
+            payload = {
+                "spoken_reply": "Investment reporting is enabled, but no tickers are configured yet. You can also ask for a specific stock by name or ticker symbol.",
+                "fsm": fsm_result,
+                "gmail": None,
+            }
             _capture_turn("assistant", payload.get("spoken_reply"))
             return payload
 
