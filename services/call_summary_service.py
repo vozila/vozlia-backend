@@ -14,53 +14,84 @@ from sqlalchemy import text
 
 from services.embeddings_service import embed_texts
 
+
 def _api_key() -> str:
     return (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "").strip()
+
 
 def _base_url() -> str:
     return (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
 
+
 def _summary_model() -> str:
     return (os.getenv("CALL_SUMMARY_MODEL") or os.getenv("OPENAI_SUMMARY_MODEL") or "gpt-4o-mini").strip()
 
+
 def _max_transcript_chars() -> int:
     return int(os.getenv("CALL_SUMMARY_MAX_TRANSCRIPT_CHARS", "12000") or 12000)
+
 
 def _response_timeout_s() -> float:
     return float(os.getenv("CALL_SUMMARY_TIMEOUT_S", "12.0") or 12.0)
 
 
-def _min_transcript_chars() -> int:
-    """Minimum transcript size required before we attempt LLM summarization.
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or str(default)).strip())
+    except Exception:
+        return default
 
-    Goal: avoid hallucinated summaries when transcript capture failed or was intentionally skipped
-    (e.g., memory-recall test calls).
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    if not v:
+        return bool(default)
+    return v in ("1", "true", "yes", "on")
+
+
+# Guardrails: if transcript is empty / too short, DO NOT generate a call summary.
+# This prevents the model from fabricating a plausible-sounding "summary" when we have no text evidence.
+CALL_SUMMARY_MIN_TRANSCRIPT_CHARS = _env_int("CALL_SUMMARY_MIN_TRANSCRIPT_CHARS", 20)
+CALL_SUMMARY_REQUIRE_CALLER_TURN = _env_bool("CALL_SUMMARY_REQUIRE_CALLER_TURN", True)
+
+
+def _has_caller_turn(events: List[CallerMemoryEvent]) -> bool:
     """
-    return int(os.getenv("CALL_SUMMARY_MIN_TRANSCRIPT_CHARS", "20") or 20)
-
-def _require_caller_line() -> bool:
-    """If true, require at least one Caller: line in transcript before summarizing.
-
-    This prevents writing summaries when only assistant/skill events exist (often a sign of partial capture).
+    Require at least one caller/user turn event (prevents call summaries on memory-recall-only calls
+    where turns are intentionally not persisted).
     """
-    return (os.getenv("CALL_SUMMARY_REQUIRE_CALLER_LINE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    for e in events or []:
+        try:
+            if getattr(e, "kind", None) == "turn":
+                sk = (getattr(e, "skill_key", "") or "").strip().lower()
+                if sk == "turn_user" or sk.endswith("_user") or "user" in sk:
+                    txt = (getattr(e, "text", "") or "").strip()
+                    if txt:
+                        return True
+        except Exception:
+            continue
+    return False
 
-def transcript_is_actionable(transcript: str) -> tuple[bool, str]:
+
+def transcript_is_actionable(transcript: str, events: List[CallerMemoryEvent]) -> bool:
     t = (transcript or "").strip()
     if not t:
-        return (False, "empty")
-    if _require_caller_line() and ("Caller:" not in t):
-        return (False, "no_caller")
-    if len(t) < _min_transcript_chars():
-        return (False, "too_short")
-    return (True, "ok")
+        return False
+    if len(t) < CALL_SUMMARY_MIN_TRANSCRIPT_CHARS:
+        return False
+    if CALL_SUMMARY_REQUIRE_CALLER_TURN and (not _has_caller_turn(events)):
+        return False
+    return True
+
 
 def _embedding_enabled() -> bool:
     return (os.getenv("VECTOR_MEMORY_ENABLED", "0").strip() == "1")
 
+
 def _vector_str(v: List[float]) -> str:
     # pgvector accepts: '[0.1,0.2,...]'
     return "[" + ",".join(f"{x:.8f}" for x in v) + "]"
+
 
 def _chat_json(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     key = _api_key()
@@ -85,6 +116,7 @@ def _chat_json(messages: List[Dict[str, str]]) -> Dict[str, Any]:
         except Exception:
             logger.warning("CALL_SUMMARY_JSON_PARSE_FAIL content_prefix=%r", (content or "")[:200])
             return {"summary": (content or "").strip()}
+
 
 def build_transcript(events: List[CallerMemoryEvent]) -> str:
     lines: List[str] = []
@@ -123,6 +155,7 @@ def build_transcript(events: List[CallerMemoryEvent]) -> str:
         transcript = "(truncated)\n" + transcript
     return transcript
 
+
 def generate_call_summary(transcript: str) -> Dict[str, Any]:
     sys = (
         "You summarize phone calls for long-term memory and vector recall. "
@@ -143,10 +176,12 @@ def generate_call_summary(transcript: str) -> Dict[str, Any]:
         "Never say you lack memory; these notes ARE the memory."
     )
     user = f"TRANSCRIPT:\n{transcript}"
-    return _chat_json([
-        {"role": "system", "content": sys},
-        {"role": "user", "content": user},
-    ])
+    return _chat_json(
+        [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ]
+    )
 
 
 def write_call_summary_event(
@@ -158,33 +193,33 @@ def write_call_summary_event(
     summary_obj: Dict[str, Any],
     transcript: str,
 ) -> bool:
-    ok, reason = transcript_is_actionable(transcript)
-    if not ok:
-        t = (transcript or "").strip()
-        logger.warning(            "CALL_SUMMARY_WRITE_SKIP transcript_unusable reason=%s tenant_id=%s caller_id=%s call_sid=%s transcript_chars=%s",            reason, tenant_id, caller_id, call_sid, len(t),        )
+    if CallerMemoryEvent is None:
         return False
 
     summary_text = (summary_obj.get("summary") or "").strip()
-    bullets = summary_obj.get("memory_bullets") or []
-    if isinstance(bullets, list) and bullets:
-        bullets_text = "\n".join(f"- {str(b).strip()}" for b in bullets[:12] if str(b).strip())
-        if bullets_text:
-            summary_text = (summary_text + "\n\nMemory bullets:\n" + bullets_text).strip()
+    memory_bullets = summary_obj.get("memory_bullets") or []
+    prefs = summary_obj.get("preferences") or {}
+    facts = summary_obj.get("facts") or {}
+    todos = summary_obj.get("todos") or {}
 
     data_json = {
-        "memory_bullets": summary_obj.get("memory_bullets") or [],
-        "preferences": summary_obj.get("preferences") or {},
-        "facts": summary_obj.get("facts") or {},
-        "todos": summary_obj.get("todos") or [],
+        "summary": summary_text,
+        "memory_bullets": memory_bullets,
+        "preferences": prefs,
+        "facts": facts,
+        "todos": todos,
         "transcript": transcript,
-        "schema": "call_summary.v1",
+        "model": _summary_model(),
+        "created_at": datetime.utcnow().isoformat(timespec="seconds"),
     }
 
-    # Build an embedding text that stays searchable even if the narrative summary is brief.
-    prefs = data_json.get("preferences") or {}
-    facts = data_json.get("facts") or {}
-    todos = data_json.get("todos") or []
+    # Create a single embedding string for vector search
     embedding_text = summary_text
+    try:
+        if isinstance(memory_bullets, list) and memory_bullets:
+            embedding_text += "\n\nBullets:\n- " + "\n- ".join([str(b) for b in memory_bullets[:12]])
+    except Exception:
+        pass
     try:
         if prefs:
             embedding_text += "\n\nPreferences: " + json.dumps(prefs, ensure_ascii=False)
@@ -215,18 +250,21 @@ def write_call_summary_event(
             if hasattr(ev, "embedding"):
                 setattr(ev, "embedding", emb)
             else:
-                # fallback: store in json (keeps data even if pgvector isn't wired yet)
                 data_json["embedding"] = emb
-            data_json["embedding_vector"] = vec_lit
         except Exception:
             logger.exception("CALL_SUMMARY_EMBED_FAIL tenant_id=%s caller_id=%s call_sid=%s", tenant_id, caller_id, call_sid)
 
-    db.add(ev)
-    db.commit()
+    try:
+        db.add(ev)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("CALL_SUMMARY_WRITE_FAIL tenant_id=%s caller_id=%s call_sid=%s", tenant_id, caller_id, call_sid)
+        return False
 
-    # If the ORM model doesn't have an embedding column but the DB does (pgvector),
-    # write it via raw SQL using the vector literal.
-    if vec_lit:
+    # If we computed a vector literal and the table supports a pgvector column, attempt an UPDATE.
+    # This is defensive for deployments where SQLAlchemy model isn't synced with the DB column.
+    if vec_lit and not hasattr(ev, "embedding"):
         try:
             db.execute(
                 text("UPDATE caller_memory_events SET embedding = (:v)::vector WHERE id = :id"),
@@ -263,7 +301,12 @@ def ensure_call_summary_for_call(
     caller_id_resolved = (caller_id or "").strip()
 
     if tenant_id_resolved and caller_id_resolved:
-        logger.info("CALL_SUMMARY_IDENTITY_FROM_STREAM tenant_id=%s caller_id=%s call_sid=%s", tenant_id_resolved, caller_id_resolved, call_sid)
+        logger.info(
+            "CALL_SUMMARY_IDENTITY_FROM_STREAM tenant_id=%s caller_id=%s call_sid=%s",
+            tenant_id_resolved,
+            caller_id_resolved,
+            call_sid,
+        )
     else:
         # Find tenant_id + caller_id from existing events for this call
         row = (
@@ -306,12 +349,23 @@ def ensure_call_summary_for_call(
         return
 
     transcript = build_transcript(events)
-
-    ok, reason = transcript_is_actionable(transcript)
-    if not ok:
-        t = (transcript or "").strip()
-        logger.warning(            "CALL_SUMMARY_SKIP transcript_unusable reason=%s tenant_id=%s caller_id=%s call_sid=%s transcript_chars=%s",            reason, tenant_id, caller_id, call_sid, len(t),        )
+    if not transcript_is_actionable(transcript, events):
+        logger.warning(
+            "CALL_SUMMARY_SKIP transcript_empty_or_no_caller_turn tenant_id=%s caller_id=%s call_sid=%s transcript_chars=%s",
+            tenant_id,
+            caller_id,
+            call_sid,
+            len((transcript or "").strip()),
+        )
         return
+
     summary_obj = generate_call_summary(transcript)
-    write_call_summary_event(db, tenant_id=tenant_id, caller_id=caller_id, call_sid=call_sid, summary_obj=summary_obj, transcript=transcript)
+    write_call_summary_event(
+        db,
+        tenant_id=tenant_id,
+        caller_id=caller_id,
+        call_sid=call_sid,
+        summary_obj=summary_obj,
+        transcript=transcript,
+    )
     logger.info("CALL_SUMMARY_WRITE_OK tenant_id=%s caller_id=%s call_sid=%s", tenant_id, caller_id, call_sid)
