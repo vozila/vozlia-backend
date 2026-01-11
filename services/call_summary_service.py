@@ -29,6 +29,32 @@ def _max_transcript_chars() -> int:
 def _response_timeout_s() -> float:
     return float(os.getenv("CALL_SUMMARY_TIMEOUT_S", "12.0") or 12.0)
 
+
+def _min_transcript_chars() -> int:
+    """Minimum transcript size required before we attempt LLM summarization.
+
+    Goal: avoid hallucinated summaries when transcript capture failed or was intentionally skipped
+    (e.g., memory-recall test calls).
+    """
+    return int(os.getenv("CALL_SUMMARY_MIN_TRANSCRIPT_CHARS", "20") or 20)
+
+def _require_caller_line() -> bool:
+    """If true, require at least one Caller: line in transcript before summarizing.
+
+    This prevents writing summaries when only assistant/skill events exist (often a sign of partial capture).
+    """
+    return (os.getenv("CALL_SUMMARY_REQUIRE_CALLER_LINE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+def transcript_is_actionable(transcript: str) -> tuple[bool, str]:
+    t = (transcript or "").strip()
+    if not t:
+        return (False, "empty")
+    if _require_caller_line() and ("Caller:" not in t):
+        return (False, "no_caller")
+    if len(t) < _min_transcript_chars():
+        return (False, "too_short")
+    return (True, "ok")
+
 def _embedding_enabled() -> bool:
     return (os.getenv("VECTOR_MEMORY_ENABLED", "0").strip() == "1")
 
@@ -132,6 +158,12 @@ def write_call_summary_event(
     summary_obj: Dict[str, Any],
     transcript: str,
 ) -> bool:
+    ok, reason = transcript_is_actionable(transcript)
+    if not ok:
+        t = (transcript or "").strip()
+        logger.warning(            "CALL_SUMMARY_WRITE_SKIP transcript_unusable reason=%s tenant_id=%s caller_id=%s call_sid=%s transcript_chars=%s",            reason, tenant_id, caller_id, call_sid, len(t),        )
+        return False
+
     summary_text = (summary_obj.get("summary") or "").strip()
     bullets = summary_obj.get("memory_bullets") or []
     if isinstance(bullets, list) and bullets:
@@ -274,6 +306,12 @@ def ensure_call_summary_for_call(
         return
 
     transcript = build_transcript(events)
+
+    ok, reason = transcript_is_actionable(transcript)
+    if not ok:
+        t = (transcript or "").strip()
+        logger.warning(            "CALL_SUMMARY_SKIP transcript_unusable reason=%s tenant_id=%s caller_id=%s call_sid=%s transcript_chars=%s",            reason, tenant_id, caller_id, call_sid, len(t),        )
+        return
     summary_obj = generate_call_summary(transcript)
     write_call_summary_event(db, tenant_id=tenant_id, caller_id=caller_id, call_sid=call_sid, summary_obj=summary_obj, transcript=transcript)
     logger.info("CALL_SUMMARY_WRITE_OK tenant_id=%s caller_id=%s call_sid=%s", tenant_id, caller_id, call_sid)
