@@ -120,11 +120,18 @@ from services.caller_cache import (
     normalize_caller_id,
 )
 from services.longterm_memory import (
+
     record_turn_event,
     longterm_memory_enabled_for_tenant,
     fetch_recent_memory_text,
     record_skill_result,
 )
+
+# Optional KB voice Q&A (DB-backed; keep failures non-fatal)
+try:
+    from services.kb_voice import answer_from_kb  # type: ignore
+except Exception:  # pragma: no cover
+    answer_from_kb = None  # type: ignore
 
 # ----------------------------
 # LLM Router (intermediate step)
@@ -783,7 +790,7 @@ def run_assistant_route(
     longterm_enabled = False
     capture_turns = False
 
-    def _capture_turn(role: str, msg: str | None) -> None:
+    def _capture_turn(role: str, msg: str | None, extra_data_json: dict | None = None) -> None:
         if not longterm_enabled or not capture_turns:
             return
         if not tenant_uuid or not caller_id:
@@ -799,6 +806,7 @@ def run_assistant_route(
                 call_sid=(str(call_id) if call_id else None),
                 role=str(role or "user"),
                 text=body,
+                extra_data_json=extra_data_json,
             )
         except Exception:
             logger.exception("TURN_CAPTURE_FAIL tenant_id=%s caller_id=%s role=%s", tenant_id, caller_id, role)
@@ -1954,6 +1962,68 @@ def run_assistant_route(
         payload = {"spoken_reply": str(spoken_list[0]), "fsm": fsm_result, "gmail": None}
         _capture_turn("assistant", payload.get("spoken_reply"))
         return payload
+
+
+    # -------------------------------------------------
+    # Optional: KB voice Q&A (reads kb_chunks in Postgres; no Control-Plane hop)
+    # Default behavior is conservative: only tries KB if we'd otherwise say nothing (unless override is enabled).
+    kb_voice_enabled = (os.getenv("VOICE_KB_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+    kb_override_nonempty = (os.getenv("VOICE_KB_OVERRIDE_NONEMPTY", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+    kb_min_words = int(os.getenv("VOICE_KB_MIN_WORDS", "2") or 2)
+    if kb_voice_enabled and answer_from_kb and (raw_user_text or "").strip():
+        # Only attempt KB if (a) we are empty/uncertain OR (b) explicitly overridden
+        _word_count = len((raw_user_text or "").strip().split())
+        if _word_count >= kb_min_words and (kb_override_nonempty or not (spoken_reply and str(spoken_reply).strip())):
+            try:
+                kb_limit = int(os.getenv("VOICE_KB_LIMIT", "8") or 8)
+            except Exception:
+                kb_limit = 8
+
+            try:
+                kb_res = answer_from_kb(
+                    db,
+                    tenant_uuid=str(tenant_uuid),
+                    query=str(raw_user_text),
+                    limit=kb_limit,
+                    include_policy=True,
+                )
+                if kb_res and getattr(kb_res, "answer", None):
+                    spoken_reply = str(kb_res.answer)
+
+                    # Add lightweight breadcrumbs for observability/debugging (doesn't affect voice output).
+                    try:
+                        fsm_result = dict(fsm_result or {})
+                        fsm_result["kb"] = {
+                            "used": True,
+                            "strategy": getattr(kb_res, "retrieval_strategy", None),
+                            "sources": len(getattr(kb_res, "sources", []) or []),
+                            "policy_chars": getattr(kb_res, "policy_chars", 0),
+                            "context_chars": getattr(kb_res, "context_chars", 0),
+                            "latency_ms": getattr(kb_res, "latency_ms", None),
+                            "model": getattr(kb_res, "model", None),
+                        }
+                    except Exception:
+                        pass
+
+                    payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
+
+                    # Capture assistant turn with KB citations so the WebUI turn console can render sources.
+                    _capture_turn(
+                        "assistant",
+                        payload.get("spoken_reply"),
+                        extra_data_json={
+                            "kb_query": str(raw_user_text),
+                            "kb_strategy": getattr(kb_res, "retrieval_strategy", None),
+                            "kb_sources": getattr(kb_res, "sources", []) or [],
+                            "kb_policy_chars": getattr(kb_res, "policy_chars", 0),
+                            "kb_context_chars": getattr(kb_res, "context_chars", 0),
+                            "kb_latency_ms": getattr(kb_res, "latency_ms", None),
+                            "kb_model": getattr(kb_res, "model", None),
+                        },
+                    )
+                    return payload
+            except Exception:
+                logger.exception("KB_VOICE_FAIL tenant_id=%s", tenant_id)
 
     payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
     _capture_turn("assistant", payload.get("spoken_reply"))

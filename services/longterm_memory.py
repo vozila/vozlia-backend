@@ -241,6 +241,7 @@ def record_turn_event(
     role: str,
     text: str,
     session_id: str | None = None,
+    extra_data_json: dict[str, Any] | None = None,
 ) -> bool:
     """Write a turn-level memory event (user or assistant). Stores cleaned text in `text`,
     raw text in data_json, and tags_json with kw:* and fact:* tags.
@@ -260,6 +261,14 @@ def record_turn_event(
         # include extracted facts (small / structured)
         if enriched.facts:
             data["facts"] = enriched.facts
+
+        # Optional extra payload (e.g., KB sources/citations for the turn console)
+        if extra_data_json and isinstance(extra_data_json, dict):
+            for k, v in extra_data_json.items():
+                # Avoid clobbering core keys
+                if k in data:
+                    continue
+                data[k] = v
 
         return write_memory_event(
             db,
