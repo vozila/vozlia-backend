@@ -69,6 +69,7 @@ from vozlia_twilio.speech_controller import (
     ExecutionContext,
     SpeechRequest,
 )
+from vozlia_twilio.thinking_sound import THINKING_CLIP_ULAW, THINKING_CLIP_DURATION_S
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +477,9 @@ async def twilio_stream(websocket: WebSocket):
     backchannel_task: Optional[asyncio.Task] = None
     backchannel_pending: bool = False
 
+    # Thinking sound: short earcon while waiting on router/LLM so caller doesn't feel dropped.
+    thinking_task: Optional[asyncio.Task] = None
+
 
 
     barge_in_enabled: bool = False
@@ -810,6 +814,105 @@ async def twilio_stream(websocket: WebSocket):
         backchannel_task = asyncio.create_task(_run())
         logger.info("VOICE_BACKCHANNEL_START delay_ms=%d intent=%s reason=%s", delay_ms, intent, reason)
 
+
+    # --- Thinking sound helpers --------------------------------------------
+    def _thinking_sound_enabled() -> bool:
+        # Safe-by-default: disabled unless explicitly enabled.
+        v = (os.getenv("VOICE_THINKING_SOUND_ENABLED", "0") or "0").strip().lower()
+        return v in ("1", "true", "yes", "on")
+
+    def _thinking_sound_supported() -> bool:
+        # We only support g711_ulaw because Twilio media frames are 8kHz μ-law.
+        return (REALTIME_OUTPUT_AUDIO_FORMAT or "").strip().lower() == "g711_ulaw"
+
+    def _thinking_sound_delay_ms() -> int:
+        # Delay before the first earcon so we don’t beep on fast responses.
+        try:
+            return int(os.getenv("VOICE_THINKING_SOUND_DELAY_MS", "500") or 500)
+        except Exception:
+            return 500
+
+    def _thinking_sound_loop_ms() -> int:
+        # How often we’re allowed to enqueue another earcon loop (if still waiting).
+        try:
+            return int(os.getenv("VOICE_THINKING_SOUND_LOOP_MS", "1400") or 1400)
+        except Exception:
+            return 1400
+
+    def _thinking_sound_max_s() -> float:
+        # Hard stop so we never 'hold music' forever.
+        try:
+            return float(os.getenv("VOICE_THINKING_SOUND_MAX_S", "10") or 10)
+        except Exception:
+            return 10.0
+
+    def _thinking_sound_backlog_max_s() -> float:
+        # Don’t queue more than this much thinking audio ahead of realtime.
+        try:
+            return float(os.getenv("VOICE_THINKING_SOUND_BACKLOG_MAX_S", "0.8") or 0.8)
+        except Exception:
+            return 0.8
+
+    async def _cancel_thinking_sound(reason: str):
+        """Cancel any in-flight thinking sound task."""
+        nonlocal thinking_task
+        if thinking_task and not thinking_task.done():
+            thinking_task.cancel()
+            logger.info("VOICE_THINKING_SOUND_CANCEL reason=%s", reason)
+        thinking_task = None
+
+    async def _start_thinking_sound(reason: str):
+        """Start a low-impact earcon loop while we wait on routing/LLM work."""
+        nonlocal thinking_task
+        if not _thinking_sound_enabled():
+            return
+        if not _thinking_sound_supported():
+            # Avoid blasting garbage bytes if audio format changes.
+            logger.warning("VOICE_THINKING_SOUND_UNSUPPORTED_FORMAT format=%s", REALTIME_OUTPUT_AUDIO_FORMAT)
+            return
+
+        await _cancel_thinking_sound("restart")
+
+        delay_s = max(0.0, _thinking_sound_delay_ms() / 1000.0)
+        loop_s = max(0.2, _thinking_sound_loop_ms() / 1000.0)
+        max_s = max(0.5, _thinking_sound_max_s())
+        backlog_max_bytes = int(max(0.2, _thinking_sound_backlog_max_s()) * 8000)
+
+        async def _run():
+            try:
+                # Never interfere with the greeting (caller experience).
+                # We delay anyway, but this guards edge cases.
+                await asyncio.sleep(delay_s)
+
+                t0 = time.monotonic()
+                while True:
+                    if twilio_ws_closed:
+                        return
+                    # If the caller starts speaking again, stop the earcon.
+                    if user_speaking_vad:
+                        return
+                    # Don’t play while greeting is protected.
+                    if greeting_audio_protected:
+                        await asyncio.sleep(0.05)
+                        continue
+                    if (time.monotonic() - t0) > max_s:
+                        return
+
+                    # Only enqueue if we’re close to realtime (avoid backlog).
+                    if len(audio_buffer) < backlog_max_bytes:
+                        audio_buffer.extend(THINKING_CLIP_ULAW)
+                        logger.info("VOICE_THINKING_SOUND_ENQUEUE bytes=%d", len(THINKING_CLIP_ULAW))
+                        # Sleep at least one clip duration so we don’t stack earcons.
+                        await asyncio.sleep(max(loop_s, THINKING_CLIP_DURATION_S))
+                    else:
+                        await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("VOICE_THINKING_SOUND_ERROR")
+
+        thinking_task = asyncio.create_task(_run())
+        logger.info("VOICE_THINKING_SOUND_START reason=%s delay_s=%.2f", reason, delay_s)
     async def twilio_clear_buffer():
         if stream_sid is None:
             return
@@ -832,6 +935,7 @@ async def twilio_stream(websocket: WebSocket):
         """
         nonlocal active_response_id, prebuffer_active
         nonlocal greeting_audio_protected
+        await _cancel_thinking_sound("barge_in")
         if greeting_audio_protected:
             logger.info("BARGE-IN: ignored (greeting protected)")
             return
@@ -1152,6 +1256,8 @@ async def twilio_stream(websocket: WebSocket):
             return
 
         await _cancel_backchannel("new_transcript")
+        await _cancel_thinking_sound("new_transcript")
+
 
         if event.get("_await_more_flush"):
             logger.info("USER Transcript merged (await_more_flush): %r", transcript)
@@ -1230,7 +1336,11 @@ async def twilio_stream(websocket: WebSocket):
             await create_generic_response()
             return
 
-        fsm_payload = await route_to_fsm_and_get_payload(transcript)
+        await _start_thinking_sound("fsm_route")
+        try:
+            fsm_payload = await route_to_fsm_and_get_payload(transcript)
+        finally:
+            await _cancel_thinking_sound("fsm_route_done")
         spoken_reply = fsm_payload.get("spoken_reply") if isinstance(fsm_payload, dict) else None
         suppress = bool(fsm_payload.get("suppress_response")) if isinstance(fsm_payload, dict) else False
 
@@ -1417,6 +1527,7 @@ async def twilio_stream(websocket: WebSocket):
 
                 elif etype == "input_audio_buffer.speech_started":
                     user_speaking_vad = True
+                    await _cancel_thinking_sound("user_speech_started")
                     logger.info("OpenAI VAD: user speech START")
                     if not user_spoke_once:
                         user_spoke_once = True
