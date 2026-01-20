@@ -488,6 +488,7 @@ async def twilio_stream(websocket: WebSocket):
     user_speaking_vad: bool = False
 
     audio_buffer = bytearray()
+    earcon_buffer = bytearray()  # thinking/earcon audio (bypasses prebuffer)
     assistant_last_audio_time: float = 0.0
     prebuffer_active: bool = True
 
@@ -496,23 +497,26 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
-        if audio_buffer:
+        if audio_buffer or earcon_buffer:
             return True
         if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) < 0.5:
             return True
         return False
 
     # --- Helper: send μ-law audio TO Twilio ---------------------------------
-    async def send_audio_to_twilio():
+    async def send_audio_to_twilio(buf: bytearray | None = None):
         nonlocal audio_buffer, assistant_last_audio_time
+
+        if buf is None:
+            buf = audio_buffer
 
         if stream_sid is None:
             return
-        if len(audio_buffer) < BYTES_PER_FRAME:
+        if len(buf) < BYTES_PER_FRAME:
             return
 
-        frame = bytes(audio_buffer[:BYTES_PER_FRAME])
-        del audio_buffer[:BYTES_PER_FRAME]
+        frame = bytes(buf[:BYTES_PER_FRAME])
+        del buf[:BYTES_PER_FRAME]
 
         payload = base64.b64encode(frame).decode("ascii")
         msg = {
@@ -533,7 +537,7 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Background task: paced audio sender to Twilio ----------------------
     async def twilio_audio_sender():
-        nonlocal audio_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled, twilio_ws_closed
+        nonlocal audio_buffer, earcon_buffer, prebuffer_active, assistant_last_audio_time, barge_in_enabled, twilio_ws_closed
 
         send_start_ts: Optional[float] = None
         frame_idx: int = 0
@@ -559,7 +563,7 @@ async def twilio_stream(websocket: WebSocket):
                 if now - last_stat_ts >= 1.0:
                     logger.info(
                         "twilio_send stats: q_bytes=%d frames_sent=%d underruns=%d late_ms_max=%.1f prebuf=%s",
-                        len(audio_buffer),
+                        (len(audio_buffer) + len(earcon_buffer)),
                         frames_sent_interval,
                         underruns,
                         late_ms_max,
@@ -571,27 +575,12 @@ async def twilio_stream(websocket: WebSocket):
                     late_ms_max = 0.0
 
                 # idle reset
-                if len(audio_buffer) == 0:
+                if len(audio_buffer) == 0 and len(earcon_buffer) == 0:
                     if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) > 1.0:
                         send_start_ts = None
                         frame_idx = 0
                     await asyncio.sleep(0.005)
                     continue
-
-                # prebuffer at utterance start
-                if prebuffer_active:
-                    if len(audio_buffer) < PREBUFFER_BYTES:
-                        await asyncio.sleep(0.005)
-                        continue
-
-                    prebuffer_active = False
-                    logger.info("Prebuffer complete; starting to send audio to Twilio")
-                    if not barge_in_enabled:
-                        barge_in_enabled = True
-                        logger.info("Barge-in is now ENABLED (audio streaming started).")
-
-                    send_start_ts = time.monotonic()
-                    frame_idx = 0
 
                 if send_start_ts is None:
                     send_start_ts = time.monotonic()
@@ -615,6 +604,31 @@ async def twilio_stream(websocket: WebSocket):
                 late_ms = (time.monotonic() - target) * 1000.0
                 if late_ms > late_ms_max:
                     late_ms_max = late_ms
+
+                # Always allow earcon frames even during prebuffer.
+                if len(earcon_buffer) >= BYTES_PER_FRAME:
+                    try:
+                        await send_audio_to_twilio(earcon_buffer)
+                    except WebSocketDisconnect:
+                        logger.info("Twilio WebSocket closed; stopping audio sender task")
+                        return
+                    except Exception:
+                        logger.exception("Error sending earcon audio to Twilio; stopping sender")
+                        return
+                    frame_idx += 1
+                    frames_sent_interval += 1
+                    continue
+
+                # prebuffer at utterance start (speech audio only)
+                if prebuffer_active:
+                    if len(audio_buffer) < PREBUFFER_BYTES:
+                        await asyncio.sleep(0.005)
+                        continue
+
+                    prebuffer_active = False
+                    logger.info("Prebuffer complete; starting to send audio to Twilio")
+                    if not barge_in_enabled:
+                        barge_in_enabled = True
 
                 if len(audio_buffer) >= BYTES_PER_FRAME:
                     try:
@@ -860,6 +874,7 @@ async def twilio_stream(websocket: WebSocket):
             thinking_task.cancel()
             logger.info("VOICE_THINKING_SOUND_CANCEL reason=%s", reason)
         thinking_task = None
+        earcon_buffer.clear()
 
     async def _start_thinking_sound(reason: str):
         """Start a low-impact earcon loop while we wait on routing/LLM work."""
@@ -899,8 +914,8 @@ async def twilio_stream(websocket: WebSocket):
                         return
 
                     # Only enqueue if we’re close to realtime (avoid backlog).
-                    if len(audio_buffer) < backlog_max_bytes:
-                        audio_buffer.extend(THINKING_CLIP_ULAW)
+                    if len(earcon_buffer) < backlog_max_bytes:
+                        earcon_buffer.extend(THINKING_CLIP_ULAW)
                         logger.info("VOICE_THINKING_SOUND_ENQUEUE bytes=%d", len(THINKING_CLIP_ULAW))
                         # Sleep at least one clip duration so we don’t stack earcons.
                         await asyncio.sleep(max(loop_s, THINKING_CLIP_DURATION_S))
@@ -964,6 +979,7 @@ async def twilio_stream(websocket: WebSocket):
         # Clear local audio immediately
         await twilio_clear_buffer()
         audio_buffer.clear()
+        earcon_buffer.clear()
 
         # Optionally inform the Realtime conversation that the assistant output was interrupted.
         # This helps the model avoid "reset" replies when the caller says "continue/go on".
@@ -1141,6 +1157,7 @@ async def twilio_stream(websocket: WebSocket):
 
         if clear_local_audio_buffer:
             audio_buffer.clear()
+            earcon_buffer.clear()
 
         prebuffer_active = True
 
@@ -1339,8 +1356,9 @@ async def twilio_stream(websocket: WebSocket):
         await _start_thinking_sound("fsm_route")
         try:
             fsm_payload = await route_to_fsm_and_get_payload(transcript)
-        finally:
-            await _cancel_thinking_sound("fsm_route_done")
+        except Exception:
+            await _cancel_thinking_sound("fsm_route_error")
+            raise
         spoken_reply = fsm_payload.get("spoken_reply") if isinstance(fsm_payload, dict) else None
         suppress = bool(fsm_payload.get("suppress_response")) if isinstance(fsm_payload, dict) else False
 
@@ -1523,6 +1541,7 @@ async def twilio_stream(websocket: WebSocket):
                         logger.exception("Failed to decode response.audio.delta")
                         continue
 
+                    await _cancel_thinking_sound("assistant_audio_started")
                     audio_buffer.extend(delta_bytes)
 
                 elif etype == "input_audio_buffer.speech_started":
