@@ -300,7 +300,15 @@ def _invrep_requested_tickers(raw_text: str, llm_plan: dict | None) -> tuple[lis
 
 
 def _emit_await_more_enabled() -> bool:
-    return (os.getenv("ROUTER_EMIT_AWAIT_MORE", "0") or "").strip().lower() in ("1","true","yes","on")
+    """
+    Prefer explicit router flag; otherwise follow voice setting so the
+    pipeline can't be half-enabled (stream ready, router disabled).
+    """
+    v = os.getenv("ROUTER_EMIT_AWAIT_MORE")
+    if v is not None:
+        return v == "1"
+    return os.getenv("VOICE_ENABLE_AWAIT_MORE", "0") == "1"
+
 
 def _await_more_default_ms() -> int:
     try:
