@@ -167,6 +167,51 @@ HARD_IGNORE = {"um", "uh", "er", "hmm", "mm", "mmm", "uh huh", "mhm"}
 ACKS = {"awesome", "great", "okay", "ok", "thanks", "thank you", "right", "cool"}
 CONTINUE_TRIGGERS = {"continue", "go on", "keep going", "tell me more", "what else"}
 
+# Heuristic: tiny 'false final' fragments that we should floor-hold for (stutters/partials)
+# instead of immediately routing to the LLM (prevents stray filler audio + thinking loop overlap).
+FRAGMENT_PREFIX_WORDS = {
+    "i", "you", "we", "they", "he", "she", "it",
+    "and", "but", "so", "because", "well",
+    "um", "uh", "erm", "hmm", "huh", "like",
+    "ok", "okay", "yeah", "yep", "right", "actually", "just",
+    "wait", "hold", "one", "can", "could", "what", "when", "where", "why", "how",
+    "do", "does", "did", "is", "are", "am",
+}
+FRAGMENT_SECOND_WORDS = {
+    "you", "me", "us", "we", "them", "they", "it", "this", "that", "these", "those", "here", "there",
+}
+FRAGMENT_PHRASES = {
+    "you know",
+    "i mean",
+    "kind of",
+    "sort of",
+    "hold on",
+    "hang on",
+    "one sec",
+    "one second",
+    "wait a",
+}
+
+
+def looks_like_utterance_fragment(text: str) -> bool:
+    """Return True for very short fragments likely to be continued."""
+    n = _normalize_text(text)
+    if not n:
+        return False
+    if n in CONTINUE_TRIGGERS:
+        return False
+    if n in HARD_IGNORE:
+        return True
+    words = n.split()
+    if len(words) == 1:
+        return words[0] in FRAGMENT_PREFIX_WORDS
+    if len(words) == 2:
+        if n in FRAGMENT_PHRASES:
+            return True
+        return (words[0] in FRAGMENT_PREFIX_WORDS) and (words[1] in FRAGMENT_SECOND_WORDS)
+    return False
+
+
 
 def should_reply(text: str, style: str, *, is_skill_intent: bool) -> bool:
     n = _normalize_text(text)
@@ -497,13 +542,19 @@ async def twilio_stream(websocket: WebSocket):
 
     # --- Simple helper: is assistant currently speaking? ---------------------
     def assistant_actively_speaking() -> bool:
+        """Best-effort: do we still have assistant audio that could be playing?"""
         if audio_buffer or earcon_buffer:
             return True
-        if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) < 0.5:
+        # Twilio playback can lag behind our last send; keep this window a bit larger to avoid
+        # 'two eras' (old speech + new thinking sound) overlapping on barge-in/noise.
+        try:
+            recent_s = float(os.getenv("VOICE_ASSISTANT_RECENT_AUDIO_S") or os.getenv("BARGE_IN_RECENT_AUDIO_S") or "1.5")
+        except Exception:
+            recent_s = 1.5
+        if assistant_last_audio_time and (time.monotonic() - assistant_last_audio_time) < max(0.2, recent_s):
             return True
         return False
 
-    # --- Helper: send μ-law audio TO Twilio ---------------------------------
     async def send_audio_to_twilio(buf: bytearray | None = None):
         nonlocal audio_buffer, assistant_last_audio_time
 
@@ -731,8 +782,14 @@ async def twilio_stream(websocket: WebSocket):
 
         # Clamp / sanitize
         if ms <= 0:
-            ms = int(os.getenv("VOICE_AWAIT_MORE_DEFAULT_MS", "1200") or 1200)
-        max_ms = int(os.getenv("VOICE_AWAIT_MORE_MAX_MS", "2500") or 2500)
+            try:
+                ms = int(os.getenv("VOICE_AWAIT_MORE_DEFAULT_MS") or os.getenv("ROUTER_AWAIT_MORE_DEFAULT_MS") or "650")
+            except Exception:
+                ms = 650
+        try:
+            max_ms = int(os.getenv("VOICE_AWAIT_MORE_MAX_MS") or os.getenv("ROUTER_AWAIT_MORE_MAX_MS") or "1400")
+        except Exception:
+            max_ms = 1400
         if ms > max_ms:
             ms = max_ms
 
@@ -885,6 +942,12 @@ async def twilio_stream(websocket: WebSocket):
             # Avoid blasting garbage bytes if audio format changes.
             logger.warning("VOICE_THINKING_SOUND_UNSUPPORTED_FORMAT format=%s", REALTIME_OUTPUT_AUDIO_FORMAT)
             return
+        # Guardrail: never play the thinking earcon while prior assistant audio may still be draining.
+        # (Prevents confusing overlap: prior 'wrap-up' speech + current thinking loop.)
+        if assistant_actively_speaking():
+            logger.debug("thinking_sound_skip assistant still speaking reason=%s", reason)
+            return
+
 
         await _cancel_thinking_sound("restart")
 
@@ -951,6 +1014,7 @@ async def twilio_stream(websocket: WebSocket):
         nonlocal active_response_id, prebuffer_active
         nonlocal greeting_audio_protected
         await _cancel_thinking_sound("barge_in")
+        await _cancel_backchannel("barge_in")
         if greeting_audio_protected:
             logger.info("BARGE-IN: ignored (greeting protected)")
             return
@@ -968,13 +1032,15 @@ async def twilio_stream(websocket: WebSocket):
         )
 
         # Cancel server-side generation if possible
-        if openai_ws is not None and active_response_id is not None:
-            rid = active_response_id
+        rid = active_response_id
+        if openai_ws is not None and rid is not None:
             try:
                 await openai_ws.send(json.dumps({"type": "response.cancel", "response_id": rid}))
-                logger.info("BARGE-IN: Sent response.cancel for %s", rid)
+                logger.info("BARGE_IN sent response.cancel response_id=%s", rid)
             except Exception:
-                logger.exception("BARGE-IN: Failed sending response.cancel for %s", rid)
+                logger.exception("BARGE_IN cancel failed")
+            # We intentionally clear locally; OpenAI may still stream a late event or two.
+            active_response_id = None
 
         # Clear local audio immediately
         await twilio_clear_buffer()
@@ -983,7 +1049,7 @@ async def twilio_stream(websocket: WebSocket):
 
         # Optionally inform the Realtime conversation that the assistant output was interrupted.
         # This helps the model avoid "reset" replies when the caller says "continue/go on".
-        if openai_ws is not None and os.getenv("BARGE_IN_CONTEXT_NOTE", "1") == "1":
+        if openai_ws is not None and rid is not None and os.getenv("BARGE_IN_CONTEXT_NOTE", "1") == "1":
             try:
                 await openai_ws.send(json.dumps({
                     "type": "conversation.item.create",
@@ -1274,6 +1340,11 @@ async def twilio_stream(websocket: WebSocket):
 
         await _cancel_backchannel("new_transcript")
         await _cancel_thinking_sound("new_transcript")
+        # Guardrail: if a user utterance completes while assistant audio may still be draining,
+        # treat it as a barge-in to prevent 'old speech' overlapping with new thinking audio.
+        if (not event.get("_await_more_flush")) and barge_in_enabled and (not greeting_audio_protected) and assistant_actively_speaking():
+            await handle_barge_in()
+
 
 
         if event.get("_await_more_flush"):
@@ -1340,6 +1411,15 @@ async def twilio_stream(websocket: WebSocket):
         feature = "email" if is_email else "chitchat"
         style = get_style_for_feature(feature)
 
+        # Await-more (human-style floor-hold): if Deepgram/Realtime finalizes a tiny fragment
+        # (stutter/false-final like "you", "um", "I"), buffer it briefly instead of replying.
+        if (not event.get("_await_more_flush")) and _await_more_enabled() and (await_more_task is None) and (pending_discovery_skill_id is None) and (not is_email):
+            if looks_like_utterance_fragment(transcript):
+                await_more_text = transcript.strip()
+                await _schedule_await_more_flush(ms=0, reason="fragment_start")
+                logger.info("Await-more start (fragment_start): %r", transcript.strip())
+                return
+
         if not should_reply(transcript, style, is_skill_intent=is_email):
             logger.info("Ignoring transcript (style=%s feature=%s): %r", style, feature, transcript)
             return
@@ -1367,6 +1447,7 @@ async def twilio_stream(websocket: WebSocket):
             await create_fsm_spoken_reply(spoken_reply)
         else:
             if suppress and (os.getenv("VOICE_SKIP_GENERIC_ON_SUPPRESS", "1").strip().lower() in ("1","true","yes","on")):
+                await _cancel_thinking_sound("suppress_response")
                 logger.info("VOICE_SUPPRESS_GENERIC_RESPONSE call_sid=%s", call_sid)
                 # Schedule a short acknowledgment so the caller doesn't feel dropped.
                 try:
@@ -1547,6 +1628,7 @@ async def twilio_stream(websocket: WebSocket):
                 elif etype == "input_audio_buffer.speech_started":
                     user_speaking_vad = True
                     await _cancel_thinking_sound("user_speech_started")
+                    await _cancel_backchannel("user_speech_started")
                     logger.info("OpenAI VAD: user speech START")
                     if not user_spoke_once:
                         user_spoke_once = True
