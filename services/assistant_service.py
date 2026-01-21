@@ -1647,104 +1647,330 @@ def run_assistant_route(
     # (1) Existing FSM backend call behavior (no change)
 
 
-    # (1.5) Multi-skill support:
-    # If the user asks for *multiple* enabled skills in a single utterance (e.g. "check my email AND give me Cisco stock"),
-    # run them sequentially and combine the spoken replies into a single response.
+    # (1.5) True multi-tool routing (same turn)
     #
-    # This prevents the "only the last skill runs" behavior when `backend_call` can represent just one action.
+    # If the user asks for multiple tools/skills in ONE utterance (e.g. "summarize my emails and what's Cisco's stock price"),
+    # run them sequentially and combine their spoken replies into a single assistant turn.
+    #
+    # IMPORTANT:
+    # - We keep this fail-open: if anything errors, we log and fall back to the single-tool routing below.
+    # - This runs before the single `backend_call` handlers, because `backend_call` can only represent one action.
     try:
-        skills_enabled_now = os.getenv("SKILLS_ENGINE_ENABLED", "false").lower() == "true"
-        if skills_enabled_now:
+        multi_tools_enabled = os.getenv("VOICE_MULTI_TOOLS_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+        if multi_tools_enabled:
             user_text = raw_user_text if "raw_user_text" in locals() else (text or "")
-            skill_cfg = get_skills_config(db, tenant_uuid)
+            user_text_l = (user_text or "").lower()
 
-            wanted: list[str] = []
+            # Build ordered tool/skill list for this turn
+            requested: list[str] = []
 
-            # 1) Forced skill(s) from the voice layer (string or list)
+            # 1) Forced tool/skill(s) from the voice layer (string or list)
             forced = None
             if isinstance(ctx_flags, dict):
-                forced = ctx_flags.get("forced_skill_id")
+                forced = ctx_flags.get("forced_skill_id") or ctx_flags.get("forced_tool_id")
             if isinstance(forced, str) and forced:
-                wanted.append(forced)
+                requested.append(forced)
             elif isinstance(forced, (list, tuple)):
-                wanted.extend([x for x in forced if isinstance(x, str) and x])
+                requested.extend([x for x in forced if isinstance(x, str) and x])
 
-            # 2) Phrase-based matches (ordered by first mention)
-            wanted.extend(match_skill_ids(user_text, limit=8))
-
-            # 3) Lightweight heuristic matches (catch cases where phrase lists are too strict)
-            t_l = user_text.lower()
-            if re.search(r"\b(email|gmail|inbox|mailbox)\b", t_l):
-                wanted.append("gmail_summary")
-
+            # 2) Phrase-based skill matches (Skills Engine registry)
             try:
-                tickers, _mode = _invrep_requested_tickers(user_text, llm_plan)
+                requested.extend(match_skill_ids(user_text, limit=8))
             except Exception:
-                tickers = []
-            if tickers or re.search(r"\b(stock|ticker|quote|marketcap)\b|\bshare\s+price\b|\bmarket\s+cap\b", t_l):
-                wanted.append("investment_reporting")
+                pass
 
-            # 4) Router hint + FSM backend_call (single-slot), if they point at known skills
+            # 3) Heuristic tool matches (built-ins)
+            if re.search(r"\b(email|emails|gmail|inbox|mailbox)\b", user_text_l):
+                requested.append("gmail_summary")
+
+            # Investment reporting intent: explicit stock/price language OR ticker(s) present
+            try:
+                inv_tickers, _inv_mode = _invrep_requested_tickers(user_text, llm_plan)
+            except Exception:
+                inv_tickers, _inv_mode = ([], None)
+
+            if inv_tickers or re.search(r"\b(stock|stocks|share price|quote|ticker|market cap|price target)\b", user_text_l):
+                requested.append("investment_reporting")
+
+            # 4) Router/FSM hints (single-tool planners still contribute one)
             if isinstance(llm_plan, dict):
                 tool = llm_plan.get("tool")
                 if isinstance(tool, str) and tool:
-                    wanted.append(tool)
+                    requested.append(tool)
             if isinstance(backend_call, dict):
                 bc_type = backend_call.get("type") or backend_call.get("skill_id")
                 if isinstance(bc_type, str) and bc_type:
-                    wanted.append(bc_type)
+                    requested.append(bc_type)
 
             # Deduplicate while preserving order
             seen: set[str] = set()
-            wanted = [sid for sid in wanted if sid and not (sid in seen or seen.add(sid))]
+            requested = [sid for sid in requested if sid and not (sid in seen or seen.add(sid))]
 
-            # Keep only enabled + registered skills
-            wanted = [sid for sid in wanted if skill_cfg.get(sid, {}).get("enabled") and skill_registry.get(sid)]
+            # Filter: keep only supported built-ins or registered Skills Engine skills
+            builtin_tools: set[str] = {"gmail_summary", "investment_reporting"}
+            requested = [sid for sid in requested if (sid in builtin_tools) or bool(skill_registry.get(sid))]
 
-            max_per_turn = int(os.getenv("VOICE_MULTI_SKILLS_MAX", "2") or "2")
-            if len(wanted) >= 2:
-                logger.info("MULTI_SKILL detected wanted=%s", wanted)
-                spoken_parts: list[str] = []
-                merged: dict = {}
-                skills_results: list[dict] = []
+            # Enforce enable gates:
+            # - For built-ins, use their existing settings toggles.
+            # - For Skills Engine skills, if the tenant has an explicit enabled flag, respect it;
+            #   otherwise default allow (fail-open).
+            skill_cfg = {}
+            try:
+                if tenant_uuid:
+                    skill_cfg = get_skills_config(db, tenant_uuid) or {}
+            except Exception:
+                skill_cfg = {}
 
-                for sid in wanted[:max_per_turn]:
+            def _tool_enabled(sid: str) -> bool:
+                if sid == "gmail_summary":
+                    return gmail_summary_enabled(db, current_user)
+                if sid == "investment_reporting":
+                    cfg = get_investment_reporting_config(db, current_user) or {}
+                    return bool(cfg.get("enabled", False))
+                if isinstance(skill_cfg, dict) and sid in skill_cfg:
                     try:
-                        res = execute_skill(
-                            sid,
-                            text=user_text,
-                            db=db,
-                            current_user=current_user,
-                            account_id=account_id_effective,
-                            context=ctx_flags,
-                        )
-                        skills_results.append({"id": sid, "ok": bool(res.get("ok", True))})
+                        return bool((skill_cfg.get(sid) or {}).get("enabled", False))
+                    except Exception:
+                        return False
+                return True
 
-                        sp = (res.get("spoken_reply") or "").strip()
-                        if sp:
-                            spoken_parts.append(sp)
+            requested = [sid for sid in requested if _tool_enabled(sid)]
 
-                        # Merge known "side payloads" so the WebUI/console can display them if needed.
-                        for k in ("gmail", "investment_reporting", "reports"):
-                            if k in res and res[k] is not None:
-                                merged[k] = res[k]
-                    except Exception as e:
-                        logger.exception("MULTI_SKILL failed sid=%s", sid)
-                        skills_results.append({"id": sid, "ok": False, "error": str(e)[:160]})
+            # Clamp how many tools we will execute in one turn (default: 2)
+            max_tools = int(os.getenv("VOICE_MULTI_TOOLS_MAX") or os.getenv("VOICE_MULTI_SKILLS_MAX") or "2")
+            if max_tools < 2:
+                max_tools = 2
+            requested = requested[:max_tools]
 
-                if len(wanted) > max_per_turn:
-                    remaining = ", ".join(wanted[max_per_turn:])
-                    spoken_parts.append(
-                        f"I can also help with {remaining}. Say 'continue' if you'd like me to do that next."
-                    )
+            if len(requested) >= 2:
+                logger.info("MULTI_TOOL detected requested=%s", requested)
 
-                spoken_reply_multi = "\n\n".join([p for p in spoken_parts if p]).strip()
-                payload = {"spoken_reply": spoken_reply_multi, "fsm": fsm_result, "skills": skills_results}
-                payload.update(merged)
-                _capture_turn("assistant", payload["spoken_reply"])
-                return payload
-    except Exception:
-        logger.exception("MULTI_SKILL failed; falling back to single-skill routing")    # ----------------------------
+                def _extract_tool_params(tool_id: str) -> dict:
+                    params: dict = {}
+                    # llm_plan args if this tool was selected
+                    if isinstance(llm_plan, dict) and llm_plan.get("tool") == tool_id:
+                        a = llm_plan.get("args") or {}
+                        if isinstance(a, dict):
+                            params.update(a)
+                    # backend_call params if matches
+                    if isinstance(backend_call, dict):
+                        bc_type = backend_call.get("type") or backend_call.get("skill_id")
+                        if bc_type == tool_id and isinstance(backend_call.get("params"), dict):
+                            params.update(backend_call.get("params") or {})
+                    return params
+
+                combined_spoken_parts: list[str] = []
+                merged: dict = {"skills": []}
+
+                for sid in requested:
+                    params = _extract_tool_params(sid)
+
+                    if sid == "gmail_summary":
+                        if not gmail_summary_enabled(db, current_user):
+                            part = "Email summaries are currently turned off in your settings."
+                            combined_spoken_parts.append(part)
+                            merged["skills"].append({"id": sid, "ok": False, "error": "disabled"})
+                            continue
+
+                        account_id_effective = params.get("account_id") or account_id or get_default_gmail_account_id(current_user, db)
+                        gmail_query = (params.get("query") or "is:unread").strip()
+                        gmail_max_results = int(params.get("max_results") or 20)
+
+                        if not account_id_effective:
+                            part = "I don't see a Gmail account connected for you yet."
+                            combined_spoken_parts.append(part)
+                            merged["skills"].append({"id": sid, "ok": False, "error": "no_account"})
+                            continue
+
+                        cache_hash = None
+                        cached = None
+                        gmail_data: dict = {}
+
+                        # Session (call) cache
+                        try:
+                            if SESSION_MEMORY_ENABLED and call_id and tenant_id:
+                                cache_hash = make_skill_cache_key_hash(
+                                    "gmail_summary",
+                                    account_id_effective,
+                                    gmail_query,
+                                    gmail_max_results,
+                                )
+                                cached = memory.get_cached_skill_result(
+                                    tenant_id=tenant_id,
+                                    call_id=call_id,
+                                    skill_key="gmail_summary",
+                                    cache_key_hash=cache_hash,
+                                )
+                        except Exception:
+                            cached = None
+
+                        if cached and isinstance(cached.result, dict) and isinstance((cached.result or {}).get("gmail"), dict):
+                            gmail_data = dict((cached.result or {}).get("gmail") or {})
+                        else:
+                            # Caller-level cache across calls
+                            caller_cached = None
+                            if CALLER_MEMORY_ENABLED and caller_id and tenant_uuid and cache_hash:
+                                try:
+                                    caller_cached = get_caller_cache(
+                                        db,
+                                        tenant_id=tenant_uuid,
+                                        caller_id=caller_id,
+                                        skill_key="gmail_summary",
+                                        cache_key_hash=cache_hash,
+                                    )
+                                except Exception:
+                                    caller_cached = None
+
+                            if caller_cached and isinstance(caller_cached.get("gmail"), dict):
+                                gmail_data = dict(caller_cached.get("gmail") or {})
+                            else:
+                                gmail_data = summarize_gmail_for_assistant(
+                                    account_id_effective,
+                                    current_user,
+                                    db,
+                                    max_results=gmail_max_results,
+                                    query=gmail_query,
+                                ) or {}
+
+                                # Put session cache
+                                try:
+                                    if SESSION_MEMORY_ENABLED and call_id and tenant_id and cache_hash and isinstance(gmail_data, dict):
+                                        memory.put_cached_skill_result(
+                                            tenant_id=tenant_id,
+                                            call_id=call_id,
+                                            skill_key="gmail_summary",
+                                            cache_key_hash=cache_hash,
+                                            result={"gmail": gmail_data},
+                                            ttl_s=SESSION_MEMORY_TTL_S,
+                                        )
+                                except Exception:
+                                    pass
+
+                                # Put caller cache
+                                try:
+                                    if CALLER_MEMORY_ENABLED and caller_id and tenant_uuid and cache_hash and isinstance(gmail_data, dict):
+                                        put_caller_cache(
+                                            db,
+                                            tenant_id=tenant_uuid,
+                                            caller_id=caller_id,
+                                            skill_key="gmail_summary",
+                                            cache_key_hash=cache_hash,
+                                            payload={"gmail": gmail_data},
+                                            ttl_s=CALLER_MEMORY_TTL_S,
+                                        )
+                                except Exception:
+                                    pass
+
+                        if isinstance(gmail_data, dict):
+                            gmail_data["used_account_id"] = account_id_effective
+
+                        summary = (gmail_data.get("summary") or "").strip() if isinstance(gmail_data, dict) else ""
+                        part = summary or "I couldn't generate an email summary right now."
+                        combined_spoken_parts.append(part)
+                        merged["gmail"] = gmail_data
+                        merged["skills"].append({"id": sid, "ok": bool(summary), "query": gmail_query, "max_results": gmail_max_results})
+
+                    elif sid == "investment_reporting":
+                        cfg = get_investment_reporting_config(db, current_user) or {}
+                        if not bool(cfg.get("enabled", False)):
+                            part = "Investment reporting is currently turned off in your settings."
+                            combined_spoken_parts.append(part)
+                            merged["skills"].append({"id": sid, "ok": False, "error": "disabled"})
+                            continue
+
+                        override_tickers = _normalize_ticker_symbols(params.get("tickers")) if isinstance(params, dict) else []
+                        tickers = override_tickers or (inv_tickers or []) or get_investment_reporting_tickers(db, current_user)
+                        tickers_source = "override" if (override_tickers or inv_tickers) else "configured"
+
+                        if not tickers:
+                            part = "I can do stock updates, but no tickers are configured yet."
+                            combined_spoken_parts.append(part)
+                            merged["skills"].append({"id": sid, "ok": False, "error": "no_tickers"})
+                            continue
+
+                        llm_prompt = (cfg.get("llm_prompt") or "").strip()
+                        if not llm_prompt:
+                            if tickers_source == "override" and len(tickers) == 1:
+                                llm_prompt = (
+                                    "You are Vozlia, a concise voice assistant delivering a stock update for the requested ticker. "
+                                    "Include: current price, previous close, percent change, 1–3 key news items from the last 24 hours, "
+                                    "and any analyst upgrades/downgrades or new price targets if available. "
+                                    "Keep it under 20 seconds and do not mention saying next."
+                                )
+                            else:
+                                llm_prompt = (
+                                    "You are Vozlia, a concise voice assistant delivering a stock report. "
+                                    "For each ticker: current price, previous close, percent change, 1–3 key news items from the last 24 hours, "
+                                    "and any analyst upgrades/downgrades or new price targets if available. "
+                                    "Keep each ticker under 20 seconds. After each ticker say: 'Say next to continue, or stop to end.'"
+                                )
+
+                        try:
+                            rep = get_investment_reports(tickers, llm_prompt=llm_prompt)
+                            logger.info("INVREP_FETCH_OK tickers=%s source=%s", tickers, tickers_source)
+                        except Exception as e:
+                            logger.exception("INVREP_FETCH_FAIL tickers=%s err=%s", tickers, e)
+                            part = "Sorry — I couldn't fetch stock data right now."
+                            combined_spoken_parts.append(part)
+                            merged["skills"].append({"id": sid, "ok": False, "error": "fetch_failed"})
+                            continue
+
+                        spoken_list = rep.get("spoken_reports") or []
+                        part = str(spoken_list[0]) if isinstance(spoken_list, list) and spoken_list else "Sorry — I couldn't generate a stock report right now."
+                        combined_spoken_parts.append(part)
+                        merged["investment_reporting"] = rep
+                        merged["skills"].append({"id": sid, "ok": bool(spoken_list), "tickers": tickers, "source": tickers_source})
+
+                        # Seed next/stop queue for investment reporting turns (optional)
+                        if call_id and tenant_id and isinstance(spoken_list, list) and spoken_list:
+                            try:
+                                memory.set_handle(
+                                    tenant_id=tenant_id,
+                                    call_id=call_id,
+                                    name="invrep_spoken_queue",
+                                    value=spoken_list,
+                                    ttl_s=SESSION_MEMORY_TTL_S,
+                                )
+                                memory.set_handle(
+                                    tenant_id=tenant_id,
+                                    call_id=call_id,
+                                    name="invrep_index",
+                                    value=0,
+                                    ttl_s=SESSION_MEMORY_TTL_S,
+                                )
+                            except Exception:
+                                pass
+
+                    else:
+                        # Generic Skills Engine skill (best-effort)
+                        sk = skill_registry.get(sid)
+                        if not sk:
+                            continue
+                        try:
+                            res = execute_skill(
+                                sid,
+                                text=user_text,
+                                db=db,
+                                current_user=current_user,
+                                account_id=account_id,
+                                context=ctx_flags,
+                            )
+                            part = (res or {}).get("spoken_reply") or ""
+                            if part:
+                                combined_spoken_parts.append(str(part))
+                            merged["skills"].append({"id": sid, "ok": True})
+                        except Exception as e:
+                            logger.exception("MULTI_TOOL_EXEC_FAIL sid=%s err=%s", sid, e)
+                            merged["skills"].append({"id": sid, "ok": False, "error": str(e)})
+
+                spoken_reply = "\n\n".join([p.strip() for p in combined_spoken_parts if p and str(p).strip()]).strip()
+                if spoken_reply:
+                    payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": merged.get("gmail")}
+                    payload.update({k: v for k, v in merged.items() if k not in ("gmail",)})
+                    _capture_turn("assistant", payload.get("spoken_reply"))
+                    return payload
+    except Exception as e:
+        logger.exception("MULTI_TOOL_FAIL err=%s", e)
     if backend_call and backend_call.get("type") == "gmail_summary":
         # ✅ Skill toggle gate (portal-controlled)
         if not gmail_summary_enabled(db, current_user):
