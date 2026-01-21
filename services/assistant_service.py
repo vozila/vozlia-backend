@@ -365,6 +365,90 @@ def _get_router_client():
         return _ROUTER_CLIENT
     except Exception:
         return None
+        
+def llm_plan_tools_multi(text: str, *, ctx: dict | None = None) -> dict | None:
+    """
+    TRUE multi-tool planner.
+    Returns STRICT JSON with a list of tools to execute in THIS turn.
+
+    Schema:
+      {
+        "tools": [
+          {"tool": "gmail_summary", "args": {"query": "optional string"}},
+          {"tool": "investment_reporting", "args": {"tickers": ["CSCO"], "mode": "brief"}},
+          {"tool": "memory_lookup", "args": {"query": "...", "time_range": "last_call|last_7_days|last_30_days|all", "scope": "caller"}}
+        ]
+      }
+
+    Notes:
+    - Keep it short and deterministic (voice latency).
+    - If user asks multiple things, include multiple tools, ordered logically.
+    """
+    client = _get_router_client()
+    if client is None:
+        return None
+
+    model = (os.getenv("OPENAI_ROUTER_MODEL") or "").strip() or "gpt-4o-mini"
+    timeout_s = float((os.getenv("OPENAI_ROUTER_TIMEOUT_S", "4.0") or "4.0").strip())
+    max_tokens = int((os.getenv("OPENAI_ROUTER_MAX_TOKENS", "220") or "220").strip())
+    max_tools = int((os.getenv("LLM_ROUTER_MAX_TOOLS", "3") or "3").strip())
+
+    system = (
+        "You are a routing planner for a phone voice assistant.\n"
+        "The user may ask for multiple actions in one sentence.\n"
+        "Return STRICT JSON only. No markdown.\n"
+        f"Return at most {max_tools} tool calls.\n\n"
+        "Available tools:\n"
+        "1) gmail_summary: user asks to check inbox/emails/unread/summarize emails.\n"
+        "   args: {\"query\": \"optional\"}\n"
+        "2) investment_reporting: user asks about stocks/tickers/portfolio/market.\n"
+        "   args: {\"tickers\": [\"CSCO\"], \"mode\": \"brief\"|\"full\"}\n"
+        "   If user names a company, infer a well-known ticker when reasonable.\n"
+        "3) memory_lookup: user asks about something previously discussed.\n"
+        "   args: {\"query\": \"string\", \"time_range\": \"last_call|last_7_days|last_30_days|all\", \"scope\": \"caller\"}\n\n"
+        "Rules:\n"
+        "- If user asks for multiple things, include multiple tools.\n"
+        "- Preserve user intent; do not invent tools.\n"
+        "- If none apply, return {\"tools\": []}.\n"
+    )
+
+    user = {"text": text or "", "ctx": (ctx or {})}
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user)},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.0,
+            timeout=timeout_s,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        plan = json.loads(content)
+        if not isinstance(plan, dict):
+            return None
+
+        tools = plan.get("tools")
+        if not isinstance(tools, list):
+            plan["tools"] = []
+            return plan
+
+        normalized = []
+        for item in tools[:max_tools]:
+            if not isinstance(item, dict):
+                continue
+            tool = str(item.get("tool") or "").strip().lower()
+            args = item.get("args") if isinstance(item.get("args"), dict) else {}
+            if tool not in ("gmail_summary", "investment_reporting", "memory_lookup"):
+                continue
+            normalized.append({"tool": tool, "args": args})
+
+        plan["tools"] = normalized
+        return plan
+    except Exception:
+        return None
 
 def llm_plan_route(text: str, *, ctx: dict | None = None) -> dict | None:
     """Return a lightweight intent/tool plan (JSON) for routing.
@@ -691,46 +775,54 @@ def run_assistant_route(
         force_memory = False
 
     # ----------------------------
-    # (0) Optional LLM router plan (intermediate step)
+    # (0) LLM router plan
+    #   - assist/shadow: legacy single-tool behavior    
+    #   - tools: TRUE multi-tool plan (execute multiple)
     # ----------------------------
     llm_plan = None
+    llm_tools: list[dict] = []
+
     if _router_enabled():
-        # Avoid spending tokens/latency on junk fragments (common during greetings / partials)
         if not _is_junk_transcript(text or ""):
-            llm_plan = llm_plan_route(text or "", ctx=ctx_flags if isinstance(ctx_flags, dict) else None)
-            if llm_plan:
-                # Always log in shadow/assist so we can validate quality without changing core flow.
-                logger.info(
-                    "LLM_ROUTER_PLAN mode=%s tool=%s conf=%s intent=%s",
-                    _router_mode(),
-                    llm_plan.get("tool"),
-                    llm_plan.get("confidence"),
-                    llm_plan.get("intent"),
-                )
+            mode = _router_mode()
 
-                # In assist mode, use the plan to steer routing without requiring callers to say
-                # engagement-keyword phrases. We do this by:
-                #   (a) setting force_* flags (existing execution paths), AND
-                #   (b) canonicalizing the utterance into the phrase the legacy FSM already expects.
-                if _router_mode() == "assist":
-                    tool = str(llm_plan.get("tool") or "").strip().lower()
-                    conf = float(llm_plan.get("confidence") or 0.0)
-                    min_conf = float(os.getenv("LLM_ROUTER_ASSIST_MIN_CONF", "0.65") or "0.65")
+            if mode == "tools":
+                llm_plan = llm_plan_tools_multi(text or "", ctx=ctx_flags if isinstance(ctx_flags, dict) else None)
+                if llm_plan and isinstance(llm_plan.get("tools"), list):
+                    llm_tools = list(llm_plan.get("tools") or [])
+                    logger.info("LLM_ROUTER_TOOLS plan_tools=%s", [t.get("tool") for t in llm_tools])
+            else:
+                llm_plan = llm_plan_route(text or "", ctx=ctx_flags if isinstance(ctx_flags, dict) else None)
+                if llm_plan:
+                    logger.info(
+                        "LLM_ROUTER_PLAN mode=%s tool=%s conf=%s intent=%s",
+                        mode,
+                        llm_plan.get("tool"),
+                        llm_plan.get("confidence"),
+                        llm_plan.get("intent"),
+                    )
 
-                    if conf >= min_conf:
-                        if tool == "gmail_summary":
-                            force_gmail_summary = True
-                        elif tool == "investment_reporting":
-                            force_investment_reporting = True
-                        elif tool == "memory_lookup":
-                            force_memory = True
+                    # Existing assist steering (single-tool)
+                    if mode == "assist":
+                        tool = str(llm_plan.get("tool") or "").strip().lower()
+                        conf = float(llm_plan.get("confidence") or 0.0)
+                        min_conf = float(os.getenv("LLM_ROUTER_ASSIST_MIN_CONF", "0.65") or "0.65")
+                        if conf >= min_conf:
+                            if tool == "gmail_summary":
+                                force_gmail_summary = True
+                            elif tool == "investment_reporting":
+                                force_investment_reporting = True
+                            elif tool == "memory_lookup":
+                                force_memory = True
 
-                        canonical = _tool_to_canonical_phrase(tool)
-                        # Do NOT canonicalize memory lookups: we want to preserve the original question
-                        # (e.g., "what animal did I mention?") for vector retrieval.
-                        if canonical and tool != "memory_lookup":
-                            logger.info("LLM_ROUTER_ASSIST_CANONICALIZE from=%r to=%r", text, canonical)
-                            text = canonical
+                            canonical = _tool_to_canonical_phrase(tool)
+                            if canonical and tool != "memory_lookup":
+                                logger.info("LLM_ROUTER_ASSIST_CANONICALIZE from=%r to=%r", text, canonical)
+                                text = canonical
+    else:
+        if debug:
+            logger.info("LLM_ROUTER_SKIP_JUNK transcript=%r", (text or ""))
+
         else:
             # Still useful to see this in debug traces, but avoid noisy info logs.
             if debug:
