@@ -1,6 +1,6 @@
 
 # services/assistant_service.py
-from skills.engine import skills_engine_enabled, match_skill_id, execute_skill
+from skills.engine import skills_engine_enabled, match_skill_id, match_skill_ids, execute_skill
 from services.settings_service import (
     get_agent_greeting,
     gmail_summary_enabled,
@@ -120,18 +120,11 @@ from services.caller_cache import (
     normalize_caller_id,
 )
 from services.longterm_memory import (
-
     record_turn_event,
     longterm_memory_enabled_for_tenant,
     fetch_recent_memory_text,
     record_skill_result,
 )
-
-# Optional KB voice Q&A (DB-backed; keep failures non-fatal)
-try:
-    from services.kb_voice import answer_from_kb  # type: ignore
-except Exception:  # pragma: no cover
-    answer_from_kb = None  # type: ignore
 
 # ----------------------------
 # LLM Router (intermediate step)
@@ -300,15 +293,7 @@ def _invrep_requested_tickers(raw_text: str, llm_plan: dict | None) -> tuple[lis
 
 
 def _emit_await_more_enabled() -> bool:
-    """
-    Prefer explicit router flag; otherwise follow voice setting so the
-    pipeline can't be half-enabled (stream ready, router disabled).
-    """
-    v = os.getenv("ROUTER_EMIT_AWAIT_MORE")
-    if v is not None:
-        return v == "1"
-    return os.getenv("VOICE_ENABLE_AWAIT_MORE", "0") == "1"
-
+    return (os.getenv("ROUTER_EMIT_AWAIT_MORE", "0") or "").strip().lower() in ("1","true","yes","on")
 
 def _await_more_default_ms() -> int:
     try:
@@ -798,7 +783,7 @@ def run_assistant_route(
     longterm_enabled = False
     capture_turns = False
 
-    def _capture_turn(role: str, msg: str | None, extra_data_json: dict | None = None) -> None:
+    def _capture_turn(role: str, msg: str | None) -> None:
         if not longterm_enabled or not capture_turns:
             return
         if not tenant_uuid or not caller_id:
@@ -814,7 +799,6 @@ def run_assistant_route(
                 call_sid=(str(call_id) if call_id else None),
                 role=str(role or "user"),
                 text=body,
-                extra_data_json=extra_data_json,
             )
         except Exception:
             logger.exception("TURN_CAPTURE_FAIL tenant_id=%s caller_id=%s role=%s", tenant_id, caller_id, role)
@@ -1569,7 +1553,106 @@ def run_assistant_route(
 
     # ----------------------------
     # (1) Existing FSM backend call behavior (no change)
-    # ----------------------------
+
+
+    # (1.5) Multi-skill support:
+    # If the user asks for *multiple* enabled skills in a single utterance (e.g. "check my email AND give me Cisco stock"),
+    # run them sequentially and combine the spoken replies into a single response.
+    #
+    # This prevents the "only the last skill runs" behavior when `backend_call` can represent just one action.
+    try:
+        skills_enabled_now = os.getenv("SKILLS_ENGINE_ENABLED", "false").lower() == "true"
+        if skills_enabled_now:
+            user_text = raw_user_text if "raw_user_text" in locals() else (text or "")
+            skill_cfg = get_skills_config(db, tenant_uuid)
+
+            wanted: list[str] = []
+
+            # 1) Forced skill(s) from the voice layer (string or list)
+            forced = None
+            if isinstance(ctx_flags, dict):
+                forced = ctx_flags.get("forced_skill_id")
+            if isinstance(forced, str) and forced:
+                wanted.append(forced)
+            elif isinstance(forced, (list, tuple)):
+                wanted.extend([x for x in forced if isinstance(x, str) and x])
+
+            # 2) Phrase-based matches (ordered by first mention)
+            wanted.extend(match_skill_ids(user_text, limit=8))
+
+            # 3) Lightweight heuristic matches (catch cases where phrase lists are too strict)
+            t_l = user_text.lower()
+            if re.search(r"\b(email|gmail|inbox|mailbox)\b", t_l):
+                wanted.append("gmail_summary")
+
+            try:
+                tickers, _mode = _invrep_requested_tickers(user_text, llm_plan)
+            except Exception:
+                tickers = []
+            if tickers or re.search(r"\b(stock|ticker|quote|marketcap)\b|\bshare\s+price\b|\bmarket\s+cap\b", t_l):
+                wanted.append("investment_reporting")
+
+            # 4) Router hint + FSM backend_call (single-slot), if they point at known skills
+            if isinstance(llm_plan, dict):
+                tool = llm_plan.get("tool")
+                if isinstance(tool, str) and tool:
+                    wanted.append(tool)
+            if isinstance(backend_call, dict):
+                bc_type = backend_call.get("type") or backend_call.get("skill_id")
+                if isinstance(bc_type, str) and bc_type:
+                    wanted.append(bc_type)
+
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            wanted = [sid for sid in wanted if sid and not (sid in seen or seen.add(sid))]
+
+            # Keep only enabled + registered skills
+            wanted = [sid for sid in wanted if skill_cfg.get(sid, {}).get("enabled") and skill_registry.get(sid)]
+
+            max_per_turn = int(os.getenv("VOICE_MULTI_SKILLS_MAX", "2") or "2")
+            if len(wanted) >= 2:
+                logger.info("MULTI_SKILL detected wanted=%s", wanted)
+                spoken_parts: list[str] = []
+                merged: dict = {}
+                skills_results: list[dict] = []
+
+                for sid in wanted[:max_per_turn]:
+                    try:
+                        res = execute_skill(
+                            sid,
+                            text=user_text,
+                            db=db,
+                            current_user=current_user,
+                            account_id=account_id_effective,
+                            context=ctx_flags,
+                        )
+                        skills_results.append({"id": sid, "ok": bool(res.get("ok", True))})
+
+                        sp = (res.get("spoken_reply") or "").strip()
+                        if sp:
+                            spoken_parts.append(sp)
+
+                        # Merge known "side payloads" so the WebUI/console can display them if needed.
+                        for k in ("gmail", "investment_reporting", "reports"):
+                            if k in res and res[k] is not None:
+                                merged[k] = res[k]
+                    except Exception as e:
+                        logger.exception("MULTI_SKILL failed sid=%s", sid)
+                        skills_results.append({"id": sid, "ok": False, "error": str(e)[:160]})
+
+                if len(wanted) > max_per_turn:
+                    remaining = ", ".join(wanted[max_per_turn:])
+                    spoken_parts.append(
+                        f"I can also help with {remaining}. Say 'continue' if you'd like me to do that next."
+                    )
+
+                spoken_reply_multi = "\n\n".join([p for p in spoken_parts if p]).strip()
+                payload = {"spoken_reply": spoken_reply_multi, "fsm": fsm_result, "skills": skills_results}
+                payload.update(merged)
+                _capture_turn("assistant", payload["spoken_reply"])
+                return payload
+    except Exception:
+        logger.exception("MULTI_SKILL failed; falling back to single-skill routing")    # ----------------------------
     if backend_call and backend_call.get("type") == "gmail_summary":
         # ✅ Skill toggle gate (portal-controlled)
         if not gmail_summary_enabled(db, current_user):
@@ -1970,68 +2053,6 @@ def run_assistant_route(
         payload = {"spoken_reply": str(spoken_list[0]), "fsm": fsm_result, "gmail": None}
         _capture_turn("assistant", payload.get("spoken_reply"))
         return payload
-
-
-    # -------------------------------------------------
-    # Optional: KB voice Q&A (reads kb_chunks in Postgres; no Control-Plane hop)
-    # Default behavior is conservative: only tries KB if we'd otherwise say nothing (unless override is enabled).
-    kb_voice_enabled = (os.getenv("VOICE_KB_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
-    kb_override_nonempty = (os.getenv("VOICE_KB_OVERRIDE_NONEMPTY", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
-    kb_min_words = int(os.getenv("VOICE_KB_MIN_WORDS", "2") or 2)
-    if kb_voice_enabled and answer_from_kb and (raw_user_text or "").strip():
-        # Only attempt KB if (a) we are empty/uncertain OR (b) explicitly overridden
-        _word_count = len((raw_user_text or "").strip().split())
-        if _word_count >= kb_min_words and (kb_override_nonempty or not (spoken_reply and str(spoken_reply).strip())):
-            try:
-                kb_limit = int(os.getenv("VOICE_KB_LIMIT", "8") or 8)
-            except Exception:
-                kb_limit = 8
-
-            try:
-                kb_res = answer_from_kb(
-                    db,
-                    tenant_uuid=str(tenant_uuid),
-                    query=str(raw_user_text),
-                    limit=kb_limit,
-                    include_policy=True,
-                )
-                if kb_res and getattr(kb_res, "answer", None):
-                    spoken_reply = str(kb_res.answer)
-
-                    # Add lightweight breadcrumbs for observability/debugging (doesn't affect voice output).
-                    try:
-                        fsm_result = dict(fsm_result or {})
-                        fsm_result["kb"] = {
-                            "used": True,
-                            "strategy": getattr(kb_res, "retrieval_strategy", None),
-                            "sources": len(getattr(kb_res, "sources", []) or []),
-                            "policy_chars": getattr(kb_res, "policy_chars", 0),
-                            "context_chars": getattr(kb_res, "context_chars", 0),
-                            "latency_ms": getattr(kb_res, "latency_ms", None),
-                            "model": getattr(kb_res, "model", None),
-                        }
-                    except Exception:
-                        pass
-
-                    payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
-
-                    # Capture assistant turn with KB citations so the WebUI turn console can render sources.
-                    _capture_turn(
-                        "assistant",
-                        payload.get("spoken_reply"),
-                        extra_data_json={
-                            "kb_query": str(raw_user_text),
-                            "kb_strategy": getattr(kb_res, "retrieval_strategy", None),
-                            "kb_sources": getattr(kb_res, "sources", []) or [],
-                            "kb_policy_chars": getattr(kb_res, "policy_chars", 0),
-                            "kb_context_chars": getattr(kb_res, "context_chars", 0),
-                            "kb_latency_ms": getattr(kb_res, "latency_ms", None),
-                            "kb_model": getattr(kb_res, "model", None),
-                        },
-                    )
-                    return payload
-            except Exception:
-                logger.exception("KB_VOICE_FAIL tenant_id=%s", tenant_id)
 
     payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
     _capture_turn("assistant", payload.get("spoken_reply"))
