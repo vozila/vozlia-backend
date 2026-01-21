@@ -255,8 +255,125 @@ def _extract_tickers_from_text(text: str) -> list[str]:
 
     return out[:8]
 
+# --- Investment Reporting: ticker resolution helpers ---
+# Users often say company names ("Cisco") instead of ticker symbols ("CSCO").
+# We resolve simple company-name mentions to tickers via Yahoo Finance search (no auth),
+# and use those as an override for the investment_reporting tool.
+
+_YAHOO_SEARCH_CACHE: dict[str, str] = {}
+
+def _yahoo_search_first_symbol(query: str) -> str | None:
+    q = (query or "").strip()
+    if not q:
+        return None
+    key = q.lower()
+    if key in _YAHOO_SEARCH_CACHE:
+        return _YAHOO_SEARCH_CACHE[key]
+
+    try:
+        import httpx  # already in requirements via gmail/oauth stack
+    except Exception:
+        return None
+
+    url = "https://query2.finance.yahoo.com/v1/finance/search"
+    params = {
+        "q": q,
+        "quotesCount": 6,
+        "newsCount": 0,
+        "listsCount": 0,
+        "enableFuzzyQuery": "true",
+    }
+    headers = {
+        # A basic UA avoids occasional 403s from some edge networks.
+        "User-Agent": "Mozilla/5.0 (compatible; Vozlia/1.0)",
+        "Accept": "application/json",
+    }
+
+    try:
+        r = httpx.get(url, params=params, headers=headers, timeout=3.0)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+    except Exception:
+        return None
+
+    quotes = data.get("quotes") or []
+    best: str | None = None
+    for item in quotes:
+        try:
+            sym = item.get("symbol") or ""
+            qt = (item.get("quoteType") or "").upper()
+            if not sym:
+                continue
+            # Prefer common tradable instruments. (Cisco => EQUITY)
+            if qt not in ("EQUITY", "ETF", "MUTUALFUND", "INDEX"):
+                continue
+            norm = _normalize_ticker_symbol(sym)
+            if not norm:
+                continue
+            best = norm
+            break
+        except Exception:
+            continue
+
+    if best:
+        _YAHOO_SEARCH_CACHE[key] = best
+    return best
+
+
+_STOCK_ENTITY_RE_1 = re.compile(
+    r"\b(?:stock|share)\b[^\n]{0,40}?\b(?:price|quote|ticker)\b[^\n]{0,20}?\b(?:of|for|to)\b\s+(?P<name>[^\n\r\t\.,;!?]{2,80})",
+    re.IGNORECASE,
+)
+_STOCK_ENTITY_RE_2 = re.compile(
+    r"\b(?P<name>[A-Za-z][A-Za-z0-9&\-\. ]{1,60}?)(?:'s)?\s+stock\b",
+    re.IGNORECASE,
+)
+
+def _extract_stock_entity_terms(text: str) -> list[str]:
+    """Best-effort extraction of company-ish terms from a 'stock' request."""
+    t = (text or "").strip()
+    if not t:
+        return []
+
+    candidates: list[str] = []
+
+    for rx in (_STOCK_ENTITY_RE_1, _STOCK_ENTITY_RE_2):
+        for m in rx.finditer(t):
+            name = (m.group("name") or "").strip()
+            if not name:
+                continue
+            candidates.append(name)
+
+    # If we captured a tail like "Cisco and Apple", split it.
+    out: list[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        # Strip trailing connectors / filler
+        c = re.sub(r"\b(please|thanks|thank you)\b", "", c, flags=re.IGNORECASE).strip()
+        parts = re.split(r"\s+(?:and|or)\s+|\s*,\s*", c)
+        for p in parts:
+            p = (p or "").strip(" \t\r\n\"'()[]{}")
+            if not p:
+                continue
+            # Avoid pulling in other intents (email, inbox, etc.)
+            if re.search(r"\b(email|emails|gmail|inbox|mailbox|summary|summaries)\b", p, flags=re.IGNORECASE):
+                continue
+            key = p.lower()
+            if key not in seen:
+                out.append(p)
+                seen.add(key)
+
+    return out[:4]
+
+
 def _invrep_requested_tickers(raw_text: str, llm_plan: dict | None) -> tuple[list[str], str | None]:
-    """Return (tickers_override, mode_override)."""
+    """Return (tickers_override, mode_override).
+
+    Priority:
+      1) Router plan tool_args (if provided)
+      2) Explicit ticker symbols in the user's text (e.g. $CSCO, ticker CSCO)
+      3) Company-name resolution via Yahoo Finance search (e.g. "Cisco" -> CSCO)
+    """
     tickers: list[str] = []
     mode: str | None = None
 
@@ -272,11 +389,9 @@ def _invrep_requested_tickers(raw_text: str, llm_plan: dict | None) -> tuple[lis
             if m in ("brief", "full"):
                 mode = m
     except Exception:
-        tickers = []
-        mode = None
+        pass
 
-    # (2) Add any explicitly mentioned tickers from the raw transcript.
-    # This is helpful when the user says "TSLA" directly.
+    # (2) Extract explicit ticker tokens from raw text.
     try:
         extracted = _extract_tickers_from_text(raw_text or "")
         if extracted:
@@ -289,8 +404,18 @@ def _invrep_requested_tickers(raw_text: str, llm_plan: dict | None) -> tuple[lis
     except Exception:
         pass
 
-    return (tickers[:8], mode)
+    # (3) If we still have no tickers, try resolving company names to tickers.
+    if not tickers:
+        try:
+            terms = _extract_stock_entity_terms(raw_text or "")
+            for term in terms:
+                sym = _yahoo_search_first_symbol(term)
+                if sym and sym not in tickers:
+                    tickers.append(sym)
+        except Exception:
+            pass
 
+    return (tickers[:8], mode)
 
 def _emit_await_more_enabled() -> bool:
     return (os.getenv("ROUTER_EMIT_AWAIT_MORE", "0") or "").strip().lower() in ("1","true","yes","on")
