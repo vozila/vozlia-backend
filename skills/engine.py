@@ -23,6 +23,45 @@ def match_skill_id(text: str) -> Optional[str]:
     text_l = (text or "").lower()
     if not text_l:
         return None
+def match_skill_ids(text: str, *, limit: int = 5) -> list[str]:
+    """Return *all* skill IDs mentioned in `text` (ordered by first mention).
+
+    This is used to support multi-skill utterances like:
+      "Check my email and give me Cisco stock info"
+
+    Notes:
+    - We do simple phrase matching using each skill's trigger phrases.
+    - Order is based on the earliest phrase occurrence in the text.
+    - Duplicates are removed while preserving order.
+    """
+    text_l = (text or "").lower()
+    hits: list[tuple[int, str]] = []
+
+    for s in skill_registry.all():
+        best_pos: int | None = None
+        for phrase in (s.trigger.phrases or []):
+            p = (phrase or "").strip().lower()
+            if not p:
+                continue
+            pos = text_l.find(p)
+            if pos >= 0:
+                if best_pos is None or pos < best_pos:
+                    best_pos = pos
+        if best_pos is not None:
+            hits.append((best_pos, s.id))
+
+    hits.sort(key=lambda x: x[0])
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for _, sid in hits:
+        if sid in seen:
+            continue
+        out.append(sid)
+        seen.add(sid)
+        if len(out) >= limit:
+            break
+    return out
 
     for skill in skill_registry.all():
         for phrase in (skill.trigger.phrases or []):
