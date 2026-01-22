@@ -23,18 +23,30 @@ def match_skill_id(text: str) -> Optional[str]:
     text_l = (text or "").lower()
     if not text_l:
         return None
+
+    for skill in skill_registry.all():
+        for phrase in (skill.trigger.phrases or []):
+            p = (phrase or "").strip().lower()
+            if p and p in text_l:
+                return skill.id
+    return None
+
+
 def match_skill_ids(text: str, *, limit: int = 5) -> list[str]:
     """Return *all* skill IDs mentioned in `text` (ordered by first mention).
 
-    This is used to support multi-skill utterances like:
+    This supports multi-skill utterances like:
       "Check my email and give me Cisco stock info"
 
     Notes:
-    - We do simple phrase matching using each skill's trigger phrases.
-    - Order is based on the earliest phrase occurrence in the text.
-    - Duplicates are removed while preserving order.
+    - Simple phrase matching using each skill's trigger phrases.
+    - Order is based on earliest phrase occurrence.
+    - Duplicates removed while preserving order.
     """
     text_l = (text or "").lower()
+    if not text_l:
+        return []
+
     hits: list[tuple[int, str]] = []
 
     for s in skill_registry.all():
@@ -62,13 +74,6 @@ def match_skill_ids(text: str, *, limit: int = 5) -> list[str]:
         if len(out) >= limit:
             break
     return out
-
-    for skill in skill_registry.all():
-        for phrase in (skill.trigger.phrases or []):
-            p = (phrase or "").strip().lower()
-            if p and p in text_l:
-                return skill.id
-    return None
 
 
 def render_template(template: str, vars: Dict[str, Any]) -> str:
