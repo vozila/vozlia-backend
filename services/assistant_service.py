@@ -1849,7 +1849,7 @@ def run_assistant_route(
             skill_cfg = {}
             try:
                 if tenant_uuid:
-                    skill_cfg = get_skills_config(db, tenant_uuid) or {}
+                    skill_cfg = get_skills_config(db, current_user) or {}
             except Exception:
                 skill_cfg = {}
 
