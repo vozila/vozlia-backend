@@ -473,7 +473,14 @@ def _router_mode() -> str:
     return (os.getenv("LLM_ROUTER_MODE", "off") or "off").strip().lower()
 
 def _router_enabled() -> bool:
-    return _router_mode() in ("shadow", "assist")
+    """Return True when the LLM router should be consulted.
+
+    NOTE: In earlier builds, LLM_ROUTER_MODE=tools accidentally bypassed the router entirely
+    because this helper only enabled assist/shadow.
+
+    We include 'tools' here so tools-mode can still use the LLM planner.
+    """
+    return _router_mode() in ("shadow", "assist", "tools")
 
 def _get_router_client():
     global _ROUTER_CLIENT
@@ -1867,22 +1874,47 @@ def run_assistant_route(
                 max_tools = 2
             requested = requested[:max_tools]
 
+            def _extract_tool_params(tool_id: str) -> dict:
+                """Best-effort param extraction for a tool id (router/FSM hints)."""
+                params: dict = {}
+                # llm_plan args if this tool was selected (single-tool planner)
+                if isinstance(llm_plan, dict) and llm_plan.get("tool") == tool_id:
+                    a = llm_plan.get("args") or {}
+                    if isinstance(a, dict):
+                        params.update(a)
+                # backend_call params if matches
+                if isinstance(backend_call, dict):
+                    bc_type = backend_call.get("type") or backend_call.get("skill_id")
+                    if bc_type == tool_id and isinstance(backend_call.get("params"), dict):
+                        params.update(backend_call.get("params") or {})
+                return params
+
+            # Single-tool fallback:
+            # If we detected exactly one actionable tool/skill but FSM didn't emit a backend_call,
+            # promote it into backend_call so the existing single-skill execution path runs.
+            #
+            # This prevents "silent" turns when VOICE_SILENT_ON_UNCERTAIN=1 (FSM fallback is suppressed),
+            # especially after barge-in where the user may only ask for one thing (e.g., "stock quote for Cisco").
+            if (not backend_call) and len(requested) == 1:
+                sid0 = requested[0]
+                if sid0 in ("gmail_summary", "investment_reporting"):
+                    params0 = _extract_tool_params(sid0)
+                    backend_call = {"type": sid0, "params": params0}
+                    try:
+                        fsm_result = dict(fsm_result)
+                        fsm_result["backend_call"] = backend_call
+                    except Exception:
+                        pass
+                    # Optional short ack for auto-exec contexts; normal voice turns will speak the final skill output.
+                    if wants_standby_ack:
+                        spoken_reply = _standby_phrase()
+                        try:
+                            fsm_result["spoken_reply"] = spoken_reply
+                        except Exception:
+                            pass
+
             if len(requested) >= 2:
                 logger.info("MULTI_TOOL detected requested=%s", requested)
-
-                def _extract_tool_params(tool_id: str) -> dict:
-                    params: dict = {}
-                    # llm_plan args if this tool was selected
-                    if isinstance(llm_plan, dict) and llm_plan.get("tool") == tool_id:
-                        a = llm_plan.get("args") or {}
-                        if isinstance(a, dict):
-                            params.update(a)
-                    # backend_call params if matches
-                    if isinstance(backend_call, dict):
-                        bc_type = backend_call.get("type") or backend_call.get("skill_id")
-                        if bc_type == tool_id and isinstance(backend_call.get("params"), dict):
-                            params.update(backend_call.get("params") or {})
-                    return params
 
                 combined_spoken_parts: list[str] = []
                 merged: dict = {"skills": []}
