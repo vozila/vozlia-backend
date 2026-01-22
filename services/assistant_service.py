@@ -29,11 +29,6 @@ from models import User
 from models import CallerMemoryEvent
 from vozlia_fsm import VozliaFSM
 
-# Canonical defaults for gmail_summary (used for cache keys + consistent behavior across call paths)
-DEFAULT_GMAIL_QUERY = "is:unread"
-DEFAULT_GMAIL_MAX_RESULTS = 20
-
-
 def _maybe_answer_history_count(
     db: Session,
     *,
@@ -1903,11 +1898,8 @@ def run_assistant_route(
                             continue
 
                         account_id_effective = params.get("account_id") or account_id or get_default_gmail_account_id(current_user, db)
-                        gmail_query = str((params or {}).get("query") or "").strip() or DEFAULT_GMAIL_QUERY
-                        try:
-                            gmail_max_results = int((params or {}).get("max_results") or DEFAULT_GMAIL_MAX_RESULTS)
-                        except Exception:
-                            gmail_max_results = DEFAULT_GMAIL_MAX_RESULTS
+                        gmail_query = (params.get("query") or "is:unread").strip()
+                        gmail_max_results = int(params.get("max_results") or 20)
 
                         if not account_id_effective:
                             part = "I don't see a Gmail account connected for you yet."
@@ -2136,11 +2128,8 @@ def run_assistant_route(
                 else "I tried to check your email, but I don't see a Gmail account connected for you yet."
             )
         else:
-            gmail_query = str(params.get("query") or "").strip() or DEFAULT_GMAIL_QUERY
-            try:
-                gmail_max_results = int(params.get("max_results") or DEFAULT_GMAIL_MAX_RESULTS)
-            except Exception:
-                gmail_max_results = DEFAULT_GMAIL_MAX_RESULTS
+            gmail_query = params.get("query")
+            gmail_max_results = params.get("max_results", 20)
 
             gmail_data_fresh = False
 
@@ -2150,8 +2139,8 @@ def run_assistant_route(
                 cache_hash = make_skill_cache_key_hash(
                     "gmail_summary",
                     account_id_effective,
-                    gmail_query,
-                    gmail_max_results,
+                    (gmail_query or ""),
+                    int(gmail_max_results),
                 )
                 cached = memory.get_cached_skill_result(
                     tenant_id=tenant_id,
@@ -2318,15 +2307,11 @@ def run_assistant_route(
                     _capture_turn("assistant", payload.get("spoken_reply"))
                     return payload
 
-                # Canonical defaults (must match other gmail_summary paths for cache key stability)
-                gmail_query = DEFAULT_GMAIL_QUERY
-                gmail_max_results = DEFAULT_GMAIL_MAX_RESULTS
-
                 # Session memory cache (SkillsEngine path)
                 cache_hash = None
                 cached = None
                 if SESSION_MEMORY_ENABLED and call_id and tenant_id:
-                    cache_hash = make_skill_cache_key_hash("gmail_summary", account_id_effective, gmail_query, gmail_max_results)
+                    cache_hash = make_skill_cache_key_hash("gmail_summary", account_id_effective, "", 20)
                     cached = memory.get_cached_skill_result(
                         tenant_id=tenant_id,
                         call_id=call_id,
@@ -2380,7 +2365,7 @@ def run_assistant_route(
                         account_id_effective,
                     )
                 else:
-                    gmail_data = summarize_gmail_for_assistant(account_id_effective, current_user, db, max_results=gmail_max_results, query=gmail_query)
+                    gmail_data = summarize_gmail_for_assistant(account_id_effective, current_user, db)
                     # Cache for follow-ups within this call
                     if SESSION_MEMORY_ENABLED and call_id and tenant_id and cache_hash and isinstance(gmail_data, dict):
                         memory.put_cached_skill_result(
