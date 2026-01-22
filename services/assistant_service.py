@@ -473,7 +473,7 @@ def _router_mode() -> str:
     return (os.getenv("LLM_ROUTER_MODE", "off") or "off").strip().lower()
 
 def _router_enabled() -> bool:
-    return _router_mode() in ("shadow", "assist")
+    return _router_mode() in ("shadow", "assist","tools")
 
 def _get_router_client():
     global _ROUTER_CLIENT
