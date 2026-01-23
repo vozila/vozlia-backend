@@ -12,6 +12,8 @@ from api.routers.assistant import router as assistant_router
 from api.routers.gmail_api import router as gmail_api_router
 from api.routers.user_settings import router as user_settings_router
 from api.routers.kb import router as kb_router
+from api.routers.notify import router as notify_router
+from api.routers.websearch import router as websearch_router
 
 
 def create_app() -> FastAPI:
@@ -31,6 +33,11 @@ def create_app() -> FastAPI:
 
     # KB router (placeholder health route + future KB endpoints)
     app.include_router(kb_router)
+
+    # Notifications + WebSearch admin routes (control plane should proxy these)
+    app.include_router(notify_router)
+    app.include_router(websearch_router)
+
 
     @app.on_event("startup")
     def _startup() -> None:

@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Float,
     Text,
     Index,
     UniqueConstraint,
@@ -258,3 +259,69 @@ class CallerMemoryEvent(Base):
 # Helpful composite indexes for time-scoped recall
 Index("ix_mem_tenant_caller_created", CallerMemoryEvent.tenant_id, CallerMemoryEvent.caller_id, CallerMemoryEvent.created_at.desc())
 Index("ix_mem_tenant_caller_skill_created", CallerMemoryEvent.tenant_id, CallerMemoryEvent.caller_id, CallerMemoryEvent.skill_key, CallerMemoryEvent.created_at.desc())
+
+# =========================
+# Web Search Skills + Scheduling
+# =========================
+
+class DeliveryChannel(enum.Enum):
+    sms = "sms"
+    whatsapp = "whatsapp"
+    email = "email"
+    call = "call"
+
+
+class DeliveryCadence(enum.Enum):
+    daily = "daily"
+
+
+class WebSearchSkill(Base):
+    __tablename__ = "web_search_skills"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    # Tenant scope (for now, tenant == user id)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    name = Column(String, nullable=False, default="Web Search")
+    query = Column(Text, nullable=False)
+    triggers = Column(JSONB, nullable=False, default=list)
+    enabled = Column(Boolean, nullable=False, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_web_search_skills_tenant_created", "tenant_id", "created_at"),
+    )
+
+
+class ScheduledDelivery(Base):
+    __tablename__ = "scheduled_deliveries"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    web_search_skill_id = Column(UUID(as_uuid=True), ForeignKey("web_search_skills.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    enabled = Column(Boolean, nullable=False, default=True)
+    cadence = Column(SAEnum(DeliveryCadence), nullable=False, default=DeliveryCadence.daily)
+
+    # "HH:MM" in local timezone
+    time_of_day = Column(String, nullable=False, default="08:00")
+    timezone = Column(String, nullable=False, default="America/New_York")
+
+    channel = Column(SAEnum(DeliveryChannel), nullable=False, default=DeliveryChannel.sms)
+    destination = Column(String, nullable=False)  # phone/email depending on channel
+
+    next_run_at = Column(DateTime, nullable=True, index=True)
+    last_run_at = Column(DateTime, nullable=True)
+    last_latency_ms = Column(Float, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_scheduled_deliveries_tenant_next", "tenant_id", "next_run_at"),
+        Index("ix_scheduled_deliveries_skill", "web_search_skill_id"),
+    )
