@@ -341,6 +341,8 @@ async def twilio_stream(websocket: WebSocket):
                     if bool(cfg.get("add_to_greeting", False)):
                         sk = skill_registry.get(sid)
                         gline = (getattr(sk, "greeting", "") or "").strip() if sk else ""
+                        if not gline:
+                            gline = (cfg.get("greeting_line") or cfg.get("greeting") or "").strip()
                         if gline:
                             announce_lines.append(gline)
 
