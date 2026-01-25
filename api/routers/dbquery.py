@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from core.logging import logger
+
 from api.deps.admin_key import require_admin_key
 from deps import get_db
 from services.user_service import get_or_create_primary_user
@@ -48,7 +50,17 @@ def admin_dbquery_entities():
 @router.post("/run", response_model=DBQueryResult)
 def admin_dbquery_run(payload: DBQueryRunIn, db: Session = Depends(get_db)):
     user = get_or_create_primary_user(db)
-    return run_db_query(db, tenant_uuid=str(user.id), spec=payload.spec)
+    try:
+        return run_db_query(db, tenant_uuid=str(user.id), spec=payload.spec)
+    except Exception as e:
+        # Never 500 for user-facing analytics; return a safe error envelope.
+        logger.exception("ADMIN_DBQUERY_RUN_FAIL")
+        ent = "unknown"
+        try:
+            ent = str(payload.spec.entity)
+        except Exception:
+            pass
+        return DBQueryResult(ok=False, entity=ent, count=0, rows=[], aggregates=None, spoken_summary=f"DB query failed: {e}")
 
 
 @router.get("/skills", response_model=list[DBQuerySkillOut])
