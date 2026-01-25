@@ -126,6 +126,11 @@ from services.longterm_memory import (
     fetch_recent_memory_text,
     record_skill_result,
 )
+from services.dynamic_skill_runtime import (
+    match_dynamic_skill,
+    execute_dynamic_skill,
+)
+
 
 # Optional KB voice Q&A (DB-backed; keep failures non-fatal)
 try:
@@ -1400,6 +1405,46 @@ def run_assistant_route(
         }
         _capture_turn("assistant", payload.get("spoken_reply"))
         return payload
+
+    # -------------------------------------------------
+    # Dynamic configured skills (websearch_*, dbquery_*)
+    # If the caller references a saved skill by name/trigger, run it deterministically.
+    # This is how WebUI-created skills become callable by voice (e.g., "give me my sports digest").
+    # Guardrail: optional caller allowlist via DYNAMIC_SKILLS_CALLER_ALLOWLIST.
+    # -------------------------------------------------
+    dyn_match = None
+    try:
+        dyn_match = match_dynamic_skill(db, current_user, raw_user_text)
+    except Exception:
+        dyn_match = None
+
+    if dyn_match and tenant_uuid and caller_id:
+        _dyn_allow = (os.getenv("DYNAMIC_SKILLS_CALLER_ALLOWLIST") or "").strip()
+        if _dyn_allow:
+            try:
+                _allowed = {normalize_caller_id(x) for x in _dyn_allow.split(",") if x.strip()}
+            except Exception:
+                _allowed = set()
+            if caller_id not in _allowed:
+                dyn_match = None
+
+    if dyn_match and tenant_uuid and caller_id:
+        dyn_payload = None
+        try:
+            dyn_payload = execute_dynamic_skill(
+                db,
+                current_user,
+                match=dyn_match,
+                tenant_uuid=str(tenant_uuid),
+                caller_id=str(caller_id),
+                call_sid=str(call_id) if call_id else None,
+                input_text=raw_user_text,
+            )
+        except Exception:
+            dyn_payload = None
+
+        if isinstance(dyn_payload, dict):
+            return _wrap_reply(dyn_payload)
 
     fsm = VozliaFSM()
 
