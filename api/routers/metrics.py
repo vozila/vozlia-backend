@@ -2,51 +2,31 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
-from typing import Any, Dict, Optional
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from api.deps.admin_key import require_admin_key
 from deps import get_db
 from services.user_service import get_or_create_primary_user
-from services.metrics_service import maybe_answer_metrics
+from services.metrics_service import run_metrics_question, capabilities
 
-router = APIRouter(prefix="/admin/metrics", tags=["admin-metrics"], dependencies=[Depends(require_admin_key)])
+
+router = APIRouter(prefix="/admin/metrics", tags=["admin-metrics"])
 
 
 class MetricsRunIn(BaseModel):
-    question: str
-    timezone: Optional[str] = None
+    question: str = Field(..., description="Natural language metric question")
+    timezone: str = Field(default="America/New_York")
 
 
-@router.post("/run")
-def metrics_run(body: MetricsRunIn, db: Session = Depends(get_db)) -> Dict[str, Any]:
+@router.post("/run", dependencies=[Depends(require_admin_key)])
+def run_metrics(payload: MetricsRunIn, db: Session = Depends(get_db)):
     user = get_or_create_primary_user(db)
-    tz = body.timezone or "America/New_York"
-    out = None
-    try:
-        out = maybe_answer_metrics(db, tenant_id=str(user.id), text=body.question or "", default_tz=tz)
-    except Exception:
-        out = None
+    tenant_id = str(user.id)
 
-    if not out:
-        return {"ok": False, "spoken_summary": "I can’t compute that metric yet from the current database.", "data": None}
-
-    return {"ok": True, "spoken_summary": out.get("spoken_reply"), "data": out.get("data"), "key": out.get("key")}
-
-
+    out = run_metrics_question(db, tenant_id=tenant_id, question=payload.question, timezone=payload.timezone)
+    out.setdefault(\"version\", capabilities().get(\"version\"))
+    return out
 @router.get("/capabilities")
-def metrics_caps() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "supports": [
-            "calls count (today/yesterday/this week/last week/this month/last month)",
-            "unique callers count (same timeframes)",
-            "top callers",
-            "email summary requests and skill executions",
-            "top skills executed (best-effort)",
-        ],
-        "notes": [
-            "Metrics are derived from caller_memory_events until call_sessions/skill_invocations tables are added.",
-        ],
-    }
+def get_capabilities(admin=Depends(require_admin_key)):
+    return capabilities()
