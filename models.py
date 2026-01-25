@@ -296,6 +296,33 @@ class WebSearchSkill(Base):
     )
 
 
+
+# =========================
+# DB Query Skills (generic DB searching skill capability)
+# =========================
+
+class DBQuerySkill(Base):
+    __tablename__ = "db_query_skills"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    # Tenant scope (for now, tenant == user id)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    name = Column(String, nullable=False, default="DB Query")
+    entity = Column(String, nullable=False, default="caller_memory_events")
+    spec = Column(JSONB, nullable=False, default=dict)  # flexible query spec (JSON DSL)
+    triggers = Column(JSONB, nullable=False, default=list)
+    enabled = Column(Boolean, nullable=False, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_db_query_skills_tenant_created", "tenant_id", "created_at"),
+        Index("ix_db_query_skills_tenant_entity", "tenant_id", "entity"),
+    )
+
 class ScheduledDelivery(Base):
     __tablename__ = "scheduled_deliveries"
 
