@@ -253,3 +253,42 @@ def capabilities() -> dict:
             }
         ]
     }
+
+# -----------------------------
+# Backwards-compatible wrappers
+# (some versions of assistant_service import these)
+# -----------------------------
+
+def looks_like_metric_question(text: str) -> bool:
+    """Return True if the utterance appears to request a quantitative metric.
+
+    Kept for compatibility with assistant_service.
+    """
+    try:
+        return _is_metric_question(text or "")
+    except Exception:
+        return False
+
+
+def maybe_answer_metrics(
+    db: Session,
+    *,
+    tenant_id: str,
+    text: str,
+    timezone: str = "America/New_York",
+) -> str | None:
+    """Return a short spoken answer for a metric question, or None.
+
+    Kept for compatibility with assistant_service, which expects a deterministic
+    string reply (and should never hallucinate numeric values).
+    """
+    try:
+        out = run_metrics_question(db, tenant_id, text, timezone=timezone)
+    except Exception:
+        return None
+    if not isinstance(out, dict) or not out.get("ok"):
+        return None
+    s = out.get("spoken_summary")
+    if isinstance(s, str) and s.strip():
+        return s.strip()
+    return None
