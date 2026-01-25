@@ -15,6 +15,7 @@ from api.routers.kb import router as kb_router
 from api.routers.notify import router as notify_router
 from api.routers.websearch import router as websearch_router
 from api.routers.dbquery import router as dbquery_router
+from api.routers.metrics import router as metrics_router
 
 
 def create_app() -> FastAPI:
@@ -39,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(notify_router)
     app.include_router(websearch_router)
     app.include_router(dbquery_router)
+    app.include_router(metrics_router)
 
 
     @app.on_event("startup")
