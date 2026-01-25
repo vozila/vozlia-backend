@@ -27,6 +27,7 @@ from skills.registry import skill_registry
 from sqlalchemy.orm import Session
 from models import User
 from models import CallerMemoryEvent
+from services.metrics_service import maybe_answer_metrics, looks_like_metric_question
 from vozlia_fsm import VozliaFSM
 
 def _maybe_answer_history_count(
@@ -910,6 +911,27 @@ def run_assistant_route(
             _hc = None
         if _hc:
             return {"spoken_reply": _hc, "fsm": {"mode": "history_count", "key": "gmail_summary_count"}, "gmail": None}
+
+        # Deterministic metrics (tenant-scoped) for quantitative questions like:
+        # - "how many calls did we receive today/this week"
+        # - "what customer made the most calls"
+        # - "how many times was gmail summary used"
+        #
+        # IMPORTANT: never let the LLM guess numeric answers. If this returns a result, we answer deterministically.
+        try:
+            _mx = maybe_answer_metrics(db, tenant_id=str(tenant_uuid), text=raw_user_text, default_tz=os.getenv("APP_TZ", "America/New_York"))
+        except Exception:
+            _mx = None
+        if isinstance(_mx, dict) and _mx.get("spoken_reply"):
+            return {"spoken_reply": _mx["spoken_reply"], "fsm": {"mode": "metrics", "key": _mx.get("key", "metrics")}, "gmail": None}
+
+        # Guardrail: if the user asked a quantitative question but we couldn't compute it deterministically,
+        # do NOT let the LLM guess a number.
+        try:
+            if looks_like_metric_question(raw_user_text or ""):
+                return {"spoken_reply": "I can’t compute that metric yet from the current database. I can answer questions about a specific call, or we can enable additional metrics logging.", "fsm": {"mode": "metrics", "action": "unsupported"}, "gmail": None}
+        except Exception:
+            pass
 
     
     # ---------------------------------------------------------
