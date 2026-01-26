@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from core.logging import logger
 from models import (
     CallerMemoryEvent,
+    AnalyticsEvent,
     WebSearchSkill,
     ScheduledDelivery,
     CallerSkillCache,
@@ -231,19 +232,43 @@ def maybe_answer_metrics(
     db: Session,
     *,
     tenant_id: str,
-    question: str,
+    question: str | None = None,
+    text: str | None = None,
     timezone: str | None = None,
+    default_tz: str | None = None,
     **_: Any,
 ) -> dict[str, Any] | None:
-    """Backwards-compatible entrypoint used by assistant_service.
+    """Backwards-compatible entrypoint used by assistant_service and other callers.
+
+    Accepts legacy kwargs:
+      - question=... (preferred)
+      - text=... (older callers)
+      - timezone=... (preferred)
+      - default_tz=... (older callers)
 
     Returns:
-      - dict response if this is a metric question (ok true/false)
+      - dict containing at least {'spoken_reply': ...} if the question is metric-like
       - None if not a metric question
     """
-    if not looks_like_metric_question(question):
+    q = question if question is not None else text
+    if not looks_like_metric_question(q or ""):
         return None
-    return run_metrics_question(db, tenant_id=tenant_id, question=question, timezone=timezone or "America/New_York")
+
+    tz = timezone or default_tz or "America/New_York"
+    out = run_metrics_question(db, tenant_id=tenant_id, question=str(q or ""), timezone=tz)
+
+    spoken = (out.get("spoken_summary") or out.get("spoken_reply") or "").strip() if isinstance(out, dict) else ""
+    if not spoken:
+        return None
+
+    # Keep the voice/assistant integration stable: assistant_service expects 'spoken_reply' + optional 'key'.
+    return {
+        "spoken_reply": spoken,
+        "key": (out.get("metric") or out.get("key") or "metrics") if isinstance(out, dict) else "metrics",
+        "ok": bool(out.get("ok")) if isinstance(out, dict) else None,
+        "data": out.get("data") if isinstance(out, dict) else None,
+        "version": out.get("version") if isinstance(out, dict) else None,
+    }
 
 
 def capabilities() -> dict[str, Any]:
@@ -261,6 +286,7 @@ def capabilities() -> dict[str, Any]:
             "calls.unique_callers_timeseries",
             # skills
             "skills.invocations",
+            "skills.requests",
             "skills.distinct_callers",
             "skills.top_invoked",
             "skills.invocations_timeseries",
@@ -518,6 +544,124 @@ def _skill_key_from_question(q_norm: str) -> str | None:
     return None
 
 
+# -------------------------
+# Skill resolution helpers
+# -------------------------
+
+_STOPWORDS = {
+    "a", "an", "the", "my", "me", "please", "give", "show", "run", "do", "get", "tell",
+    "today", "todays", "yesterday", "this", "that", "for", "to", "of", "in", "on", "at",
+    "and", "or", "is", "are", "was", "were", "skill", "skills",
+    "how", "many", "times", "invoked", "invoke", "invocation", "requested", "request",
+    "used", "use", "executed", "execute", "ran", "run", "by", "hour", "day", "week", "month",
+}
+
+
+def _tok(s: str) -> list[str]:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    toks = [w for w in s.split(" ") if w and w not in _STOPWORDS]
+    return toks
+
+
+def _load_skills_config_for_tenant(db: Session, tenant_id: str) -> dict[str, dict]:
+    """Loads skills_config from user_settings without requiring a User object.
+
+    Supports both shapes:
+      - { "skills": { "<id>": {...} } }
+      - { "<id>": {...}, ... }
+    """
+    tid = _tenant_uuid(tenant_id)
+    if not tid:
+        return {}
+    try:
+        row = db.query(UserSetting).filter(UserSetting.user_id == tid).filter(UserSetting.key == "skills_config").first()
+    except Exception:
+        row = None
+    v = getattr(row, "value", None) if row else None
+    if not isinstance(v, dict):
+        return {}
+
+    # Shape A
+    skills = v.get("skills")
+    if isinstance(skills, dict) and skills:
+        out: dict[str, dict] = {}
+        for k, cfg in skills.items():
+            if isinstance(k, str) and isinstance(cfg, dict):
+                out[k] = cfg
+        if out:
+            return out
+
+    # Shape B
+    out2: dict[str, dict] = {}
+    for k, cfg in v.items():
+        if k == "skills":
+            continue
+        if isinstance(k, str) and isinstance(cfg, dict):
+            out2[k] = cfg
+    return out2
+
+
+def _resolve_skill_key(db: Session, tenant_id: str, q_norm: str) -> str | None:
+    """Resolve a skill key from a metric question.
+
+    Priority:
+      1) Explicit quoted skill key: skill 'gmail_summary' / skill "websearch_..."
+      2) Friendly synonyms (email summaries -> gmail_summary)
+      3) Dynamic skills via skills_config label/triggers (best-effort substring + token overlap)
+    """
+    # (1) quoted / explicit
+    sk = _skill_key_from_question(q_norm)
+    if sk:
+        return sk
+
+    # (2) dynamic skills best-effort
+    cfg = _load_skills_config_for_tenant(db, tenant_id)
+    if not cfg:
+        return None
+
+    q_tokens = set(_tok(q_norm))
+    best_id: str | None = None
+    best_score: float = 0.0
+
+    for skill_id, scfg in cfg.items():
+        if not isinstance(skill_id, str) or not isinstance(scfg, dict):
+            continue
+
+        label = (scfg.get("label") or scfg.get("name") or scfg.get("title") or "").strip()
+        triggers = scfg.get("triggers") if isinstance(scfg.get("triggers"), list) else []
+
+        # Strong match: substring on label/trigger phrase
+        if label:
+            lab_norm = " ".join(_tok(label))
+            if lab_norm and lab_norm in q_norm:
+                return skill_id
+
+        for tr in triggers[:20]:
+            if not isinstance(tr, str):
+                continue
+            trn = " ".join(_tok(tr))
+            if trn and trn in q_norm:
+                return skill_id
+
+        # Soft match: token overlap with label
+        if label and q_tokens:
+            label_tokens = set(_tok(label))
+            if not label_tokens:
+                continue
+            inter = len(q_tokens.intersection(label_tokens))
+            score = inter / float(max(1, len(label_tokens)))
+            if score > best_score:
+                best_score = score
+                best_id = skill_id
+
+    # Require a minimum overlap so we don't accidentally pick a random skill.
+    if best_id and best_score >= 0.55:
+        return best_id
+    return None
+
+
 def _skills_q(db: Session, tenant_id: str, w: TimeWindow):
     return (
         db.query(CallerMemoryEvent)
@@ -526,6 +670,42 @@ def _skills_q(db: Session, tenant_id: str, w: TimeWindow):
         .filter(CallerMemoryEvent.created_at < w.end_utc)
         .filter(CallerMemoryEvent.kind == "skill")
     )
+
+def _skill_requests_q(db: Session, tenant_id: str, w: TimeWindow):
+    return (
+        db.query(AnalyticsEvent)
+        .filter(AnalyticsEvent.tenant_id == str(tenant_id))
+        .filter(AnalyticsEvent.created_at >= w.start_utc)
+        .filter(AnalyticsEvent.created_at < w.end_utc)
+        .filter(AnalyticsEvent.event_type == "skill_requested")
+    )
+
+
+def _count_skill_requests(db: Session, tenant_id: str, w: TimeWindow, skill_key: str | None) -> int:
+    q = _skill_requests_q(db, tenant_id, w)
+    if skill_key:
+        q = q.filter(AnalyticsEvent.skill_key == skill_key)
+    return int(q.with_entities(func.count(AnalyticsEvent.id)).scalar() or 0)
+
+
+def _count_skill_requests_distinct_callers(db: Session, tenant_id: str, w: TimeWindow, skill_key: str | None) -> int:
+    q = _skill_requests_q(db, tenant_id, w)
+    if skill_key:
+        q = q.filter(AnalyticsEvent.skill_key == skill_key)
+    return int(q.with_entities(func.count(distinct(AnalyticsEvent.caller_id))).scalar() or 0)
+
+
+def _skill_requests_timeseries(db: Session, tenant_id: str, w: TimeWindow, tz_name: str, bucket: str, skill_key: str | None):
+    bucket_expr = func.date_trunc(bucket, _local_time_expr(AnalyticsEvent.created_at, tz_name)).label("bucket")
+    q = _skill_requests_q(db, tenant_id, w).with_entities(bucket_expr, func.count(AnalyticsEvent.id).label("n"))
+    if skill_key:
+        q = q.filter(AnalyticsEvent.skill_key == skill_key)
+    rows = q.group_by(bucket_expr).order_by(bucket_expr).all()
+    out: list[dict[str, Any]] = []
+    for b, n in rows:
+        out.append({"bucket": (b.isoformat() if getattr(b, "isoformat", None) else str(b)), "count": int(n or 0)})
+    return out
+
 
 
 def _count_skill_invocations(db: Session, tenant_id: str, w: TimeWindow, skill_key: str | None) -> int:
@@ -772,28 +952,76 @@ def run_metrics_question(
         )
         return _ok("skills.email_summaries_requested", w.preset, stats, spoken)
 
-    if "invoked" in q_norm and "skill" in q_norm:
-        sk = _skill_key_from_question(q_norm)
+    # Skill invocation count (robust phrasing; does NOT handle timeseries 'by hour/day')
+    if (
+        (
+            ("skill" in q_norm)
+            and (
+                ("invoked" in q_norm)
+                or ("invocation" in q_norm)
+                or ("invocations" in q_norm)
+                or ("used" in q_norm)
+                or ("executed" in q_norm)
+                or ("ran" in q_norm)
+                or ("run" in q_norm)
+                or ("how many times" in q_norm)
+            )
+        )
+        or (("how many times" in q_norm) and ("skill" in q_norm))
+    ) and ("requested" not in q_norm) and ("by hour" not in q_norm) and ("by day" not in q_norm):
+        sk = _resolve_skill_key(db, tenant_id, q_norm)
         if not sk:
-            return _fail("Which skill key do you mean? Example: skill 'gmail_summary'.")
+            return _fail("Which skill do you mean? Example: skill 'gmail_summary'.")
         inv = _count_skill_invocations(db, tenant_id, w, sk)
-        return _ok("skills.invocations", w.preset, {"skill_key": sk, "invocations": inv}, f"Skill '{sk}' invocations {w.preset.replace('_',' ')}: {inv}.")
+        return _ok(
+            "skills.invocations",
+            w.preset,
+            {"skill_key": sk, "invocations": inv},
+            f"Skill '{sk}' invocations {w.preset.replace('_',' ')}: {inv}.",
+        )
+
+    # Skill request count (requires analytics event layer)
+    if (
+        ("requested" in q_norm or "request" in q_norm)
+        and ("email summary" not in q_norm)  # handled above
+        and ("by hour" not in q_norm)
+        and ("by day" not in q_norm)
+    ):
+        sk = _resolve_skill_key(db, tenant_id, q_norm)
+        if not sk:
+            return _fail("Which skill do you mean? Example: skill 'gmail_summary' or a saved skill name.")
+        # If analytics is not enabled, we cannot compute request metrics reliably.
+        try:
+            import os as _os
+            _enabled = (_os.getenv("ANALYTICS_EVENTS_ENABLED", "0") or "0").strip().lower() in ("1","true","yes","on")
+        except Exception:
+            _enabled = False
+        if not _enabled:
+            return _fail("Skill request metrics require ANALYTICS_EVENTS_ENABLED=1 on the backend.")
+        req = _count_skill_requests(db, tenant_id, w, sk)
+        callers = _count_skill_requests_distinct_callers(db, tenant_id, w, sk)
+        return _ok(
+            "skills.requests",
+            w.preset,
+            {"skill_key": sk, "requests": req, "distinct_callers": callers},
+            f"Skill '{sk}' requested {w.preset.replace('_',' ')}: {req} (distinct callers: {callers}).",
+        )
 
     if "distinct callers invoked" in q_norm or "distinct callers invoked skill" in q_norm:
-        sk = _skill_key_from_question(q_norm)
+        sk = _resolve_skill_key(db, tenant_id, q_norm)
         if not sk:
             return _fail("Which skill key do you mean? Example: skill 'gmail_summary'.")
         n = _count_skill_distinct_callers(db, tenant_id, w, sk)
         return _ok("skills.distinct_callers", w.preset, {"skill_key": sk, "distinct_callers": n}, f"Distinct callers invoking '{sk}' {w.preset.replace('_',' ')}: {n}.")
 
     if ("skill invocations by day" in q_norm) or (("invocations by day" in q_norm) and ("skill" in q_norm)):
-        sk = _skill_key_from_question(q_norm)
+        sk = _resolve_skill_key(db, tenant_id, q_norm)
         rows = _skills_timeseries(db, tenant_id, w, tz_name, bucket="day", skill_key=sk)
         label = f"Skill '{sk}' invocations by day" if sk else "Skill invocations by day"
         return _ok("skills.invocations_timeseries", w.preset, {"bucket": "day", "skill_key": sk, "rows": rows}, f"{label} ({w.preset.replace('_',' ')}, {tz_name}).")
 
     if ("skill invocations by hour" in q_norm) or (("invocations by hour" in q_norm) and ("skill" in q_norm)):
-        sk = _skill_key_from_question(q_norm)
+        sk = _resolve_skill_key(db, tenant_id, q_norm)
         rows = _skills_timeseries(db, tenant_id, w, tz_name, bucket="hour", skill_key=sk)
         label = f"Skill '{sk}' invocations by hour" if sk else "Skill invocations by hour"
         return _ok("skills.invocations_timeseries", w.preset, {"bucket": "hour", "skill_key": sk, "rows": rows}, f"{label} ({w.preset.replace('_',' ')}, {tz_name}).")
@@ -813,7 +1041,7 @@ def run_metrics_question(
 
     # "How many times was skill 'X' invoked ..." (without the word "skill" sometimes)
     if "how many times was" in q_norm and "invoked" in q_norm:
-        sk = _skill_key_from_question(q_norm)
+        sk = _resolve_skill_key(db, tenant_id, q_norm)
         if sk:
             inv = _count_skill_invocations(db, tenant_id, w, sk)
             return _ok("skills.invocations", w.preset, {"skill_key": sk, "invocations": inv}, f"Skill '{sk}' invocations {w.preset.replace('_',' ')}: {inv}.")
@@ -1343,7 +1571,7 @@ def _handle_compare(db: Session, *, tenant_id: str, q_norm: str, tz_name: str) -
         )
 
     if "skill invocations" in q_norm or "invocations" in q_norm:
-        sk = _skill_key_from_question(q_norm)
+        sk = _resolve_skill_key(db, tenant_id, q_norm)
         a = _count_skill_invocations(db, tenant_id, w_a, sk)
         b = _count_skill_invocations(db, tenant_id, w_b, sk)
         delta = a - b

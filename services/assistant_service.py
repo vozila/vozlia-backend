@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from models import User
 from models import CallerMemoryEvent
 from services.metrics_service import maybe_answer_metrics, looks_like_metric_question
+from services.analytics_events import emit_analytics_event
 from vozlia_fsm import VozliaFSM
 
 def _maybe_answer_history_count(
@@ -1451,6 +1452,29 @@ def run_assistant_route(
                 dyn_match = None
 
     if dyn_match and tenant_uuid and caller_id:
+        # Analytics: record that the user requested this saved skill (best-effort, fail-open).
+        try:
+            emit_analytics_event(
+                tenant_id=str(tenant_uuid),
+                event_type="skill_requested",
+                caller_id=str(caller_id),
+                call_sid=(str(call_id) if call_id else None),
+                skill_key=str(getattr(dyn_match, "skill_id", "") or ""),
+                payload={
+                    "source": "voice",
+                    "query": (raw_user_text or "")[:240],
+                    "match_score": float(getattr(dyn_match, "score", 0.0) or 0.0),
+                    "match_reason": str(getattr(dyn_match, "reason", "") or "")[:240],
+                },
+                tags=[
+                    "origin:voice",
+                    "kind:skill_requested",
+                    f"skill:{str(getattr(dyn_match, 'skill_id', '') or '')}",
+                ],
+            )
+        except Exception:
+            pass
+
         dyn_payload = None
         try:
             dyn_payload = execute_dynamic_skill(
@@ -1640,6 +1664,21 @@ def run_assistant_route(
             _capture_turn("assistant", payload.get("spoken_reply"))
             return payload
 
+        # Analytics: record that the user requested the Gmail summary skill (best-effort, fail-open).
+        try:
+            emit_analytics_event(
+                tenant_id=str(tenant_uuid) if tenant_uuid else "",
+                event_type="skill_requested",
+                caller_id=str(caller_id) if caller_id else None,
+                call_sid=(str(call_id) if call_id else None),
+                skill_key="gmail_summary",
+                payload={"source": "voice", "query": (raw_user_text or "")[:240]},
+                tags=["origin:voice", "kind:skill_requested", "skill:gmail_summary"],
+            )
+        except Exception:
+            pass
+
+
         # If this was initiated via auto-exec/offer-followup, use a neutral standby phrase instead of a confirmation.
         if wants_standby_ack:
             spoken_reply = _standby_phrase()
@@ -1805,6 +1844,22 @@ def run_assistant_route(
                 except Exception:
                     logger.exception("LONGTERM_MEM_RECORD_GMAIL_FAILED")
             gmail_data["used_account_id"] = account_id_effective
+            # Analytics: record skill execution (best-effort, fail-open).
+            try:
+                emit_analytics_event(
+                    tenant_id=str(tenant_uuid) if tenant_uuid else "",
+                    event_type="skill_executed",
+                    caller_id=str(caller_id) if caller_id else None,
+                    call_sid=(str(call_id) if call_id else None),
+                    skill_key="gmail_summary",
+                    payload={
+                        "source": "voice",
+                        "fresh": bool(gmail_data_fresh) if "gmail_data_fresh" in locals() else None,
+                    },
+                    tags=["origin:voice", "kind:skill_executed", "skill:gmail_summary"],
+                )
+            except Exception:
+                pass
 
         payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
         _capture_turn("assistant", payload.get("spoken_reply"))
@@ -1960,6 +2015,21 @@ def run_assistant_route(
             _capture_turn("assistant", payload.get("spoken_reply"))
             return payload
 
+        # Analytics: record that the user requested investment reporting (best-effort, fail-open).
+        try:
+            emit_analytics_event(
+                tenant_id=str(tenant_uuid) if tenant_uuid else "",
+                event_type="skill_requested",
+                caller_id=str(caller_id) if caller_id else None,
+                call_sid=(str(call_id) if call_id else None),
+                skill_key="investment_reporting",
+                payload={"source": "voice", "query": (raw_user_text or "")[:240]},
+                tags=["origin:voice", "kind:skill_requested", "skill:investment_reporting"],
+            )
+        except Exception:
+            pass
+
+
         # Allow per-call override tickers (e.g., user asked: "price on TSLA").
         inv_params = backend_call.get("params") if isinstance(backend_call, dict) else {}
         override_tickers = _normalize_ticker_symbols(inv_params.get("tickers")) if isinstance(inv_params, dict) else []
@@ -2023,6 +2093,20 @@ def run_assistant_route(
                     memory_text=str(spoken_list[0]),
                     data_json={"tickers": tickers, "report": rep},
                 )
+        except Exception:
+            pass
+
+        # Analytics: record skill execution (best-effort, fail-open).
+        try:
+            emit_analytics_event(
+                tenant_id=str(tenant_uuid) if tenant_uuid else "",
+                event_type="skill_executed",
+                caller_id=str(caller_id) if caller_id else None,
+                call_sid=(str(call_id) if call_id else None),
+                skill_key="investment_reporting",
+                payload={"source": "voice"},
+                tags=["origin:voice", "kind:skill_executed", "skill:investment_reporting"],
+            )
         except Exception:
             pass
 

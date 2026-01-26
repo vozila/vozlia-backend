@@ -15,6 +15,7 @@ from services.settings_service import get_skills_config
 from services.web_search_service import run_web_search
 from services.db_query_service import run_db_query
 from services.longterm_memory import record_skill_result
+from services.analytics_events import emit_analytics_event
 
 
 # Cache skills_config by tenant for a short TTL to avoid per-turn DB hits in the voice hot path.
@@ -236,6 +237,20 @@ def execute_dynamic_skill(
         except Exception:
             pass
 
+        # Analytics: record skill execution (best-effort, fail-open).
+        try:
+            emit_analytics_event(
+                tenant_id=str(tenant_uuid),
+                event_type="skill_executed",
+                caller_id=str(caller_id) if caller_id else None,
+                call_sid=(str(call_sid) if call_sid else None),
+                skill_key=str(skill_id),
+                payload={"source": "voice", "type": "web_search"},
+                tags=["origin:voice", "kind:skill_executed", f"skill:{str(skill_id)}"],
+            )
+        except Exception:
+            pass
+
         logger.info("DYNAMIC_SKILL_RUN type=web_search skill_id=%s score=%.1f reason=%s", skill_id, match.score, match.reason)
         return {"spoken_reply": spoken, "fsm": {"mode": "dynamic_skill", "type": "web_search", "skill_id": skill_id}, "gmail": None}
 
@@ -268,6 +283,20 @@ def execute_dynamic_skill(
                     "ok": bool(getattr(qres, "ok", True)),
                     "count": getattr(qres, "count", None),
                 },
+            )
+        except Exception:
+            pass
+
+        # Analytics: record skill execution (best-effort, fail-open).
+        try:
+            emit_analytics_event(
+                tenant_id=str(tenant_uuid),
+                event_type="skill_executed",
+                caller_id=str(caller_id) if caller_id else None,
+                call_sid=(str(call_sid) if call_sid else None),
+                skill_key=str(skill_id),
+                payload={"source": "voice", "type": "db_query"},
+                tags=["origin:voice", "kind:skill_executed", f"skill:{str(skill_id)}"],
             )
         except Exception:
             pass
