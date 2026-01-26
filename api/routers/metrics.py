@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session
 from api.deps.admin_key import require_admin_key
 from deps import get_db
 from services.user_service import get_or_create_primary_user
-from services.metrics_service import run_metrics_question, capabilities
+from services.metrics_service import capabilities
+from services.metrics_controller import run_metrics
 
 router = APIRouter(prefix="/admin/metrics", tags=["metrics"])
 
@@ -33,12 +34,13 @@ def metrics_run(payload: MetricsRunRequest, db: Session = Depends(get_db)):
     user = get_or_create_primary_user(db)
     tenant_id = str(user.id)
 
-    out = run_metrics_question(
+    out = run_metrics(
         db,
         tenant_id=tenant_id,
         question=payload.question,
         timezone=payload.timezone,
+        user=user,
     )
-    # Ensure version field exists
+    # Ensure version field exists (for clients that pin behavior)
     out.setdefault("version", capabilities().get("version"))
     return out
