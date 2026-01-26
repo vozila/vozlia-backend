@@ -261,6 +261,34 @@ Index("ix_mem_tenant_caller_created", CallerMemoryEvent.tenant_id, CallerMemoryE
 Index("ix_mem_tenant_caller_skill_created", CallerMemoryEvent.tenant_id, CallerMemoryEvent.caller_id, CallerMemoryEvent.skill_key, CallerMemoryEvent.created_at.desc())
 
 # =========================
+# Analytics Events (Metrics Layer)
+# =========================
+
+class AnalyticsEvent(Base):
+    __tablename__ = "analytics_events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+    tenant_id = Column(String, index=True, nullable=False)
+
+    # Optional context (present for call/voice events)
+    caller_id = Column(String, index=True, nullable=True)
+    call_sid = Column(String, index=True, nullable=True)
+
+    # e.g. "skill_requested", "skill_executed", "schedule_fired", "notification_sent"
+    event_type = Column(String, index=True, nullable=False)
+    skill_key = Column(String, index=True, nullable=True)
+
+    created_at = Column(DateTime, default=_dt.utcnow, index=True, nullable=False)
+
+    payload_json = Column(JSON, nullable=True)
+    tags_json = Column(JSON, nullable=True)
+
+Index("ix_analytics_tenant_type_created", AnalyticsEvent.tenant_id, AnalyticsEvent.event_type, AnalyticsEvent.created_at.desc())
+Index("ix_analytics_tenant_skill_created", AnalyticsEvent.tenant_id, AnalyticsEvent.skill_key, AnalyticsEvent.created_at.desc())
+Index("ix_analytics_tenant_call_created", AnalyticsEvent.tenant_id, AnalyticsEvent.call_sid, AnalyticsEvent.created_at.desc())
+
+
+# =========================
 # Web Search Skills + Scheduling
 # =========================
 
