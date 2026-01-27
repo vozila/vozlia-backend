@@ -3,7 +3,7 @@ from fastapi import FastAPI
 
 from core.logging import logger  # IMPORTANT: initializes logging early
 
-from db import Base, engine
+from db import Base, engine, SessionLocal
 from skills.loader import load_skills_from_disk
 
 from api.routers.health import router as health_router
@@ -15,6 +15,10 @@ from api.routers.kb import router as kb_router
 from api.routers.notify import router as notify_router
 from api.routers.websearch import router as websearch_router
 from api.routers.dbquery import router as dbquery_router
+
+# Admin troubleshooting routes
+from api.routers.admin_settings import router as admin_settings_router
+from api.routers.admin_dynamic_skills import router as admin_dynamic_skills_router
 
 
 def create_app() -> FastAPI:
@@ -40,12 +44,34 @@ def create_app() -> FastAPI:
     app.include_router(websearch_router)
     app.include_router(dbquery_router)
 
+    # Admin settings + troubleshooting
+    app.include_router(admin_settings_router)
+    app.include_router(admin_dynamic_skills_router)
 
     @app.on_event("startup")
     def _startup() -> None:
         # Ensure DB schema exists and load YAML skills.
         Base.metadata.create_all(bind=engine)
         load_skills_from_disk()
+
+        # Best-effort: repair dynamic-skill routing after rollbacks / drift.
+        # Rollback: set DYNAMIC_SKILLS_AUTOSYNC=0 to disable.
+        try:
+            from services.dynamic_skill_autosync import dynamic_skills_autosync_enabled, autosync_dynamic_skills
+            from services.user_service import get_or_create_primary_user
+
+            if dynamic_skills_autosync_enabled():
+                db = SessionLocal()
+                try:
+                    user = get_or_create_primary_user(db)
+                    autosync_dynamic_skills(db, user, force=False)
+                    db.commit()
+                finally:
+                    db.close()
+        except Exception:
+            # Never crash startup due to autosync; it is purely a recovery mechanism.
+            logger.exception("DYNAMIC_SKILLS_AUTOSYNC_STARTUP_FAIL")
+
         logger.info("Database tables ensured and skills loaded.")
 
     @app.get("/")
