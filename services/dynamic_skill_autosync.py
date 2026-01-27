@@ -41,6 +41,69 @@ def dynamic_skills_autosync_enabled() -> bool:
     return (os.getenv("DYNAMIC_SKILLS_AUTOSYNC", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 
 
+# -----------------------------------------------------------------------------
+# Category metadata for dynamic skills
+#
+# Why
+#   Voice/chat intent routing improves when skills carry lightweight category tags
+#   (e.g. "sports", "parking", "weather"). Categories are OPTIONAL and must never
+#   break execution. If missing, we set a safe default. Optionally, we can
+#   heuristically auto-classify at sync-time (NOT on the voice hot path).
+#
+# Rollback / safety
+#   - Set DYNAMIC_SKILL_CATEGORY_AUTO=0 to disable heuristic categorization.
+#   - Categories are stored in skills_config only; no DB migration required.
+# -----------------------------------------------------------------------------
+
+def dynamic_skill_category_default() -> str:
+    return (os.getenv("DYNAMIC_SKILL_CATEGORY_DEFAULT", "general") or "general").strip() or "general"
+
+
+def dynamic_skill_category_auto_enabled() -> bool:
+    # Optional heuristic categorization (safe: only fills missing category).
+    return (os.getenv("DYNAMIC_SKILL_CATEGORY_AUTO", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _norm(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+_CATEGORY_RULES: list[tuple[str, list[str]]] = [
+    ("sports", ["sport", "sports", "nba", "wnba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "hockey", "digest", "score", "scores", "games", "matchup", "matchups"]),
+    ("parking", ["alternate side parking", "asp", "parking"]),
+    ("weather", ["weather", "forecast", "temperature", "rain", "snow", "humidity", "wind"]),
+    ("finance", ["investment", "invest", "portfolio", "stock", "stocks", "crypto", "bitcoin", "btc", "market", "yfinance", "debt", "national debt", "interest rate"]),
+    ("email", ["gmail", "email", "inbox", "summary", "summaries"]),
+    ("calls", ["caller", "callers", "call", "calls", "voicemail", "missed call"]),
+    ("business", ["hours", "open", "close", "appointment", "reservation", "order", "orders", "booking"]),
+]
+
+
+def guess_dynamic_skill_category(*, label: str, query: str = "", entity: str = "", phrases: list[str] | None = None) -> str:
+    """Best-effort category guess.
+
+    IMPORTANT: This is a heuristic convenience only. It MUST be safe:
+      - never raises
+      - never returns empty
+      - never overwrites an operator-set category
+    """
+    try:
+        text = " ".join([label or "", query or "", entity or "", " ".join(phrases or [])])
+        t = _norm(text)
+        if not t:
+            return dynamic_skill_category_default()
+        for cat, keys in _CATEGORY_RULES:
+            for k in keys:
+                if _norm(k) and _norm(k) in t:
+                    return cat
+    except Exception:
+        pass
+    return dynamic_skill_category_default()
+
+
 def _clean_label(name: str) -> str:
     s = (name or "").strip()
     if not s:
@@ -93,6 +156,12 @@ def _merge_cfg(existing: dict[str, Any], desired: dict[str, Any]) -> Tuple[dict[
         if k in existing:
             merged[k] = existing.get(k)
 
+
+    # Preserve operator-assigned category if present (do not clobber manual grouping)
+    cat = existing.get("category")
+    if isinstance(cat, str) and cat.strip():
+        merged["category"] = cat.strip()
+
     # Preserve existing engagement phrases if non-empty; else fill with desired
     ep = existing.get("engagement_phrases")
     if isinstance(ep, list) and any(isinstance(x, str) and x.strip() for x in ep):
@@ -126,9 +195,20 @@ def autosync_dynamic_skills(db: Session, user: User, *, force: bool = False) -> 
         key = f"websearch_{row.id}"
         triggers = row.triggers if isinstance(row.triggers, list) else []
         phrases = [t for t in triggers if isinstance(t, str) and t.strip()] or _default_phrases(row.name)
+        # Category: preserve operator-set category if present; else default/auto-classify (safe).
+        existing = cfg.get(key) if isinstance(cfg.get(key), dict) else None
+        existing_cat = (existing.get("category") if isinstance(existing, dict) else None)
+        if isinstance(existing_cat, str) and existing_cat.strip():
+            category = existing_cat.strip()
+        else:
+            if dynamic_skill_category_auto_enabled():
+                category = guess_dynamic_skill_category(label=str(row.name or ""), query=str(row.query or ""), phrases=phrases)
+            else:
+                category = dynamic_skill_category_default()
         desired = {
             "enabled": bool(getattr(row, "enabled", True)),
             "label": str(row.name or "Saved Web Search"),
+            "category": str(category),
             "type": "web_search",
             "query": str(row.query or ""),
             "engagement_phrases": phrases,
@@ -160,9 +240,20 @@ def autosync_dynamic_skills(db: Session, user: User, *, force: bool = False) -> 
         key = f"dbquery_{row.id}"
         triggers = row.triggers if isinstance(row.triggers, list) else []
         phrases = [t for t in triggers if isinstance(t, str) and t.strip()] or _default_phrases(row.name)
+        # Category: preserve operator-set category if present; else default/auto-classify (safe).
+        existing = cfg.get(key) if isinstance(cfg.get(key), dict) else None
+        existing_cat = (existing.get("category") if isinstance(existing, dict) else None)
+        if isinstance(existing_cat, str) and existing_cat.strip():
+            category = existing_cat.strip()
+        else:
+            if dynamic_skill_category_auto_enabled():
+                category = guess_dynamic_skill_category(label=str(row.name or ""), entity=str(row.entity or ""), phrases=phrases)
+            else:
+                category = dynamic_skill_category_default()
         desired = {
             "enabled": bool(getattr(row, "enabled", True)),
             "label": str(row.name or "DB Query"),
+            "category": str(category),
             "type": "db_query",
             "entity": str(row.entity or "caller_memory_events"),
             "spec": row.spec if isinstance(row.spec, dict) else {},
