@@ -1407,44 +1407,106 @@ def run_assistant_route(
         return payload
 
     # -------------------------------------------------
-    # Dynamic configured skills (websearch_*, dbquery_*)
+    # Intent Router V2 (LLM-assisted, schema-validated)
+    #
+    # Why: callers (and owners) speak in natural language, not standardized phrases.
+    # This layer lets an LLM pick the intended skill (or ask to disambiguate) using a
+    # small candidate list, then Python executes deterministically.
+    #
+    # Safety: feature-flagged via INTENT_V2_MODE (off|shadow|assist).
+    # Rollback: set INTENT_V2_MODE=off to restore legacy routing instantly.
+    # -------------------------------------------------
+    _intent_v2_enabled = False
+    try:
+        from services.intent_router_v2 import (
+            intent_v2_enabled as _intent_v2_enabled_fn,
+            maybe_consume_disambiguation_choice as _intent_v2_consume,
+            maybe_route_and_execute as _intent_v2_route,
+        )
+        _intent_v2_enabled = bool(_intent_v2_enabled_fn())
+    except Exception:
+        _intent_v2_enabled = False
+
+    if _intent_v2_enabled:
+        # If previous turn asked the caller to choose between multiple skills, consume it first.
+        try:
+            out = _intent_v2_consume(
+                utterance=raw_user_text,
+                db=db,
+                user=current_user,
+                tenant_uuid=str(tenant_uuid) if tenant_uuid else None,
+                caller_id=str(caller_id) if caller_id else None,
+                call_id=str(call_id) if call_id else None,
+                account_id=account_id,
+                context=ctx if isinstance(ctx, dict) else None,
+            )
+        except Exception:
+            out = None
+        if isinstance(out, dict):
+            return _wrap_reply(out)
+
+        # Otherwise, attempt LLM-based routing (may return None to fall back to legacy).
+        try:
+            out = _intent_v2_route(
+                utterance=raw_user_text,
+                db=db,
+                user=current_user,
+                tenant_uuid=str(tenant_uuid) if tenant_uuid else None,
+                caller_id=str(caller_id) if caller_id else None,
+                call_id=str(call_id) if call_id else None,
+                account_id=account_id,
+                context=ctx if isinstance(ctx, dict) else None,
+            )
+        except Exception:
+            out = None
+        if isinstance(out, dict):
+            return _wrap_reply(out)
+
+    # -------------------------------------------------
+    # Legacy dynamic configured skills (websearch_*, dbquery_*)
     # If the caller references a saved skill by name/trigger, run it deterministically.
     # This is how WebUI-created skills become callable by voice (e.g., "give me my sports digest").
     # Guardrail: optional caller allowlist via DYNAMIC_SKILLS_CALLER_ALLOWLIST.
+    #
+    # NOTE: By default we KEEP this legacy matcher as a fallback (stability first).
+    # If you want the new router to be the single authority, set:
+    #   INTENT_V2_STRICT=1
     # -------------------------------------------------
-    dyn_match = None
-    try:
-        dyn_match = match_dynamic_skill(db, current_user, raw_user_text)
-    except Exception:
+    _intent_v2_strict = (os.getenv("INTENT_V2_STRICT", "0") or "0").strip().lower() in ("1","true","yes","on")
+    if not (_intent_v2_enabled and _intent_v2_strict):
         dyn_match = None
-
-    if dyn_match and tenant_uuid and caller_id:
-        _dyn_allow = (os.getenv("DYNAMIC_SKILLS_CALLER_ALLOWLIST") or "").strip()
-        if _dyn_allow:
-            try:
-                _allowed = {normalize_caller_id(x) for x in _dyn_allow.split(",") if x.strip()}
-            except Exception:
-                _allowed = set()
-            if caller_id not in _allowed:
-                dyn_match = None
-
-    if dyn_match and tenant_uuid and caller_id:
-        dyn_payload = None
         try:
-            dyn_payload = execute_dynamic_skill(
-                db,
-                current_user,
-                match=dyn_match,
-                tenant_uuid=str(tenant_uuid),
-                caller_id=str(caller_id),
-                call_sid=str(call_id) if call_id else None,
-                input_text=raw_user_text,
-            )
+            dyn_match = match_dynamic_skill(db, current_user, raw_user_text)
         except Exception:
-            dyn_payload = None
+            dyn_match = None
 
-        if isinstance(dyn_payload, dict):
-            return _wrap_reply(dyn_payload)
+        if dyn_match and tenant_uuid and caller_id:
+            _dyn_allow = (os.getenv("DYNAMIC_SKILLS_CALLER_ALLOWLIST") or "").strip()
+            if _dyn_allow:
+                try:
+                    _allowed = {normalize_caller_id(x) for x in _dyn_allow.split(",") if x.strip()}
+                except Exception:
+                    _allowed = set()
+                if caller_id not in _allowed:
+                    dyn_match = None
+
+        if dyn_match and tenant_uuid and caller_id:
+            dyn_payload = None
+            try:
+                dyn_payload = execute_dynamic_skill(
+                    db,
+                    current_user,
+                    match=dyn_match,
+                    tenant_uuid=str(tenant_uuid),
+                    caller_id=str(caller_id),
+                    call_sid=str(call_id) if call_id else None,
+                    input_text=raw_user_text,
+                )
+            except Exception:
+                dyn_payload = None
+
+            if isinstance(dyn_payload, dict):
+                return _wrap_reply(dyn_payload)
 
     fsm = VozliaFSM()
 
