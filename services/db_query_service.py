@@ -1,3 +1,13 @@
+# NOTE (LEGACY / SLATED FOR REMOVAL)
+# ---------------------------------
+# This module was part of the earlier DBQuery/Wizard experimentation.
+# It is kept for backwards compatibility and troubleshooting only.
+# The current direction is to route natural-language intent via an LLM
+# (schema-validated) and execute deterministically via the skill engines.
+#
+# When Intent Router V2 is fully cut over, we should remove or archive this
+# DBQuery v1 path (do NOT delete until an env-var gated rollback exists).
+
 # services/db_query_service.py
 from __future__ import annotations
 
@@ -12,60 +22,6 @@ from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
 from core.logging import logger
-
-# ---------------------------------------------------------------------------
-# Serialization helpers (avoid 500s from non-JSONable SQLAlchemy row/UUID objects)
-# ---------------------------------------------------------------------------
-
-def _jsonable_value(v: Any) -> Any:
-    """Convert common DB values into JSON-safe primitives."""
-    try:
-        from uuid import UUID
-    except Exception:
-        UUID = None  # type: ignore
-
-    if v is None:
-        return None
-    if isinstance(v, datetime):
-        # Prefer seconds precision for readability
-        try:
-            return v.isoformat(timespec="seconds")
-        except Exception:
-            return v.isoformat()
-    if UUID is not None and isinstance(v, UUID):  # type: ignore[arg-type]
-        return str(v)
-    if isinstance(v, (str, int, float, bool)):
-        return v
-    if isinstance(v, bytes):
-        try:
-            return v.decode("utf-8", errors="ignore")
-        except Exception:
-            return str(v)
-    # Fallback: stringify (prevents FastAPI json encoding errors)
-    return str(v)
-
-
-def _row_to_dict(r: Any) -> dict[str, Any]:
-    """Convert SQLAlchemy Row / tuple into a plain dict."""
-    # SQLAlchemy 1.4/2.0 Row objects expose _mapping
-    if hasattr(r, "_mapping"):
-        try:
-            m = getattr(r, "_mapping")
-            out: dict[str, Any] = {}
-            for k, v in m.items():
-                if isinstance(k, str):
-                    key = k
-                else:
-                    key = getattr(k, "key", None) or getattr(k, "name", None) or str(k)
-                out[str(key)] = _jsonable_value(v)
-            return out
-        except Exception:
-            pass
-    # Tuple fallback
-    if isinstance(r, tuple):
-        return {str(i): _jsonable_value(v) for i, v in enumerate(r)}
-    return {"value": _jsonable_value(r)}
-
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +198,7 @@ def _resolve_time_window(tf: DBTimeframe, *, now_utc: datetime) -> tuple[datetim
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
-        try:
-            tz = ZoneInfo("America/New_York")
-        except Exception:
-            tz = timezone.utc
+        tz = ZoneInfo("America/New_York")
 
     # Explicit start/end wins (assume provided in UTC if tzinfo missing)
     if tf.start or tf.end:
@@ -430,10 +383,7 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
                 q2 = q2.filter(getattr(model, ed.created_at_field) >= start)
             if end and ed.created_at_field in allowed_fields:
                 q2 = q2.filter(getattr(model, ed.created_at_field) < end)
-        try:
-            q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields)
-        except Exception as e:
-            return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=str(e))
+        q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields)
 
         if group_cols:
             q2 = q2.group_by(*group_cols)
@@ -458,24 +408,20 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
         raw_rows = q2.all()
         for r in raw_rows:
-            # SQLAlchemy 2.x returns Row objects; 1.x may return tuples.
-            d: dict[str, Any] = {}
-            if hasattr(r, "_mapping"):
-                d = _row_to_dict(r)
-            elif isinstance(r, tuple):
-                # Legacy tuple shape: [group_by..., agg...]
+            # SQLAlchemy returns tuples when selecting columns
+            if isinstance(r, tuple):
+                d: dict[str, Any] = {}
+                # group_by columns first
                 idx = 0
                 for gb in parsed.group_by or []:
-                    if idx < len(r):
-                        d[gb] = _jsonable_value(r[idx])
+                    d[gb] = r[idx]
                     idx += 1
                 for ac in agg_cols:
-                    if idx < len(r):
-                        d[ac.key] = _jsonable_value(r[idx])
+                    d[ac.key] = r[idx]
                     idx += 1
+                rows_out.append(d)
             else:
-                d = _row_to_dict(r)
-            rows_out.append(d)
+                rows_out.append({"value": r})
 
         # If no group_by, collapse to aggregates
         if not group_cols and rows_out:
@@ -510,7 +456,10 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
             d = {}
             for f in clean_fields:
                 v = getattr(row, f, None)
-                d[f] = _jsonable_value(v)
+                if isinstance(v, datetime):
+                    d[f] = v.isoformat(timespec="seconds")
+                else:
+                    d[f] = v
             rows_out.append(d)
 
     # Count: for aggregated queries without rows, use 1; else row length; else full count
