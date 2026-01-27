@@ -1,11 +1,19 @@
+# NOTE (LEGACY / SLATED FOR REMOVAL)
+# ---------------------------------
+# This module was part of the earlier DBQuery/Wizard experimentation.
+# It is kept for backwards compatibility and troubleshooting only.
+# The current direction is to route natural-language intent via an LLM
+# (schema-validated) and execute deterministically via the skill engines.
+#
+# When Intent Router V2 is fully cut over, we should remove or archive this
+# DBQuery v1 path (do NOT delete until an env-var gated rollback exists).
+
 # api/routers/dbquery.py
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-
-from core.logging import logger
 
 from api.deps.admin_key import require_admin_key
 from deps import get_db
@@ -50,17 +58,7 @@ def admin_dbquery_entities():
 @router.post("/run", response_model=DBQueryResult)
 def admin_dbquery_run(payload: DBQueryRunIn, db: Session = Depends(get_db)):
     user = get_or_create_primary_user(db)
-    try:
-        return run_db_query(db, tenant_uuid=str(user.id), spec=payload.spec)
-    except Exception as e:
-        # Never 500 for user-facing analytics; return a safe error envelope.
-        logger.exception("ADMIN_DBQUERY_RUN_FAIL")
-        ent = "unknown"
-        try:
-            ent = str(payload.spec.entity)
-        except Exception:
-            pass
-        return DBQueryResult(ok=False, entity=ent, count=0, rows=[], aggregates=None, spoken_summary=f"DB query failed: {e}")
+    return run_db_query(db, tenant_uuid=str(user.id), spec=payload.spec)
 
 
 @router.get("/skills", response_model=list[DBQuerySkillOut])
