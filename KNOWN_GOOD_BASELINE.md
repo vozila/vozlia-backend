@@ -1,3 +1,236 @@
+Good — if Render is now tracking the **correct branch**, we should lock in a **“known-good baseline”** first (so we don’t reintroduce drift), then we proceed with the **LLM→JSON→FSM intent path** expansion.
+
+## Step 1 — Prove the deployment is on the correct code
+
+Because we previously had “wrong repo / wrong branch” drift, the fastest way to confirm is to hit a few **“newer” endpoints/features** that didn’t exist in the older branch.
+
+Run these from anywhere:
+
+### A) Health (service up)
+
+```bash
+curl -s https://vozlia-backend.onrender.com/health
+```
+
+### B) Admin settings should exist (this fixed your legacy cards config panel)
+
+```bash
+curl -s https://vozlia-backend.onrender.com/admin/settings \
+  -H "x-vozlia-admin-key: $ADMIN_KEY"
+```
+
+If this returns **404**, you’re still not on the correct code.
+
+### C) Dynamic skill sync endpoint should exist
+
+```bash
+curl -s -X POST https://vozlia-backend.onrender.com/admin/dynamic-skills/sync \
+  -H "x-vozlia-admin-key: $ADMIN_KEY"
+```
+
+You should see an `{ "ok": true, ... }` response.
+
+### D) Confirm a dynamic websearch skill routes from natural language
+
+```bash
+curl -s -X POST "https://vozlia-backend.onrender.com/assistant/route" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text":"please give me my sports digest",
+    "context":{"call_id":"debug-call-1","from_number":"+15550001111","channel":"phone"}
+  }'
+```
+
+If B+C+D are good, we can safely treat this as “baseline is back”.
+
+---
+
+## Step 2 — Freeze this as the rollback point (to stop drift)
+
+Now that it’s working again, do this **immediately**:
+
+1. **Create a “stable” branch/tag** in Git (example: `stable-websearch-dynskills-intentv2-working`).
+2. In Render:
+
+   * Ensure auto-deploy follows **that stable branch** (not a moving dev branch), OR keep auto-deploy off and deploy manually only from that branch.
+3. Record the deployed commit SHA in your ops notes (or a “DEPLOYED_SHA.md” in the repo).
+
+This ensures that if we break anything during the new intent work, rollback is instant and unambiguous.
+
+---
+
+## Step 3 — Proceed with the new intent route/execution path (alongside the working system)
+
+Your proposed workflow (“LLM first → structured JSON → FSM routes”) is the correct direction for natural language.
+
+### How this differs from what you *had* (and why it failed before)
+
+* The failing approach relied on:
+
+  * **brittle matching** (regex/substring/keyword heuristics), and/or
+  * **missing dynamic-skill registration** (skills existed in DB, but weren’t callable by the router)
+* That’s why you got:
+
+  * “unknown intent” → KB fallback → chitchat-like behavior
+  * and why “sports digest” wasn’t recognized until dynamic skills were synced into the runtime skills config.
+
+### What we’re building now (LLM-first, but still deterministic)
+
+We keep the reliability rule:
+
+**LLM decides intent → outputs strict JSON → Python validates → FSM executes deterministically.**
+
+And we keep it **side-by-side** with the current working path via env var cutover:
+
+* `INTENT_V2_MODE=off|shadow|assist`
+
+  * `off`: old behavior only (rollback)
+  * `shadow`: LLM produces plans, logs them, but behavior unchanged
+  * `assist`: LLM plan executes if valid; fallback if not
+
+That matches your “build alongside → cutover → rollback by env var” requirement.
+
+---
+
+## Step 4 — The *next* concrete capability to add: category-first routing (your design)
+
+You want:
+
+1. User says: “sports digest”
+2. LLM returns JSON like:
+
+   ```json
+   {
+     "intent": "category_request",
+     "category": "sports",
+     "confidence": 0.82
+   }
+   ```
+3. FSM checks category:
+
+   * If **only one** sports skill → run it
+   * If **multiple** sports skills → present list and let user choose
+4. After execution, user can say: “schedule that daily at 9pm”
+
+   * LLM returns schedule JSON
+   * FSM creates schedule deterministically
+
+This is the scalable way to avoid stuffing the prompt with 200 skills *and* avoid regex.
+
+**Important detail:** category routing requires that skills have lightweight metadata:
+
+* `category` (sports / parking / finance / email / ops / etc.)
+* optional `tags` (nba, nfl, weather, nyc, etc.)
+
+We can do this without UI work by:
+
+* defaulting category to `"general"`
+* optionally auto-classifying category at skill creation time (LLM does it once, offline-ish)
+
+---
+
+## Step 5 — Code drift control (you asked for thoughts)
+
+You’re right: drift is almost guaranteed when:
+
+* multiple repos,
+* multiple interfaces (voice/chat),
+* and context resets.
+
+The fix is not “more memory”, it’s **higher-quality invariants** in-repo.
+
+Your approach (“document the purpose of each file/line touched”) is directionally correct, but doing it **line-by-line** will become unmaintainable.
+
+The sustainable version is:
+
+* **Per-file purpose headers** (hot path? invariants? public interfaces?)
+* **Per-change log** (what changed + why + how to rollback)
+* **A drift control protocol doc** that future chats must follow
+
+You already have this doc now:
+[CODE_DRIFT_CONTROL.md](sandbox:/mnt/data/CODE_DRIFT_CONTROL.md)
+
+From here on, whenever we touch a file, we follow that contract (purpose header + invariants + rollback note). That’s how we prevent future “it worked yesterday but not today” regressions.
+
+---
+
+## What I need from you right now (no code yet)
+
+Before we implement category-first routing, do **one last sanity pass**:
+
+* Confirm `/admin/settings` returns **200** (not 404)
+* Confirm `/admin/dynamic-skills/sync` returns **ok**
+* Confirm `/assistant/route` routes “sports digest” to the websearch skill
+
+If all 3 pass, the next step is:
+
+* **Add category metadata to dynamic skills**
+* **Extend the LLM JSON schema to support `category_request` + `schedule_request`**
+* Keep it behind the same `INTENT_V2_MODE` cutover so rollback is a 1-line env change.
+
+---
+
+# AUTO-SUMMARY PACK
+
+1. **Current Goal**
+   Re-establish stable backend behavior after repo/branch drift, then proceed with the new LLM→JSON→FSM intent routing system (category-based, scalable, no regex dependence), built alongside the working system with env-var rollback.
+
+2. **Refactor Step Completed**
+   No refactor performed in this message (deployment verification + next-step plan only).
+
+3. **What Changed (Code/Config/Infra)**
+
+* User updated Render to follow the correct branch (fixing prior drift).
+* Next actions focus on verification and then extending intent routing.
+
+4. **Known Issues**
+
+* “Wrong repo/branch” drift can silently reintroduce missing endpoints and break routing.
+* Without category metadata, category-first routing can’t disambiguate multiple skills cleanly.
+
+5. **Evidence (≤5 log lines)**
+
+* Prior evidence already showed dynamic skill routing worked once `/admin/dynamic-skills/sync` was available and used.
+
+6. **Tests Performed / To Perform**
+   To perform now (curl smoke tests):
+
+* `GET /admin/settings` returns 200
+* `POST /admin/dynamic-skills/sync` returns ok
+* `POST /assistant/route` routes “sports digest” to the dynamic skill
+
+7. **Next Actions (ordered)**
+
+1) Run the 3 smoke tests above to confirm correct branch is deployed.
+2) Freeze this deployment as a rollback point (stable branch/tag + record SHA).
+3) Implement category metadata for dynamic skills (default + optional auto-classify).
+4) Extend LLM plan schema to include `category_request` + `schedule_request`.
+5) Keep cutover controlled via `INTENT_V2_MODE` (shadow → assist).
+
+8. **Safe Defaults + Rollback Point**
+
+* Safe default: keep `INTENT_V2_MODE=shadow` until category routing is validated.
+* Rollback: set `INTENT_V2_MODE=off` to restore legacy routing immediately; deploy stable branch/tag SHA.
+
+9. **Open Questions**
+
+* Do you want category to be user-editable later (portal), or purely auto-derived for now?
+* Should category apply to legacy skills too (recommended), or only dynamic skills first?
+
+10. **Goal/Wizard Status (goals/wizard state/playbooks/monitors/notifications/anomalies)**
+
+* Wizard/UI deprioritized (troubleshooting only).
+* Focus is now unified backend routing engine usable by both voice and portal chat.
+* Category-first intent routing is the next planned capability.
+
+**Flow A (must preserve)**
+Twilio → FastAPI WS (`/twilio/stream`) → OpenAI Realtime (audio in/out) → Twilio
+Rule: keep heavy planning out of the audio hot path; do intent planning in `/assistant/route` / non-stream paths.
+
+
+
+
+
 Next step is **Phase 2: ingestion + retrieval**, now that Phase 1 (upload/list/download/delete) is proven and the Admin UI is usable (tenant dropdown + collapsible Memory Bank). Your Control Plane logs already show the happy-path traffic working end‑to‑end for upload + download + delete. 
 
 Here’s the **most stable, incremental path** forward.
