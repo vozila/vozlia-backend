@@ -1,3 +1,13 @@
+# NOTE (LEGACY / SLATED FOR REMOVAL)
+# ---------------------------------
+# This module was part of the earlier DBQuery/Wizard experimentation.
+# It is kept for backwards compatibility and troubleshooting only.
+# The current direction is to route natural-language intent via an LLM
+# (schema-validated) and execute deterministically via the skill engines.
+#
+# When Intent Router V2 is fully cut over, we should remove or archive this
+# DBQuery v1 path (do NOT delete until an env-var gated rollback exists).
+
 # api/routers/dbquery.py
 from __future__ import annotations
 
