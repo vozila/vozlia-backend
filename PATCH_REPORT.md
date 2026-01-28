@@ -1,52 +1,50 @@
-Vozlia Backend Patch — Intent V2 Category Routing Fix (v2)
-Date: 2026-01-28
+# Patch: Intent V2 dynamic-skill activation keywords gate
 
-Problem
--------
-With INTENT_V2_MODE=assist, utterances like "sports update" were falling through to generic chitchat
-even though multiple dynamic skills exist under the 'sports' category.
+## Goal
+Prevent ambiguous natural-language mentions (e.g., "sports update") from triggering **dynamic skill disambiguation**
+unless the user explicitly signals they want to run a saved skill/report.
 
-Root cause
-----------
-Intent Router V2 scored/LLM-selected only from skill candidates. For category-like utterances that do
-NOT name a specific skill (and don't match triggers), the LLM plan could legitimately return
-route='chitchat', causing the router to return None and fall back to legacy/KB.
+This applies **only** to dynamic skills:
+- `websearch_*`
+- `dbquery_*`
 
-Fix
----
-1) Include `category` on each candidate in the LLM candidates payload.
-2) Add deterministic category fallback in assist mode:
-   - If the LLM planner fails (plan None) OR explicitly routes to chitchat,
-     and the utterance contains a known category token, the router returns a disambiguation prompt
-     listing the skills in that category.
-   - The available options are stored in session_store under `intent_v2_choices`
-     so the next user turn can pick by number.
+Legacy skills, memory, KB, and general chitchat are unaffected.
 
-Files changed
--------------
-- services/intent_router_v2.py
+## What changed
+1) `services/intent_router_v2.py`
+- Added env-var gate: `INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS`
+- When the gate is set (non-empty), dynamic skill candidates are only considered if:
+  - the utterance contains one of the activation keywords/phrases, OR
+  - the user explicitly referenced a skill (skill-name/trigger substring), OR
+  - the match score is very high (>=90, which corresponds to explicit substring matching)
 
-How to apply
-------------
-- Replace services/intent_router_v2.py with the patched version from this zip.
-- Redeploy backend.
+2) `INTENT_ROUTER_V2.md`
+- Documented the new env var.
 
-Smoke tests
------------
-1) Category disambiguation:
-   curl -s -X POST "https://vozlia-backend.onrender.com/assistant/route" \
-     -H "Content-Type: application/json" \
-     -d '{"text":"sports update","context":{"call_id":"smoke-cat-2","from_number":"+15550001111","channel":"phone"}}' | jq
+## New environment variable
+`INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS`
 
-   Expected: spoken_reply asks "Which sports skill did you mean?" and lists sports skills.
+Examples:
+- `skill,report`
+- `skill,report,digest,summary`
+- `run skill`  (single phrase; if you want multiple phrases, separate with commas)
 
-2) Select option:
-   curl -s -X POST "https://vozlia-backend.onrender.com/assistant/route" \
-     -H "Content-Type: application/json" \
-     -d '{"text":"1","context":{"call_id":"smoke-cat-2","from_number":"+15550001111","channel":"phone"}}' | jq
+If unset/empty → gate disabled (legacy behavior).
 
-   Expected: runs the chosen dynamic sports skill.
+## Recommended rollout
+1) Deploy this patch
+2) Set `INTENT_V2_MODE=assist` (already) + optionally `INTENT_V2_DEBUG=1` temporarily
+3) Set `INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS=skill,report`
+4) Smoke tests (curl):
+   - Should NOT disambiguate/run a dynamic skill:
+     `sports update`
+   - Should disambiguate/run dynamic skills:
+     `sports report`
+     `run sports skill`
+   - Should still run explicit skill name triggers without keywords:
+     `Todays Sports Digest`
+     `alternate side parking`
 
-Rollback
---------
-Set INTENT_V2_MODE=off and redeploy to restore legacy routing.
+Rollback:
+- Set `INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS=` (empty) OR remove it.
+- Or set `INTENT_V2_MODE=off` for full rollback.

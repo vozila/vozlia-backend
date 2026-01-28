@@ -40,6 +40,12 @@ Rollback: set `INTENT_V2_MODE=off`.
   Logs candidate lists and planning outcomes.
 - `INTENT_V2_MAX_CANDIDATES=10`  
   Caps how many skills are sent to the LLM (keeps prompts small).
+- `INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS="skill,report"`  
+  Optional safety gate for **dynamic skills** (`websearch_*` / `dbquery_*`). If set,
+  V2 will only consider *ambiguous / category-style* dynamic routing when the user includes one of
+  these keywords/phrases in their utterance (comma-separated).
+  Explicit skill-name/trigger mentions still work without these keywords. Empty/unset disables the gate.
+
 
 ### OpenAI routing model
 
