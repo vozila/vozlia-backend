@@ -88,6 +88,99 @@ def _tokens(s: str) -> List[str]:
     toks = [w for w in t.split(" ") if w and w not in _STOPWORDS]
     return toks
 
+# ----------------------------
+# Dynamic-skill activation gate
+# ----------------------------
+#
+# Problem:
+# - In natural conversation, people may mention a category word (e.g., "sports") in passing.
+# - If we always allow dynamic skill disambiguation on category words, we can "punt" into saved
+#   skills when the user did not intend to run a saved Skill.
+#
+# Solution:
+# - Optionally require an activation keyword/phrase (e.g., "skill", "report") to engage
+#   *category-style* dynamic routing.
+# - Explicit mentions (skill name / trigger substring) still work even without activation words.
+#
+# Env:
+#   INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS="skill,report"
+#   - Comma-separated list (recommended).
+#   - If you provide a single space-separated string with no commas ("skill report"),
+#     we treat it as a list of single-word keywords.
+#   - Empty/unset disables the gate (legacy behavior).
+#
+# NOTE: This gate applies ONLY to dynamic skills (websearch_* / dbquery_*). It does not affect:
+# - legacy manifest skills (gmail_summary, investment_reporting, ...)
+# - memory / KB / chitchat handling
+#
+def dynamic_skill_activation_keywords() -> List[str]:
+    raw = (os.getenv("INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS") or "").strip()
+    if not raw:
+        return []
+
+    parts: List[str] = []
+    chunks = [c.strip() for c in re.split(r"[,\n]+", raw) if c and c.strip()]
+
+    # If the user provided one chunk with spaces and no commas, treat it as "keywords" list.
+    if len(chunks) == 1 and ("," not in raw) and (" " in chunks[0]):
+        parts = [p.strip() for p in re.split(r"\s+", chunks[0]) if p and p.strip()]
+    else:
+        parts = chunks
+
+    # Deduplicate by normalized form while preserving order.
+    seen: set[str] = set()
+    out: List[str] = []
+    for p in parts:
+        pn = _norm(p)
+        if not pn:
+            continue
+        if pn not in seen:
+            out.append(p)
+            seen.add(pn)
+    return out
+
+
+def utterance_has_activation_keyword(utterance: str) -> bool:
+    kws = dynamic_skill_activation_keywords()
+    if not kws:
+        return True  # gate disabled
+
+    u = _norm(utterance)
+    if not u:
+        return True  # don't block non-utterance flows (e.g., disambiguation cache)
+
+    padded = f" {u} "
+    for kw in kws:
+        kn = _norm(kw)
+        if not kn:
+            continue
+        # "word-ish" / phrase match on normalized strings
+        if f" {kn} " in padded:
+            return True
+    return False
+
+
+def allow_dynamic_skill_candidate(utterance: str, *, score: float, reason: str) -> bool:
+    """Return True if a dynamic skill candidate should be considered for this utterance."""
+    kws = dynamic_skill_activation_keywords()
+    if not kws:
+        return True  # gate disabled
+    if not (utterance or "").strip():
+        return True  # e.g., disambiguation selection build
+    if utterance_has_activation_keyword(utterance):
+        return True
+
+    # Without activation keywords, allow only explicit mentions.
+    # - trigger_substring/label_substring are explicit
+    # - score>=90 typically implies an explicit substring match (see _candidate_score)
+    if score >= 90.0:
+        return True
+    r = (reason or "")
+    if r.startswith("label_substring") or r.startswith("trigger_substring"):
+        return True
+    return False
+
+
 
 @dataclass(frozen=True)
 class SkillCandidate:
@@ -95,7 +188,6 @@ class SkillCandidate:
     label: str
     stype: str  # web_search | db_query | internal
     triggers: List[str]
-    category: str = ""  # user-facing grouping label (e.g., sports, parking, finance)
     enabled: bool = True
     score: float = 0.0
     reason: str = ""
@@ -165,6 +257,9 @@ def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
             triggers.extend([t for t in ep if isinstance(t, str) and t.strip()])
 
         score, reason = _candidate_score(utterance, label, triggers + [label])
+        if not allow_dynamic_skill_candidate(utterance, score=score, reason=reason):
+            continue
+
 
         out.append(
             SkillCandidate(
@@ -172,7 +267,6 @@ def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
                 label=label,
                 stype=stype,
                 triggers=triggers[:5],
-                category=str((scfg.get("category") or "")).strip().lower(),
                 enabled=enabled,
                 score=score,
                 reason=reason,
@@ -280,7 +374,7 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
         "Return STRICT JSON ONLY (no markdown, no extra text). "
         "Rules: "
         "1) If the user is asking to run a specific saved skill, route='run_skill' and set skill_key to an EXACT candidate skill_key. "
-        "2) If the user is asking about a topic or CATEGORY (e.g., 'sports update') and one or more candidates share a relevant label/category, route='disambiguate' and provide choices (skill_key list) in best-first order. "
+        "2) If the user is asking about a topic but multiple candidates match, route='disambiguate' and provide choices (skill_key list) in best-first order. "
         "3) If nothing matches, route='chitchat'. "
         "Never invent skill keys."
     )
@@ -292,7 +386,6 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
             "label": c.label,
             "type": c.stype,
             "triggers": c.triggers[:3],
-            "category": (c.category or ""),
         }
         for c in candidates
     ]
@@ -338,77 +431,12 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
 # Execution glue
 # ----------------------------
 
-def _format_disambiguation_prompt(options: List[SkillCandidate], *, header: str | None = None) -> str:
-    lines = [header or "Which one did you mean?"]
+def _format_disambiguation_prompt(options: List[SkillCandidate]) -> str:
+    lines = ["Which one did you mean?"]
     for i, c in enumerate(options[:6], start=1):
         lines.append(f"{i}. {c.label}")
     lines.append("Reply with the number or the skill name.")
     return "\n".join(lines)
-
-
-
-def _detect_category_from_utterance(utterance: str, candidates: List[SkillCandidate]) -> str | None:
-    """Best-effort category detection.
-
-    Why this exists
-    ---------------
-    Users often speak in natural language like "sports update" without naming a specific skill.
-    We want to avoid brittle regex/phrase matching and still keep routing deterministic and safe.
-
-    Strategy
-    --------
-    - Look for a category token present in the utterance (substring + token match)
-    - Only consider categories that actually exist in the current candidate snapshot
-    - Return the best match, else None
-    """
-    u = _norm(utterance)
-    if not u:
-        return None
-    u_tokens = set(_tokens(utterance))
-
-    cats = []
-    for c in candidates:
-        cat = (c.category or "").strip().lower()
-        if not cat:
-            continue
-        cats.append(cat)
-
-    if not cats:
-        return None
-
-    # De-dupe while preserving order (stable behavior)
-    seen = set()
-    unique_cats = []
-    for cat in cats:
-        if cat in seen:
-            continue
-        seen.add(cat)
-        unique_cats.append(cat)
-
-    best_cat = None
-    best_score = 0.0
-
-    for cat in unique_cats:
-        cat_norm = _norm(cat)
-        if not cat_norm:
-            continue
-
-        # Substring match is the strongest signal ("sports" in "sports update")
-        if cat_norm in u:
-            score = 10.0 + (len(cat_norm) / 10.0)
-        else:
-            # Token overlap (handles "call metrics" vs category "calls")
-            cat_tokens = set([t for t in _tokens(cat_norm) if t])
-            inter = len(cat_tokens.intersection(u_tokens))
-            if inter <= 0:
-                continue
-            score = float(inter)
-
-        if score > best_score:
-            best_score = score
-            best_cat = cat_norm
-
-    return best_cat
 
 
 def maybe_route_and_execute(
@@ -437,6 +465,15 @@ def maybe_route_and_execute(
     candidates = build_skill_candidates(db, user, utterance)
     if not candidates:
         return None
+
+    if intent_v2_debug():
+        kws = dynamic_skill_activation_keywords()
+        if kws:
+            logger.info(
+                "INTENT_V2_DYNAMIC_ACTIVATION has_kw=%s keywords=%s",
+                utterance_has_activation_keyword(utterance),
+                [_norm(k) for k in kws][:8],
+            )
 
     if intent_v2_debug():
         logger.info(
@@ -468,28 +505,7 @@ def maybe_route_and_execute(
     if plan is None:
         if intent_v2_debug():
             logger.info("INTENT_V2_PLAN_NONE mode=%s", mode)
-
-        # If the LLM planner fails (timeout / transient), we can still do a safe,
-        # deterministic category-based disambiguation in ASSIST mode.
-        if mode == "assist":
-            cat = _detect_category_from_utterance(utterance, candidates)
-            if cat:
-                opts = [c for c in candidates if c.enabled and (c.category or "").strip().lower() == cat]
-                if opts:
-                    logger.info("INTENT_V2_CATEGORY_FALLBACK reason=plan_none category=%s n=%s", cat, len(opts))
-                    if call_id:
-                        try:
-                            from services.session_store import session_store
-                            session_store.set(call_id, "intent_v2_choices", [c.skill_key for c in opts[:6]])
-                        except Exception:
-                            pass
-                    return {
-                        "spoken_reply": _format_disambiguation_prompt(opts, header=f"Which {cat} skill did you mean?"), 
-                        "fsm": {"mode": "intent_v2", "intent": "category_disambiguate", "category": cat},
-                        "gmail": None
-                    }
-
-        return None
+        return None if mode != "shadow" else None
 
     # Always log the plan (auditable, helps diagnose drift)
     logger.info(
@@ -540,27 +556,7 @@ def maybe_route_and_execute(
 
         return {"spoken_reply": _format_disambiguation_prompt(opts), "fsm": {"mode": "intent_v2", "intent": "disambiguate"}, "gmail": None}
 
-    # chitchat -> normally let legacy router handle. However, if the caller used a
-    # category-like utterance (e.g., "sports update") and we DO have skills in that
-    # category, disambiguate instead of falling into generic chitchat.
-    if plan.route == "chitchat" and mode == "assist":
-        cat = _detect_category_from_utterance(utterance, candidates)
-        if cat:
-            opts = [c for c in candidates if c.enabled and (c.category or "").strip().lower() == cat]
-            if opts:
-                logger.info("INTENT_V2_CATEGORY_FALLBACK reason=plan_chitchat category=%s n=%s", cat, len(opts))
-                if call_id:
-                    try:
-                        from services.session_store import session_store
-                        session_store.set(call_id, "intent_v2_choices", [c.skill_key for c in opts[:6]])
-                    except Exception:
-                        pass
-                return {
-                    "spoken_reply": _format_disambiguation_prompt(opts, header=f"Which {cat} skill did you mean?"),
-                    "fsm": {"mode": "intent_v2", "intent": "category_disambiguate", "category": cat},
-                    "gmail": None,
-                }
-
+    # chitchat -> let legacy router handle
     return None
 
 
