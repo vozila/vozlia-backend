@@ -1,3 +1,174 @@
+Good — that **category disambiguation path is now working** in `INTENT_V2_MODE=assist`, based on your latest smoke test:
+
+* `sports update` → returns a **disambiguation list** of skills in the **sports** category
+* Replying `1` → executes the selected skill (`Basketball and Football`) successfully
+* This confirms the router is now able to:
+
+  1. detect a **category-ish utterance**,
+  2. enumerate matching skills,
+  3. run a chosen skill without regex-based brittle phrase matching.
+
+Also answering your earlier question directly:
+
+### Does this impact only dynamic skills, or everything?
+
+It impacts **everything that goes through `/assistant/route`**, but **how much it changes behavior depends on `INTENT_V2_MODE`:**
+
+* **`INTENT_V2_MODE=assist` (your current setting)**
+  The LLM router runs and can **assist** routing (like category disambiguation), but it is designed to be **non-destructive**: if it can’t confidently route, the system can still fall back to existing behavior (legacy skill routing / KB fallback / chitchat).
+  ✅ So: it *applies to all*, but only *takes over* for the specific assist paths we’ve enabled (like category disambiguation).
+
+* **`INTENT_V2_MODE=strict`**
+  The LLM router becomes the **primary gate** for *everything*: legacy skills, dynamic skills, memory, chitchat, etc.
+  ✅ So: in strict mode it fully affects everything.
+
+That’s exactly why we’re keeping `assist` as the safe rollout posture until you confirm stability.
+
+---
+
+## Checkpoint for new chat session
+
+Below is the handover checkpoint you requested. Copy/paste this into a new chat session when you’re ready.
+
+Also: here is the drift-control doc you already generated so future sessions can stay aligned:
+[CODE_DRIFT_CONTROL.md](sandbox:/mnt/data/CODE_DRIFT_CONTROL.md)
+
+---
+
+# AUTO-SUMMARY PACK
+
+## 1) Current Goal
+
+* **Intent routing v2** for Vozlia that works for **all skills** (legacy + dynamic), **memory**, and **chitchat**, using:
+
+  * **LLM-first intent interpretation**
+  * **schema-validated structured plan**
+  * deterministic execution / routing
+* We are currently in the **category + disambiguation** phase (pre-DB-dynamic-skills).
+* Next milestone after stability: **DB query–based dynamic skills** built on top of Intent V2.
+
+## 2) Refactor Step Completed
+
+* No large refactor. Incremental safe change: **Intent V2 category routing + disambiguation** added alongside existing router.
+* Dynamic skills now support **category metadata** and can be **disambiguated** by category keyword-like utterances.
+
+## 3) What Changed (Code/Config/Infra)
+
+* **Backend**
+
+  * Added/expanded **Intent V2** plan interpretation to support:
+
+    * category detection → skill candidate list → disambiguation prompt
+    * selection by number or skill name
+  * Added/confirmed **dynamic skill autosync** behavior so dynamic websearch skills appear in `skills_config` and become routable in voice.
+  * Restored/confirmed `/admin/settings` endpoint (needed for system configuration visibility and troubleshooting).
+* **Infra**
+
+  * Critical deployment issue discovered and resolved: **Render was deploying the wrong Git branch/repo**.
+  * Going forward, deployment must pin to the correct branch and ideally a specific SHA for stability.
+
+## 4) Known Issues
+
+* In `assist` mode, the router **may still allow old behavior** for some utterances (by design). Some category phrases may not trigger disambiguation unless the router confidence/capabilities match.
+* Category-only utterances (e.g., “sports update”) now disambiguate correctly *when skills exist in that category* — but categories must be consistently present on dynamic skills.
+* Websearch content variability remains (LLM/web results can change), but routing is now deterministic enough to consistently select the intended skill.
+
+## 5) Evidence (≤5 log lines)
+
+* `INFO:vozlia:LLM_ROUTER_PLAN mode=assist tool=none conf=0.9 intent=sports_update`
+* `POST /assistant/route ... responseTimeMS=2419`
+* `/admin/dynamic-skills/sync -> {"ok":true,"enabled":true,"added":0,"updated":0,"total_dynamic":6,"total_config":12}`
+* `sports update -> intent_v2 disambiguate -> returns 2 sports skills`
+* `reply "1" -> mode=dynamic_skill type=web_search ... intent_v2_reason=disambiguation_number`
+
+## 6) Tests Performed / To Perform
+
+### Performed (confirmed working)
+
+1. `GET /admin/settings` returns settings + `skills_config` with dynamic skills included.
+2. `POST /admin/dynamic-skills/sync` returns ok and counts.
+3. `POST /assistant/route`:
+
+   * “please give me my sports digest” executes the correct websearch dynamic skill.
+   * “sports update” returns category disambiguation list.
+   * replying “1” runs the selected skill.
+
+### To Perform (smoke tests you should run before DB skills)
+
+1. **Legacy skill routing test** (gmail_summary via voice): “email summaries”
+2. **Memory request test**: “what did I say earlier” / “do you remember…”
+3. **Chitchat fallback test**: “tell me a joke” (should not attempt skill execution)
+
+## 7) Next Actions (ordered)
+
+(As you requested — keep this exact ordering)
+
+1. Run the 3 smoke tests above to confirm correct branch is deployed.
+2. Freeze this deployment as a rollback point (stable branch/tag + record SHA).
+3. Implement category metadata for dynamic skills (default + optional auto-classify).
+4. Extend LLM plan schema to include `category_request` + `schedule_request`.
+5. Keep cutover controlled via `INTENT_V2_MODE` (shadow → assist → strict).
+
+Then (after confirmation) move forward with:
+6. Build **DB dynamic skills** leveraging Intent V2 (robust natural language → structured query spec → deterministic DB execution).
+
+## 8) Safe Defaults + Rollback Point
+
+* **Safe default:** keep `INTENT_V2_MODE=assist` until DB skills are stable.
+* **Rollback point:** the current stable build where:
+
+  * dynamic websearch skills are routable in voice
+  * category disambiguation works
+  * `/admin/settings` works
+  * `/admin/dynamic-skills/sync` works
+* Rollback mechanism: flip `INTENT_V2_MODE` back (or redeploy stable SHA if needed).
+
+## 9) Open Questions
+
+* Category management UX:
+
+  * categories editable via portal later (owner-only)
+  * on skill creation: suggest category, allow override/new category
+* Category “mnemonics” / attributes:
+
+  * whether category should remain a simple string now
+  * or become `{slug, label, tags, domain, audience, business_type}` later
+* How we want DB query intent to work:
+
+  * single “DBQuery skill” that can query all tables
+  * vs multiple domain query skills (calls/leads/appointments) for safer scoping
+
+## 10) Goal/Wizard Status (goals/wizard state/playbooks/monitors/notifications/anomalies)
+
+* Wizard UI is de-prioritized as a polished product; portal remains **troubleshooting-only** for now.
+* Skills created in voice must still appear in portal for troubleshooting/deletion.
+* Intent V2 is being built as the shared core for **voice + chat**.
+* DB dynamic skills are next; they must support natural language metrics like:
+
+  * “how many times caller X called last Tuesday”
+  * “who called yesterday”
+  * “what did caller X say around 2pm yesterday”
+* Anomalies not implemented in this phase.
+
+### Flow A (must preserve)
+
+**Flow A (Legacy/Realtime):** Twilio → FastAPI WS (`/twilio/stream`) → OpenAI Realtime (audio in/out) → Twilio
+Rule: **No heavy planning** in the audio hot path; all planning/DB-query interpretation stays out-of-band or behind non-stream endpoints.
+
+---
+
+If you start the new chat session with this checkpoint + the repo zip + the backend env file, we’ll begin immediately with the **DB dynamic skill design** using the Intent V2 plan schema (LLM → validated JSON → deterministic DB executor), while keeping rollback simple via `INTENT_V2_MODE`.
+
+
+
+
+
+
+
+
+
+
+
 Good — if Render is now tracking the **correct branch**, we should lock in a **“known-good baseline”** first (so we don’t reintroduce drift), then we proceed with the **LLM→JSON→FSM intent path** expansion.
 
 ## Step 1 — Prove the deployment is on the correct code
