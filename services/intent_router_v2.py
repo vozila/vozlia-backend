@@ -39,7 +39,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field, ValidationError
 
 from core.logging import logger
-from services.skill_category import infer_category, DEFAULT_CATEGORY
 from services.settings_service import get_skills_config
 
 try:
@@ -95,8 +94,8 @@ class SkillCandidate:
     skill_key: str
     label: str
     stype: str  # web_search | db_query | internal
-    category: str = DEFAULT_CATEGORY
     triggers: List[str]
+    category: str = ""  # user-facing grouping label (e.g., sports, parking, finance)
     enabled: bool = True
     score: float = 0.0
     reason: str = ""
@@ -165,16 +164,6 @@ def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
         if isinstance(ep, list):
             triggers.extend([t for t in ep if isinstance(t, str) and t.strip()])
 
-        # Category is metadata only. If missing, keep DEFAULT_CATEGORY.
-        # If DYNAMIC_SKILLS_AUTOCAT=1, infer_category may classify deterministically from label/query.
-        category = infer_category(
-            label=label,
-            query=str(scfg.get("query") or "") if stype == "web_search" else None,
-            triggers=triggers,
-            stype=stype,
-            existing=str(scfg.get("category") or "") if isinstance(scfg.get("category"), str) else None,
-        )
-
         score, reason = _candidate_score(utterance, label, triggers + [label])
 
         out.append(
@@ -182,8 +171,8 @@ def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
                 skill_key=skill_key,
                 label=label,
                 stype=stype,
-                category=category,
                 triggers=triggers[:5],
+                category=str((scfg.get("category") or "")).strip().lower(),
                 enabled=enabled,
                 score=score,
                 reason=reason,
@@ -206,22 +195,12 @@ def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
             except Exception:
                 triggers = []
 
-            # Stable categories for built-ins; fall back to DEFAULT_CATEGORY.
-            category = infer_category(
-                label=label,
-                query=None,
-                triggers=triggers,
-                stype=sid,
-                existing=None,
-            )
-
             score, reason = _candidate_score(utterance, label, triggers + [label])
             out.append(
                 SkillCandidate(
                     skill_key=sid,
                     label=label,
                     stype="internal",
-                    category=category,
                     triggers=triggers[:5],
                     enabled=True,
                     score=score,
@@ -240,35 +219,14 @@ def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
 # LLM plan schema
 # ----------------------------
 
-class CategoryRequest(BaseModel):
-    # Category requested by the user (e.g., 'sports').
-    # Must match a category string present in candidates when route='category'.
-    category: str = ''
-    rationale: str | None = None
-
-
-class ScheduleRequest(BaseModel):
-    # Optional: the user is asking to schedule a skill. We keep this flexible
-    # and capture 'when' as natural language for later parsing.
-    requested: bool = False
-    when: str | None = None
-    timezone: str | None = None
-
-
 class IntentPlanV2(BaseModel):
     """Strict plan returned by the LLM."""
 
-    route: str = Field(..., description="run_skill|disambiguate|category|chitchat")
+    route: str = Field(..., description="run_skill|disambiguate|chitchat")
     skill_key: Optional[str] = Field(None, description="Chosen skill_key if route=run_skill")
     choices: Optional[List[str]] = Field(None, description="List of skill_keys if route=disambiguate")
     confidence: float = Field(0.0, ge=0.0, le=1.0)
     rationale: Optional[str] = Field(None, description="Short reason; not shown to end user")
-
-    # Optional nested fields. These are included so the LLM can return richer,
-    # future-proof plans WITHOUT us needing programmatic changes every time
-    # we add a routing dimension.
-    category_request: Optional[CategoryRequest] = None
-    schedule_request: Optional[ScheduleRequest] = None
 
 
 _CLIENT: OpenAI | None = None
@@ -322,9 +280,8 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
         "Return STRICT JSON ONLY (no markdown, no extra text). "
         "Rules: "
         "1) If the user is asking to run a specific saved skill, route='run_skill' and set skill_key to an EXACT candidate skill_key. "
-        "2) If the user is asking about a topic but multiple candidates match, route='disambiguate' and provide choices (skill_key list) in best-first order. "
-        "3) If the user asks for a category (e.g., 'sports') and you cannot pick a single skill, route='category' and set category_request.category to an EXACT category from candidates. "
-        "4) If nothing matches, route='chitchat'. "
+        "2) If the user is asking about a topic or CATEGORY (e.g., 'sports update') and one or more candidates share a relevant label/category, route='disambiguate' and provide choices (skill_key list) in best-first order. "
+        "3) If nothing matches, route='chitchat'. "
         "Never invent skill keys."
     )
 
@@ -334,8 +291,8 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
             "skill_key": c.skill_key,
             "label": c.label,
             "type": c.stype,
-            "category": c.category,
             "triggers": c.triggers[:3],
+            "category": (c.category or ""),
         }
         for c in candidates
     ]
@@ -344,13 +301,11 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
         "utterance": (utterance or "")[:800],
         "candidates": cand_payload,
         "output_schema": {
-            "route": "run_skill|disambiguate|category|chitchat",
+            "route": "run_skill|disambiguate|chitchat",
             "skill_key": "string (only if route=run_skill)",
             "choices": "array of skill_key strings (only if route=disambiguate)",
             "confidence": "0.0-1.0",
             "rationale": "short string (optional)",
-            "category_request": "object {category: string, rationale?: string} (only if route=category)",
-            "schedule_request": "object {requested: bool, when?: string, timezone?: string} (optional)",
         },
     }
 
@@ -372,7 +327,7 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
         data = json.loads(js)
         plan = IntentPlanV2.model_validate(data)
         plan.route = (plan.route or "").strip().lower()
-        if plan.route not in ("run_skill", "disambiguate", "category", "chitchat"):
+        if plan.route not in ("run_skill", "disambiguate", "chitchat"):
             return None
         return plan
     except Exception:
@@ -383,26 +338,77 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
 # Execution glue
 # ----------------------------
 
-def _format_disambiguation_prompt(options: List[SkillCandidate]) -> str:
-    # Group choices by category for faster caller comprehension.
-    lines: list[str] = ["Which one did you mean?"]
-    groups: dict[str, list[SkillCandidate]] = {}
-    for c in options[:6]:
-        cat = (c.category or DEFAULT_CATEGORY).strip() or DEFAULT_CATEGORY
-        groups.setdefault(cat, []).append(c)
-
-    # Deterministic ordering: category with most options first, then alpha.
-    ordered_cats = sorted(groups.keys(), key=lambda k: (-len(groups[k]), k))
-    idx = 1
-    for cat in ordered_cats:
-        if cat and cat != DEFAULT_CATEGORY:
-            lines.append(f"{cat.title()}:")
-        for c in groups[cat]:
-            lines.append(f"{idx}. {c.label}")
-            idx += 1
-
+def _format_disambiguation_prompt(options: List[SkillCandidate], *, header: str | None = None) -> str:
+    lines = [header or "Which one did you mean?"]
+    for i, c in enumerate(options[:6], start=1):
+        lines.append(f"{i}. {c.label}")
     lines.append("Reply with the number or the skill name.")
     return "\n".join(lines)
+
+
+
+def _detect_category_from_utterance(utterance: str, candidates: List[SkillCandidate]) -> str | None:
+    """Best-effort category detection.
+
+    Why this exists
+    ---------------
+    Users often speak in natural language like "sports update" without naming a specific skill.
+    We want to avoid brittle regex/phrase matching and still keep routing deterministic and safe.
+
+    Strategy
+    --------
+    - Look for a category token present in the utterance (substring + token match)
+    - Only consider categories that actually exist in the current candidate snapshot
+    - Return the best match, else None
+    """
+    u = _norm(utterance)
+    if not u:
+        return None
+    u_tokens = set(_tokens(utterance))
+
+    cats = []
+    for c in candidates:
+        cat = (c.category or "").strip().lower()
+        if not cat:
+            continue
+        cats.append(cat)
+
+    if not cats:
+        return None
+
+    # De-dupe while preserving order (stable behavior)
+    seen = set()
+    unique_cats = []
+    for cat in cats:
+        if cat in seen:
+            continue
+        seen.add(cat)
+        unique_cats.append(cat)
+
+    best_cat = None
+    best_score = 0.0
+
+    for cat in unique_cats:
+        cat_norm = _norm(cat)
+        if not cat_norm:
+            continue
+
+        # Substring match is the strongest signal ("sports" in "sports update")
+        if cat_norm in u:
+            score = 10.0 + (len(cat_norm) / 10.0)
+        else:
+            # Token overlap (handles "call metrics" vs category "calls")
+            cat_tokens = set([t for t in _tokens(cat_norm) if t])
+            inter = len(cat_tokens.intersection(u_tokens))
+            if inter <= 0:
+                continue
+            score = float(inter)
+
+        if score > best_score:
+            best_score = score
+            best_cat = cat_norm
+
+    return best_cat
 
 
 def maybe_route_and_execute(
@@ -462,7 +468,28 @@ def maybe_route_and_execute(
     if plan is None:
         if intent_v2_debug():
             logger.info("INTENT_V2_PLAN_NONE mode=%s", mode)
-        return None if mode != "shadow" else None
+
+        # If the LLM planner fails (timeout / transient), we can still do a safe,
+        # deterministic category-based disambiguation in ASSIST mode.
+        if mode == "assist":
+            cat = _detect_category_from_utterance(utterance, candidates)
+            if cat:
+                opts = [c for c in candidates if c.enabled and (c.category or "").strip().lower() == cat]
+                if opts:
+                    logger.info("INTENT_V2_CATEGORY_FALLBACK reason=plan_none category=%s n=%s", cat, len(opts))
+                    if call_id:
+                        try:
+                            from services.session_store import session_store
+                            session_store.set(call_id, "intent_v2_choices", [c.skill_key for c in opts[:6]])
+                        except Exception:
+                            pass
+                    return {
+                        "spoken_reply": _format_disambiguation_prompt(opts, header=f"Which {cat} skill did you mean?"), 
+                        "fsm": {"mode": "intent_v2", "intent": "category_disambiguate", "category": cat},
+                        "gmail": None
+                    }
+
+        return None
 
     # Always log the plan (auditable, helps diagnose drift)
     logger.info(
@@ -513,33 +540,27 @@ def maybe_route_and_execute(
 
         return {"spoken_reply": _format_disambiguation_prompt(opts), "fsm": {"mode": "intent_v2", "intent": "disambiguate"}, "gmail": None}
 
-    if plan.route == "category":
-        cat = None
-        try:
-            if plan.category_request and isinstance(plan.category_request.category, str):
-                cat = plan.category_request.category.strip().lower()
-        except Exception:
-            cat = None
-        if not cat:
-            return None
+    # chitchat -> normally let legacy router handle. However, if the caller used a
+    # category-like utterance (e.g., "sports update") and we DO have skills in that
+    # category, disambiguate instead of falling into generic chitchat.
+    if plan.route == "chitchat" and mode == "assist":
+        cat = _detect_category_from_utterance(utterance, candidates)
+        if cat:
+            opts = [c for c in candidates if c.enabled and (c.category or "").strip().lower() == cat]
+            if opts:
+                logger.info("INTENT_V2_CATEGORY_FALLBACK reason=plan_chitchat category=%s n=%s", cat, len(opts))
+                if call_id:
+                    try:
+                        from services.session_store import session_store
+                        session_store.set(call_id, "intent_v2_choices", [c.skill_key for c in opts[:6]])
+                    except Exception:
+                        pass
+                return {
+                    "spoken_reply": _format_disambiguation_prompt(opts, header=f"Which {cat} skill did you mean?"),
+                    "fsm": {"mode": "intent_v2", "intent": "category_disambiguate", "category": cat},
+                    "gmail": None,
+                }
 
-        opts = [c for c in candidates if (c.category or DEFAULT_CATEGORY).lower() == cat and c.enabled]
-        if not opts:
-            # If category is unknown, fall back to scored list.
-            opts = [c for c in candidates if c.enabled][:6]
-        else:
-            opts = opts[:6]
-
-        if call_id:
-            try:
-                from services.session_store import session_store
-                session_store.set(call_id, "intent_v2_choices", [c.skill_key for c in opts[:6]])
-            except Exception:
-                pass
-
-        return {"spoken_reply": _format_disambiguation_prompt(opts), "fsm": {"mode": "intent_v2", "intent": "category"}, "gmail": None}
-
-    # chitchat -> let legacy router handle
     return None
 
 
