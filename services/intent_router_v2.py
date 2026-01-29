@@ -40,8 +40,6 @@ from pydantic import BaseModel, Field, ValidationError
 
 from core.logging import logger
 from services.settings_service import get_skills_config
-from models import DeliveryChannel
-from services.web_search_skill_store import upsert_daily_schedule
 
 try:
     # openai>=1.x (used elsewhere in this repo)
@@ -90,6 +88,99 @@ def _tokens(s: str) -> List[str]:
     toks = [w for w in t.split(" ") if w and w not in _STOPWORDS]
     return toks
 
+# ----------------------------
+# Dynamic-skill activation gate
+# ----------------------------
+#
+# Problem:
+# - In natural conversation, people may mention a category word (e.g., "sports") in passing.
+# - If we always allow dynamic skill disambiguation on category words, we can "punt" into saved
+#   skills when the user did not intend to run a saved Skill.
+#
+# Solution:
+# - Optionally require an activation keyword/phrase (e.g., "skill", "report") to engage
+#   *category-style* dynamic routing.
+# - Explicit mentions (skill name / trigger substring) still work even without activation words.
+#
+# Env:
+#   INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS="skill,report"
+#   - Comma-separated list (recommended).
+#   - If you provide a single space-separated string with no commas ("skill report"),
+#     we treat it as a list of single-word keywords.
+#   - Empty/unset disables the gate (legacy behavior).
+#
+# NOTE: This gate applies ONLY to dynamic skills (websearch_* / dbquery_*). It does not affect:
+# - legacy manifest skills (gmail_summary, investment_reporting, ...)
+# - memory / KB / chitchat handling
+#
+def dynamic_skill_activation_keywords() -> List[str]:
+    raw = (os.getenv("INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS") or "").strip()
+    if not raw:
+        return []
+
+    parts: List[str] = []
+    chunks = [c.strip() for c in re.split(r"[,\n]+", raw) if c and c.strip()]
+
+    # If the user provided one chunk with spaces and no commas, treat it as "keywords" list.
+    if len(chunks) == 1 and ("," not in raw) and (" " in chunks[0]):
+        parts = [p.strip() for p in re.split(r"\s+", chunks[0]) if p and p.strip()]
+    else:
+        parts = chunks
+
+    # Deduplicate by normalized form while preserving order.
+    seen: set[str] = set()
+    out: List[str] = []
+    for p in parts:
+        pn = _norm(p)
+        if not pn:
+            continue
+        if pn not in seen:
+            out.append(p)
+            seen.add(pn)
+    return out
+
+
+def utterance_has_activation_keyword(utterance: str) -> bool:
+    kws = dynamic_skill_activation_keywords()
+    if not kws:
+        return True  # gate disabled
+
+    u = _norm(utterance)
+    if not u:
+        return True  # don't block non-utterance flows (e.g., disambiguation cache)
+
+    padded = f" {u} "
+    for kw in kws:
+        kn = _norm(kw)
+        if not kn:
+            continue
+        # "word-ish" / phrase match on normalized strings
+        if f" {kn} " in padded:
+            return True
+    return False
+
+
+def allow_dynamic_skill_candidate(utterance: str, *, score: float, reason: str) -> bool:
+    """Return True if a dynamic skill candidate should be considered for this utterance."""
+    kws = dynamic_skill_activation_keywords()
+    if not kws:
+        return True  # gate disabled
+    if not (utterance or "").strip():
+        return True  # e.g., disambiguation selection build
+    if utterance_has_activation_keyword(utterance):
+        return True
+
+    # Without activation keywords, allow only explicit mentions.
+    # - trigger_substring/label_substring are explicit
+    # - score>=90 typically implies an explicit substring match (see _candidate_score)
+    if score >= 90.0:
+        return True
+    r = (reason or "")
+    if r.startswith("label_substring") or r.startswith("trigger_substring"):
+        return True
+    return False
+
+
 
 @dataclass(frozen=True)
 class SkillCandidate:
@@ -97,7 +188,6 @@ class SkillCandidate:
     label: str
     stype: str  # web_search | db_query | internal
     triggers: List[str]
-    category: str = ""  # user-facing grouping label (e.g., sports, parking, finance)
     enabled: bool = True
     score: float = 0.0
     reason: str = ""
@@ -167,6 +257,9 @@ def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
             triggers.extend([t for t in ep if isinstance(t, str) and t.strip()])
 
         score, reason = _candidate_score(utterance, label, triggers + [label])
+        if not allow_dynamic_skill_candidate(utterance, score=score, reason=reason):
+            continue
+
 
         out.append(
             SkillCandidate(
@@ -174,7 +267,6 @@ def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
                 label=label,
                 stype=stype,
                 triggers=triggers[:5],
-                category=str((scfg.get("category") or "")).strip().lower(),
                 enabled=enabled,
                 score=score,
                 reason=reason,
@@ -221,29 +313,12 @@ def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
 # LLM plan schema
 # ----------------------------
 
-
-class ScheduleRequest(BaseModel):
-    """Structured schedule request extracted from a natural-language utterance.
-
-    NOTE: We keep this intentionally small (daily schedules only for MVP).
-    Extend later with weekly/monthly cron-like support behind feature flags.
-    """
-
-    cadence: Literal["daily"] = "daily"
-    hour: int = Field(..., ge=0, le=23)
-    minute: int = Field(..., ge=0, le=59)
-    timezone: str = Field(..., min_length=1)
-    # Delivery channel for scheduled results (MVP: email or sms).
-    channel: str = Field(..., min_length=1)
-    destination: str = Field(..., min_length=1)
-
 class IntentPlanV2(BaseModel):
     """Strict plan returned by the LLM."""
 
-    route: str = Field(..., description="run_skill|schedule_skill|disambiguate|chitchat")
-    skill_key: Optional[str] = Field(None, description="Chosen skill_key if route=run_skill|schedule_skill")
+    route: str = Field(..., description="run_skill|disambiguate|chitchat")
+    skill_key: Optional[str] = Field(None, description="Chosen skill_key if route=run_skill")
     choices: Optional[List[str]] = Field(None, description="List of skill_keys if route=disambiguate")
-    schedule_request: Optional[ScheduleRequest] = Field(None, description="If scheduling: cadence/time/channel/destination")
     confidence: float = Field(0.0, ge=0.0, le=1.0)
     rationale: Optional[str] = Field(None, description="Short reason; not shown to end user")
 
@@ -281,527 +356,284 @@ def _extract_json_object(text: str) -> str | None:
     return None
 
 
-def llm_plan_intent(candidates: List[SkillCandidate], utterance: str, context: Dict[str, Any]) -> IntentPlanV2:
-    """Ask the LLM to pick an intent route and (optionally) a skill.
+def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> IntentPlanV2 | None:
+    """Use the LLM to pick an intent plan from a small candidate list."""
+    client = _get_client()
+    if client is None:
+        return None
 
-    IMPORTANT:
-    - This returns a structured plan ONLY (schema-validated JSON).
-    - Python executes deterministically (run skill / schedule / disambiguation).
-    """
-    tz = (context or {}).get("timezone") or "America/New_York"
+    model = (os.getenv("OPENAI_INTENT_MODEL") or "").strip() or "gpt-4o-mini"
+    timeout_s = float((os.getenv("OPENAI_INTENT_TIMEOUT_S", "4.0") or "4.0").strip())
+    max_tokens = int((os.getenv("OPENAI_INTENT_MAX_TOKENS", "220") or "220").strip())
 
-    system = f"""You are Vozlia's intent planner.
-
-Your job: decide whether the user wants to (a) run a skill now, (b) schedule a skill,
-(c) disambiguate among multiple skills, or (d) just chat.
-
-Return JSON that matches this schema exactly:
-{IntentPlanV2.as_json_schema()}
-
-Routes:
-- run_skill: user is asking to execute ONE specific skill right now.
-- schedule_skill: user is asking to create/update a schedule for a skill (DO NOT run it).
-- disambiguate: multiple plausible skills; provide ordered choices (skill_keys).
-- chitchat: no tool/skill should run.
-
-SCHEDULING RULES (MVP):
-- We only support DAILY schedules right now.
-- If the user asks to schedule/recurring/deliver "every day"/"daily", choose route=schedule_skill
-  (or route=disambiguate if multiple skills match) and include schedule_request:
-  {
-    "cadence": "daily",
-    "hour": <0-23>,
-    "minute": <0-59>,
-    "timezone": "<IANA timezone>",
-    "channel": "email"|"sms",
-    "destination": "<email address or phone number>"
-  }
-- If timezone is not specified, default to {tz}.
-- If the user says "this report" / "this skill", and context implies a recent skill, still schedule it.
-
-CATEGORY RULE:
-- If the user is asking for a category (e.g., "sports" / "weather" / "finance") and there are
-  multiple skills in that category, choose route=disambiguate with those choices.
-
-CONFIDENCE:
-- confidence must be 0.0–1.0.
-- If you're not confident, choose chitchat.
-"""
-
-    user = json.dumps(
-        {
-            "utterance": utterance,
-            "candidates": [c.model_dump() for c in candidates],
-        },
-        ensure_ascii=False,
+    # Keep prompt short for voice latency.
+    system = (
+        "You are Vozlia's intent router. "
+        "The user speaks in natural language and does NOT use standardized phrases. "
+        "Choose the BEST route using ONLY the provided candidates list. "
+        "Return STRICT JSON ONLY (no markdown, no extra text). "
+        "Rules: "
+        "1) If the user is asking to run a specific saved skill, route='run_skill' and set skill_key to an EXACT candidate skill_key. "
+        "2) If the user is asking about a topic but multiple candidates match, route='disambiguate' and provide choices (skill_key list) in best-first order. "
+        "3) If nothing matches, route='chitchat'. "
+        "Never invent skill keys."
     )
-    return openai_chat_json(IntentPlanV2, system, user)
-def _detect_category_from_utterance(utterance: str, candidates: List[SkillCandidate]) -> str | None:
-    """Best-effort category detection.
 
-    Why this exists
-    ---------------
-    Users often speak in natural language like "sports update" without naming a specific skill.
-    We want to avoid brittle regex/phrase matching and still keep routing deterministic and safe.
+    # Compress candidates to keep token footprint small.
+    cand_payload = [
+        {
+            "skill_key": c.skill_key,
+            "label": c.label,
+            "type": c.stype,
+            "triggers": c.triggers[:3],
+        }
+        for c in candidates
+    ]
 
-    Strategy
-    --------
-    - Look for a category token present in the utterance (substring + token match)
-    - Only consider categories that actually exist in the current candidate snapshot
-    - Return the best match, else None
-    """
-    u = _norm(utterance)
-    if not u:
-        return None
-    u_tokens = set(_tokens(utterance))
-
-    cats = []
-    for c in candidates:
-        cat = (c.category or "").strip().lower()
-        if not cat:
-            continue
-        cats.append(cat)
-
-    if not cats:
-        return None
-
-    # De-dupe while preserving order (stable behavior)
-    seen = set()
-    unique_cats = []
-    for cat in cats:
-        if cat in seen:
-            continue
-        seen.add(cat)
-        unique_cats.append(cat)
-
-    best_cat = None
-    best_score = 0.0
-
-    for cat in unique_cats:
-        cat_norm = _norm(cat)
-        if not cat_norm:
-            continue
-
-        # Substring match is the strongest signal ("sports" in "sports update")
-        if cat_norm in u:
-            score = 10.0 + (len(cat_norm) / 10.0)
-        else:
-            # Token overlap (handles "call metrics" vs category "calls")
-            cat_tokens = set([t for t in _tokens(cat_norm) if t])
-            inter = len(cat_tokens.intersection(u_tokens))
-            if inter <= 0:
-                continue
-            score = float(inter)
-
-        if score > best_score:
-            best_score = score
-            best_cat = cat_norm
-
-    return best_cat
-
-
-
-def _dynamic_activation_keywords() -> List[str]:
-    """Comma-separated keywords required to activate *dynamic* skills from fuzzy/category intent.
-
-    Purpose:
-    - Prevent accidental tool execution when the user mentions a topic in passing (e.g. "sports").
-
-    Env:
-    - DYNAMIC_SKILL_ACTIVATION_KEYWORDS="skill,report,digest"
-
-    Behavior:
-    - If empty/unset → no gating (legacy behavior).
-    """
-    raw = os.getenv("DYNAMIC_SKILL_ACTIVATION_KEYWORDS", "").strip()
-    if not raw:
-        return []
-    return [k.strip().lower() for k in raw.split(",") if k.strip()]
-
-
-def _dynamic_activation_keywords_ok(utterance: str) -> bool:
-    kws = _dynamic_activation_keywords()
-    if not kws:
-        return True
-    u = utterance.lower()
-    return any(k in u for k in kws)
-
-
-def _utterance_matches_any_phrase(utterance: str, phrases: List[str]) -> bool:
-    u = utterance.lower()
-    for p in phrases or []:
-        p = (p or "").strip().lower()
-        if not p:
-            continue
-        if p in u:
-            return True
-    return False
-
-
-def _dynamic_activation_ok_for_candidate(utterance: str, cand: SkillCandidate) -> bool:
-    """Allow dynamic skill routing if either:
-    - user explicitly used a configured activation keyword, OR
-    - utterance directly matches a known trigger phrase for the candidate.
-    """
-    # Direct trigger phrase match should always win (it is already user-provided disambiguation).
-    if _utterance_matches_any_phrase(utterance, cand.trigger_phrases):
-        return True
-    # Otherwise require activation keywords if configured.
-    return _dynamic_activation_keywords_ok(utterance)
-
-
-def _is_schedule_like_utterance(utterance: str) -> bool:
-    u = utterance.lower()
-    return any(k in u for k in ["schedule", "every day", "everyday", "daily", "recurring", "deliver every"])
-
-
-def _parse_schedule_from_utterance(utterance: str, default_timezone: str) -> Optional[ScheduleRequest]:
-    """Best-effort deterministic schedule extraction (fallback when LLM doesn't emit schedule_request)."""
-    u = utterance.lower()
-    if not _is_schedule_like_utterance(utterance):
-        return None
-
-    # Cadence (MVP: daily only).
-    if "daily" in u or "every day" in u or "everyday" in u:
-        cadence = "daily"
-    else:
-        # Not supported yet (weekly/monthly).
-        return None
-
-    # Timezone: first IANA-looking token, else default.
-    tz_match = re.search(r"\b([A-Za-z]+\/[A-Za-z_]+)\b", utterance)
-    tz = tz_match.group(1) if tz_match else default_timezone
-
-    # Time: look for "at 3:33 AM" or "at 15:33".
-    tm = re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", utterance, flags=re.IGNORECASE)
-    if not tm:
-        return None
-    hour = int(tm.group(1))
-    minute = int(tm.group(2) or "0")
-    ampm = (tm.group(3) or "").lower()
-    if ampm:
-        if hour == 12:
-            hour = 0
-        if ampm == "pm":
-            hour = (hour + 12) % 24
-    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-        return None
-
-    # Channel + destination.
-    channel = "email" if "email" in u else ("sms" if ("sms" in u or "text" in u) else "")
-    if not channel:
-        return None
-    dest = ""
-    if channel == "email":
-        em = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", utterance)
-        if em:
-            dest = em.group(1)
-    elif channel == "sms":
-        ph = re.search(r"(\+?\d{10,15})", utterance)
-        if ph:
-            dest = ph.group(1)
-    if not dest:
-        return None
+    user_obj = {
+        "utterance": (utterance or "")[:800],
+        "candidates": cand_payload,
+        "output_schema": {
+            "route": "run_skill|disambiguate|chitchat",
+            "skill_key": "string (only if route=run_skill)",
+            "choices": "array of skill_key strings (only if route=disambiguate)",
+            "confidence": "0.0-1.0",
+            "rationale": "short string (optional)",
+        },
+    }
 
     try:
-        return ScheduleRequest(cadence=cadence, hour=hour, minute=minute, timezone=tz, channel=channel, destination=dest)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user_obj)},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.0,
+            timeout=timeout_s,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        js = _extract_json_object(raw)
+        if not js:
+            return None
+        data = json.loads(js)
+        plan = IntentPlanV2.model_validate(data)
+        plan.route = (plan.route or "").strip().lower()
+        if plan.route not in ("run_skill", "disambiguate", "chitchat"):
+            return None
+        return plan
     except Exception:
         return None
 
+
+# ----------------------------
+# Execution glue
+# ----------------------------
+
+def _format_disambiguation_prompt(options: List[SkillCandidate]) -> str:
+    lines = ["Which one did you mean?"]
+    for i, c in enumerate(options[:6], start=1):
+        lines.append(f"{i}. {c.label}")
+    lines.append("Reply with the number or the skill name.")
+    return "\n".join(lines)
+
+
 def maybe_route_and_execute(
-    db: Session,
+    *,
+    utterance: str,
+    db,
     user,
     tenant_uuid: str | None,
     caller_id: str | None,
-    utterance: str,
-    context: Dict[str, Any],
-    mode: str,
+    call_id: str | None,
+    account_id: str | None = None,
+    context: dict | None = None,
 ) -> dict | None:
-    """Intent V2: LLM plans (schema-validated), Python executes.
+    """If INTENT_V2_MODE is enabled, attempt skill routing and execution.
 
-    mode:
-      - shadow: plan only (no execution / no schedule writes).
-      - assist: execute intent_v2 if confident; else fallback to legacy.
-      - strict: always use intent_v2 (not implemented here; handled upstream).
+    Returns an /assistant/route payload dict if handled, else None (caller should fall back to legacy).
     """
-    call_id = (context or {}).get("call_id")
+    if not intent_v2_enabled():
+        return None
 
-    # 1) If we are waiting on a disambiguation selection, consume it first.
-    if call_id:
-        consumed = maybe_consume_disambiguation_choice(
+    mode = intent_v2_mode()
+    if not (utterance or "").strip():
+        return None
+
+    # Candidate generation is deterministic + cheap.
+    candidates = build_skill_candidates(db, user, utterance)
+    if not candidates:
+        return None
+
+    if intent_v2_debug():
+        kws = dynamic_skill_activation_keywords()
+        if kws:
+            logger.info(
+                "INTENT_V2_DYNAMIC_ACTIVATION has_kw=%s keywords=%s",
+                utterance_has_activation_keyword(utterance),
+                [_norm(k) for k in kws][:8],
+            )
+
+    if intent_v2_debug():
+        logger.info(
+            "INTENT_V2_CANDIDATES mode=%s n=%s top=%s",
+            mode,
+            len(candidates),
+            [(c.skill_key, round(c.score, 1), c.reason) for c in candidates[:5]],
+        )
+
+    # If best deterministic match is extremely strong, we can avoid LLM for speed.
+    best = candidates[0]
+    fast_path = best.score >= 120.0 and best.enabled
+    if fast_path:
+        logger.info("INTENT_V2_FASTPATH skill_key=%s score=%.1f reason=%s", best.skill_key, best.score, best.reason)
+        return _execute_candidate(
+            best,
+            utterance=utterance,
             db=db,
             user=user,
             tenant_uuid=tenant_uuid,
             caller_id=caller_id,
             call_id=call_id,
-            utterance=utterance,
+            account_id=account_id,
             context=context,
+            reason="fastpath",
         )
-        if consumed is not None:
-            return consumed
 
-    # 2) Build candidates from skills_config (legacy + dynamic).
-    skills_cfg = get_skills_config(db, user)
-    candidates = _build_candidates(skills_cfg)
-    if not candidates:
-        return None
-
-    # 3) Deterministic fast-path (exact trigger/name match).
-    best, score = _best_match_candidate(utterance, candidates)
-    if score >= 0.92 and best.enabled:
-        # Optional safety gate for dynamic skills: allow if trigger matched OR activation keyword.
-        if best.skill_key.startswith(("websearch_", "dbquery_")) and not _dynamic_activation_ok_for_candidate(utterance, best):
-            logger.info("INTENT_V2_FASTPATH_BLOCKED skill=%s", best.skill_key)
-        else:
-            logger.info("INTENT_V2_FASTPATH skill=%s score=%.2f", best.skill_key, score)
-            return _execute_candidate(db, user, best, tenant_uuid, caller_id, call_id)
-
-    # 4) Ask LLM for a plan (schema-validated).
-    plan: IntentPlanV2 | None = None
-    if mode != "off":
-        try:
-            plan = llm_plan_intent(candidates=candidates, utterance=utterance, context=context or {})
-        except Exception:
-            plan = None
-
-    # Shadow mode: never execute / schedule. (We still let legacy routing handle it.)
-    if mode == "shadow":
-        return None
-
-    # 5) If the utterance is schedule-like, treat scheduling as higher priority than running.
-    schedule_like = _is_schedule_like_utterance(utterance)
-    default_tz = (context or {}).get("timezone") or "America/New_York"
-    schedule_req: ScheduleRequest | None = None
-    if schedule_like:
-        if plan and plan.schedule_request:
-            schedule_req = plan.schedule_request
-        else:
-            schedule_req = _parse_schedule_from_utterance(utterance, default_timezone=default_tz)
-
-    # 5a) Scheduling path (only if we can extract schedule details).
-    if schedule_like and schedule_req is not None:
-        # Candidate selection preference:
-        # 1) LLM-selected skill_key (even if the LLM mistakenly set route=run_skill).
-        # 2) Last executed skill in this call ("schedule this report").
-        target_skill_key = (plan.skill_key if plan else None)
-        if not target_skill_key and call_id:
-            target_skill_key = session_store.get(call_id, "intent_v2_last_skill_key")
-
-        if target_skill_key:
-            chosen = next((c for c in candidates if c.skill_key == target_skill_key and c.enabled), None)
-            if chosen is not None:
-                logger.info("INTENT_V2_SCHEDULE skill=%s", chosen.skill_key)
-                out = _schedule_candidate(db, user, chosen, schedule_req, tenant_uuid, caller_id, call_id)
-                if out is not None:
-                    return out
-
-        # If we couldn't select a single skill, disambiguate among category matches.
-        cat = _detect_category_from_utterance(utterance, candidates)
-        opts = [c for c in candidates if c.enabled and (cat and c.category == cat)]
-        if opts:
-            if not _dynamic_activation_keywords_ok(utterance):
-                # User mentioned the topic but didn't explicitly ask for a report/skill (configurable gate).
-                return None
-            session_store.set(call_id, "intent_v2_choices", [c.model_dump() for c in opts])
-            session_store.set(call_id, "intent_v2_pending_action", "schedule_skill")
-            session_store.set(call_id, "intent_v2_pending_schedule", schedule_req.model_dump())
-            return {
-                "spoken_reply": _format_disambiguation_prompt(opts),
-                "fsm": {"mode": "intent_v2", "intent": "disambiguate"},
-                "gmail": None,
-            }
-
-        return {
-            "spoken_reply": "Which skill should I schedule? You can say: schedule skill <name> daily at <time> <timezone> and deliver by email to <address>.",
-            "fsm": {"mode": "intent_v2", "intent": "schedule_needs_skill"},
-            "gmail": None,
-        }
-
-    # 5b) If user asked to schedule but we couldn't parse schedule details, ask for specifics.
-    if schedule_like and schedule_req is None:
-        return {
-            "spoken_reply": "Sure — what time should I run it daily, which timezone, and where should I deliver it (email or SMS)?",
-            "fsm": {"mode": "intent_v2", "intent": "schedule_needs_details"},
-            "gmail": None,
-        }
-
-    # 6) No plan (LLM failed): optional category fallback in assist mode, gated by activation keywords.
+    plan = llm_plan_intent(utterance, candidates=candidates)
     if plan is None:
-        if mode == "assist" and call_id and _dynamic_activation_keywords_ok(utterance):
-            cat = _detect_category_from_utterance(utterance, candidates)
-            if cat:
-                opts = [c for c in candidates if c.enabled and c.category == cat]
-                if len(opts) == 1:
-                    return _execute_candidate(db, user, opts[0], tenant_uuid, caller_id, call_id)
-                if len(opts) > 1:
-                    session_store.set(call_id, "intent_v2_choices", [c.model_dump() for c in opts])
-                    session_store.set(call_id, "intent_v2_pending_action", "run_skill")
-                    return {
-                        "spoken_reply": _format_disambiguation_prompt(opts),
-                        "fsm": {"mode": "intent_v2", "intent": "disambiguate"},
-                        "gmail": None,
-                    }
+        if intent_v2_debug():
+            logger.info("INTENT_V2_PLAN_NONE mode=%s", mode)
+        return None if mode != "shadow" else None
+
+    # Always log the plan (auditable, helps diagnose drift)
+    logger.info(
+        "INTENT_V2_PLAN mode=%s route=%s skill_key=%s conf=%.2f",
+        mode,
+        plan.route,
+        plan.skill_key,
+        float(plan.confidence or 0.0),
+    )
+
+    if mode == "shadow":
+        # Shadow: do NOT change behavior.
         return None
 
-    # 7) Execute plan routes.
-    if plan.route == "chitchat":
+    # Assist mode: execute valid plans
+    if plan.route == "run_skill" and plan.skill_key:
+        sk = plan.skill_key.strip()
+        chosen = next((c for c in candidates if c.skill_key == sk), None)
+        if chosen and chosen.enabled:
+            return _execute_candidate(
+                chosen,
+                utterance=utterance,
+                db=db,
+                user=user,
+                tenant_uuid=tenant_uuid,
+                caller_id=caller_id,
+                call_id=call_id,
+                account_id=account_id,
+                context=context,
+                reason="llm",
+            )
         return None
-
-    if plan.route == "run_skill":
-        if not plan.skill_key:
-            return None
-        chosen = next((c for c in candidates if c.skill_key == plan.skill_key and c.enabled), None)
-        if not chosen:
-            return None
-        if chosen.skill_key.startswith(("websearch_", "dbquery_")) and not _dynamic_activation_ok_for_candidate(utterance, chosen):
-            return None
-        return _execute_candidate(db, user, chosen, tenant_uuid, caller_id, call_id)
 
     if plan.route == "disambiguate":
-        if not call_id:
-            return None
-        if not _dynamic_activation_keywords_ok(utterance):
-            # Topic mentioned without explicit activation keyword; avoid unintended tool prompts.
-            return None
+        # Offer top-N as choices (either from plan.choices or from scored list)
         keys = [k for k in (plan.choices or []) if isinstance(k, str)]
-        opts = [next((c for c in candidates if c.skill_key == k), None) for k in keys]
-        opts = [c for c in opts if c and c.enabled]
+        opts = [c for c in candidates if c.skill_key in keys] if keys else candidates[:6]
         if not opts:
-            return None
-        session_store.set(call_id, "intent_v2_choices", [c.model_dump() for c in opts])
-        session_store.set(call_id, "intent_v2_pending_action", "run_skill")
-        return {
-            "spoken_reply": _format_disambiguation_prompt(opts),
-            "fsm": {"mode": "intent_v2", "intent": "disambiguate"},
-            "gmail": None,
-        }
+            opts = candidates[:6]
 
-    if plan.route == "schedule_skill":
-        # Even if the LLM chose schedule_skill, we still need schedule_request; otherwise ask for details.
-        if schedule_req is None:
-            return {
-                "spoken_reply": "Sure — what time should I run it daily, which timezone, and where should I deliver it (email or SMS)?",
-                "fsm": {"mode": "intent_v2", "intent": "schedule_needs_details"},
-                "gmail": None,
-            }
-        if not plan.skill_key and call_id:
-            plan.skill_key = session_store.get(call_id, "intent_v2_last_skill_key")
-        if not plan.skill_key:
-            return {
-                "spoken_reply": "Which skill should I schedule?",
-                "fsm": {"mode": "intent_v2", "intent": "schedule_needs_skill"},
-                "gmail": None,
-            }
-        chosen = next((c for c in candidates if c.skill_key == plan.skill_key and c.enabled), None)
-        if not chosen:
-            return None
-        out = _schedule_candidate(db, user, chosen, schedule_req, tenant_uuid, caller_id, call_id)
-        if out is not None:
-            return out
-        return None
+        # Store into session for next turn selection (best-effort)
+        if call_id:
+            try:
+                from services.session_store import session_store
+                session_store.set(call_id, "intent_v2_choices", [c.skill_key for c in opts[:6]])
+            except Exception:
+                pass
 
+        return {"spoken_reply": _format_disambiguation_prompt(opts), "fsm": {"mode": "intent_v2", "intent": "disambiguate"}, "gmail": None}
+
+    # chitchat -> let legacy router handle
     return None
+
+
 def maybe_consume_disambiguation_choice(
-    db: Session,
+    *,
+    utterance: str,
+    db,
     user,
     tenant_uuid: str | None,
     caller_id: str | None,
-    call_id: str,
-    utterance: str,
-    context: Dict[str, Any],
+    call_id: str | None,
+    account_id: str | None = None,
+    context: dict | None = None,
 ) -> dict | None:
-    """If the previous turn asked the user to pick a skill (1/2/3...), consume the choice.
-
-    This supports both:
-    - running the selected skill, OR
-    - scheduling the selected skill (when a schedule request caused disambiguation).
-    """
-    stored = session_store.pop(call_id, "intent_v2_choices")
-    if not stored:
+    """If the previous turn asked for disambiguation, try to consume the user's selection."""
+    if not (call_id and utterance and utterance.strip()):
+        return None
+    try:
+        from services.session_store import session_store
+        keys = session_store.pop(call_id, "intent_v2_choices", None)
+    except Exception:
+        keys = None
+    if not keys or not isinstance(keys, list):
         return None
 
-    pending_action = session_store.pop(call_id, "intent_v2_pending_action") or "run_skill"
-    pending_schedule = session_store.pop(call_id, "intent_v2_pending_schedule")
-    schedule_req: ScheduleRequest | None = None
-    if pending_schedule:
+    # Numeric selection: "1", "option 2", etc.
+    m = re.search(r"\b(\d{1,2})\b", utterance.strip())
+    if m:
         try:
-            schedule_req = ScheduleRequest.model_validate(pending_schedule)
+            idx = int(m.group(1)) - 1
         except Exception:
-            schedule_req = None
+            idx = -1
+        if 0 <= idx < len(keys):
+            chosen_key = str(keys[idx])
+            # Build a fresh candidate snapshot so we have labels/config
+            candidates = build_skill_candidates(db, user, utterance="")
+            chosen = next((c for c in candidates if c.skill_key == chosen_key), None)
+            if chosen:
+                return _execute_candidate(
+                    chosen,
+                    utterance=utterance,
+                    db=db,
+                    user=user,
+                    tenant_uuid=tenant_uuid,
+                    caller_id=caller_id,
+                    call_id=call_id,
+                    account_id=account_id,
+                    context=context,
+                    reason="disambiguation_number",
+                )
 
-    try:
-        candidates = [SkillCandidate.model_validate(x) for x in stored]
-    except Exception:
-        return None
+    # Name-based fallback: run LLM with only those choices
+    candidates_all = build_skill_candidates(db, user, utterance=utterance)
+    candidates = [c for c in candidates_all if c.skill_key in set([str(k) for k in keys])]
+    if not candidates:
+        return {"spoken_reply": "Sorry — please reply with a number from the list.", "fsm": {"mode": "intent_v2", "intent": "disambiguate_retry"}, "gmail": None}
 
-    u = utterance.strip()
-
-    def _restore_and_prompt() -> dict:
-        session_store.set(call_id, "intent_v2_choices", [c.model_dump() for c in candidates])
-        session_store.set(call_id, "intent_v2_pending_action", pending_action)
-        if schedule_req:
-            session_store.set(call_id, "intent_v2_pending_schedule", schedule_req.model_dump())
-        return {
-            "spoken_reply": _format_disambiguation_prompt(candidates),
-            "fsm": {"mode": "intent_v2", "intent": "disambiguate"},
-            "gmail": None,
-        }
-
-    # Numeric choice ("1", "2", ...).
-    if u.isdigit():
-        idx = int(u) - 1
-        if idx < 0 or idx >= len(candidates):
-            return _restore_and_prompt()
-        chosen = candidates[idx]
-        if pending_action == "schedule_skill":
-            if not schedule_req:
-                return {
-                    "spoken_reply": "Okay — what time should I run it daily, which timezone, and where should I deliver it (email or SMS)?",
-                    "fsm": {"mode": "intent_v2", "intent": "schedule_needs_details"},
-                    "gmail": None,
-                }
-            out = _schedule_candidate(db, user, chosen, schedule_req, tenant_uuid, caller_id, call_id)
-            return out or _restore_and_prompt()
-        return _execute_candidate(db, user, chosen, tenant_uuid, caller_id, call_id)
-
-    # Non-numeric: try to match by skill label substring.
-    u_can = _canonicalize(u)
-    label_matches = [c for c in candidates if u_can and (u_can in _canonicalize(c.label) or _canonicalize(c.label) in u_can)]
-    if len(label_matches) == 1:
-        chosen = label_matches[0]
-        if pending_action == "schedule_skill":
-            if not schedule_req:
-                return {
-                    "spoken_reply": "Okay — what time should I run it daily, which timezone, and where should I deliver it (email or SMS)?",
-                    "fsm": {"mode": "intent_v2", "intent": "schedule_needs_details"},
-                    "gmail": None,
-                }
-            out = _schedule_candidate(db, user, chosen, schedule_req, tenant_uuid, caller_id, call_id)
-            return out or _restore_and_prompt()
-        return _execute_candidate(db, user, chosen, tenant_uuid, caller_id, call_id)
-
-    # Last resort: ask the LLM to map this utterance to one of the candidate skill_keys.
-    try:
-        plan = llm_plan_intent(candidates=candidates, utterance=utterance, context=context or {})
-    except Exception:
-        return _restore_and_prompt()
-
-    target_key = plan.skill_key if plan else None
-    if target_key:
-        chosen = next((c for c in candidates if c.skill_key == target_key), None)
+    plan = llm_plan_intent(utterance, candidates=candidates)
+    if plan and plan.route == "run_skill" and plan.skill_key:
+        chosen = next((c for c in candidates if c.skill_key == plan.skill_key), None)
         if chosen:
-            if pending_action == "schedule_skill":
-                if not schedule_req:
-                    return {
-                        "spoken_reply": "Okay — what time should I run it daily, which timezone, and where should I deliver it (email or SMS)?",
-                        "fsm": {"mode": "intent_v2", "intent": "schedule_needs_details"},
-                        "gmail": None,
-                    }
-                out = _schedule_candidate(db, user, chosen, schedule_req, tenant_uuid, caller_id, call_id)
-                return out or _restore_and_prompt()
-            return _execute_candidate(db, user, chosen, tenant_uuid, caller_id, call_id)
+            return _execute_candidate(
+                chosen,
+                utterance=utterance,
+                db=db,
+                user=user,
+                tenant_uuid=tenant_uuid,
+                caller_id=caller_id,
+                call_id=call_id,
+                account_id=account_id,
+                context=context,
+                reason="disambiguation_llm",
+            )
 
-    return _restore_and_prompt()
+    return {"spoken_reply": "Sorry — please reply with a number from the list.", "fsm": {"mode": "intent_v2", "intent": "disambiguate_retry"}, "gmail": None}
+
+
 def _execute_candidate(
     cand: SkillCandidate,
     *,
@@ -847,9 +679,6 @@ def _execute_candidate(
                 if isinstance(payload.get("fsm"), dict):
                     payload["fsm"]["intent_v2"] = True
                     payload["fsm"]["intent_v2_reason"] = reason
-                # Remember last skill for this call (used for follow-ups like "schedule this report").
-                if call_id:
-                    session_store.set(call_id, "intent_v2_last_skill_key", cand.skill_key)
                 return payload
         except Exception:
             return None
@@ -868,94 +697,6 @@ def _execute_candidate(
         spoken = (out or {}).get("spoken_reply") or (out or {}).get("spoken") or ""
         if not spoken:
             spoken = f"Okay — running {cand.label}."
-        if call_id:
-            session_store.set(call_id, "intent_v2_last_skill_key", cand.skill_key)
         return {"spoken_reply": spoken, "fsm": {"mode": "intent_v2", "skill_id": cand.skill_key, "type": "internal", "intent_v2_reason": reason}, "gmail": out.get("gmail") if isinstance(out, dict) else None}
     except Exception:
         return None
-
-def _to_delivery_channel(channel: str) -> DeliveryChannel | None:
-    c = (channel or "").strip().lower()
-    if c in ("email", "e-mail"):
-        return DeliveryChannel.email
-    if c in ("sms", "text"):
-        return DeliveryChannel.sms
-    if c in ("whatsapp", "wa"):
-        return DeliveryChannel.whatsapp
-    if c in ("call", "phone"):
-        return DeliveryChannel.call
-    return None
-
-
-def _schedule_candidate(
-    db: Session,
-    user,
-    cand: SkillCandidate,
-    sched: ScheduleRequest,
-    tenant_uuid: str | None,
-    caller_id: str | None,
-    call_id: str | None,
-) -> dict | None:
-    """Create/update a daily schedule for a dynamic *websearch* skill."""
-    if not cand.skill_key.startswith("websearch_"):
-        return {
-            "spoken_reply": "Scheduling is only supported for WebSearch skills right now.",
-            "fsm": {"mode": "intent_v2", "intent": "schedule_unsupported", "skill_id": cand.skill_key},
-            "gmail": None,
-        }
-
-    # Convert skill_key -> raw uuid for the schedule table.
-    raw_skill_id = cand.skill_key.split("websearch_", 1)[1] if "websearch_" in cand.skill_key else ""
-    if not raw_skill_id:
-        return None
-
-    channel = _to_delivery_channel(sched.channel)
-    if channel is None:
-        return {
-            "spoken_reply": "I can only deliver scheduled results by email or SMS right now.",
-            "fsm": {"mode": "intent_v2", "intent": "schedule_invalid_channel"},
-            "gmail": None,
-        }
-
-    if sched.cadence != "daily":
-        return {
-            "spoken_reply": "I can only schedule daily runs right now.",
-            "fsm": {"mode": "intent_v2", "intent": "schedule_invalid_cadence"},
-            "gmail": None,
-        }
-
-    try:
-        row = upsert_daily_schedule(
-            db=db,
-            current_user=user,
-            skill_id=raw_skill_id,
-            hour=int(sched.hour),
-            minute=int(sched.minute),
-            timezone=sched.timezone,
-            channel=channel,
-            destination=sched.destination,
-            enabled=True,
-        )
-    except Exception:
-        return None
-
-    # Remember last skill to support "schedule this report" follow-ups.
-    if call_id:
-        session_store.set(call_id, "intent_v2_last_skill_key", cand.skill_key)
-
-    time_of_day = f"{int(sched.hour):02d}:{int(sched.minute):02d}"
-    spoken = (
-        f"Okay — scheduled {cand.label} daily at {time_of_day} {sched.timezone} "
-        f"and will deliver by {sched.channel} to {sched.destination}."
-    )
-    return {
-        "spoken_reply": spoken,
-        "fsm": {
-            "mode": "intent_v2",
-            "intent": "schedule_created",
-            "skill_id": cand.skill_key,
-            "schedule_id": getattr(row, "id", None),
-            "next_run_at": getattr(row, "next_run_at", None),
-        },
-        "gmail": None,
-    }
