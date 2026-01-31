@@ -1,48 +1,16 @@
 # services/intent_router_v2.py
-"""Intent Router V2 (LLM-assisted, schema-validated).
-
-Purpose
--------
-Provide a flexible, natural-language first-stage router so callers do NOT need
-standardized phrases. The LLM interprets user intent and returns a STRICT JSON plan.
-Python then executes deterministically (no hallucinated actions).
-
-Key behaviors (Vozlia-specific)
--------------------------------
-1) Exact skill name → execute that skill once
-   e.g., "give me a Sports Digest"
-
-2) Skill name + keyword (e.g. "report") → either:
-   - execute once, or
-   - create/modify schedule when the utterance clearly expresses a schedule
-   e.g., "give me my Sports Digest report at 9 AM EST every day"
-
-3) Similar-meaning name + keyword → execute or modify schedule
-   e.g., "give me my sports summary report at 10AM every day instead"
-   or   "give me my sports summary report" (no schedule change)
-
-LLM owns the intent:
-- route ∈ {"run_skill","schedule_skill","disambiguate","chitchat"}
-- schedule details provided via schedule_request JSON
-Python only:
-- validates the plan via Pydantic
-- ensures skill_key is one of the candidates
-- executes skill or creates/updates schedules
-
-Feature flags
--------------
-INTENT_V2_MODE
-  - off (default): V2 disabled
-  - shadow: log plans, no behavior change
-  - assist: execute when confident; otherwise fallback
-INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS
-  - keyword gate for dynamic skills (websearch_*/dbquery_*)
-INTENT_V2_SCHEDULE_ENABLED
-  - gate for schedule_request execution
-
-Rollback:
-  - set INTENT_V2_MODE=off and/or INTENT_V2_SCHEDULE_ENABLED=0
+"""VOZLIA FILE PURPOSE
+Purpose: LLM-first intent routing + (optional) scheduling. Produces strict JSON plans; Python executes deterministically.
+Hot path: no (called from /assistant/route, not the realtime WS loop).
+Public interfaces: maybe_route_and_execute, maybe_consume_disambiguation_choice.
+Reads/Writes: user_settings (skills_config), scheduled_deliveries (via stores), session_store.
+Feature flags: INTENT_V2_MODE, INTENT_V2_SCHEDULE_ENABLED, DBQUERY_SCHEDULE_ENABLED.
+Failure mode: falls back to legacy routing; scheduling failures return safe errors.
+Last touched: 2026-01-31 (extend scheduling to dbquery dynamic skills behind flag)
 """
+
+# (legacy module docs removed to keep __future__ import valid)
+
 
 from __future__ import annotations
 
@@ -60,6 +28,7 @@ from models import DeliveryChannel
 from services.session_store import session_store
 from services.settings_service import get_skills_config
 from services.web_search_skill_store import upsert_daily_schedule
+from services.db_query_skill_store import upsert_daily_schedule_dbquery
 
 try:
     from openai import OpenAI
@@ -89,6 +58,12 @@ def intent_v2_debug() -> bool:
 
 def intent_v2_schedule_enabled() -> bool:
     v = (os.getenv("INTENT_V2_SCHEDULE_ENABLED") or "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def dbquery_schedule_enabled() -> bool:
+    """Enable scheduling for dbquery_* dynamic skills (opt-in, default OFF)."""
+    v = (os.getenv("DBQUERY_SCHEDULE_ENABLED") or "0").strip().lower()
     return v in ("1", "true", "yes", "on")
 
 
@@ -623,15 +598,36 @@ def _schedule_candidate(
     caller_id: str | None,
     call_id: str | None,
 ) -> dict | None:
-    """Create/update a daily schedule for a dynamic *websearch* skill."""
-    if not cand.skill_key.startswith("websearch_"):
+    """Create/update a daily schedule for a dynamic skill (websearch_* or dbquery_*).
+
+    Behavior:
+      - websearch_* schedules are always supported when INTENT_V2_SCHEDULE_ENABLED is on.
+      - dbquery_* schedules are additionally gated by DBQUERY_SCHEDULE_ENABLED (default OFF).
+      - Upsert semantics: if a schedule exists for this (tenant, skill), it is updated (time/channel/destination).
+    """
+    skill_key = (cand.skill_key or "").strip()
+    kind: str | None = None
+    raw_skill_id = ""
+
+    if skill_key.startswith("websearch_"):
+        kind = "websearch"
+        raw_skill_id = skill_key.split("websearch_", 1)[1] if "websearch_" in skill_key else ""
+    elif skill_key.startswith("dbquery_"):
+        if not dbquery_schedule_enabled():
+            return {
+                "spoken_reply": "Scheduling is not enabled for database metrics yet.",
+                "fsm": {"mode": "intent_v2", "intent": "schedule_unsupported", "skill_id": skill_key},
+                "gmail": None,
+            }
+        kind = "dbquery"
+        raw_skill_id = skill_key.split("dbquery_", 1)[1] if "dbquery_" in skill_key else ""
+    else:
         return {
-            "spoken_reply": "Scheduling is only supported for WebSearch skills right now.",
-            "fsm": {"mode": "intent_v2", "intent": "schedule_unsupported", "skill_id": cand.skill_key},
+            "spoken_reply": "Scheduling is only supported for saved WebSearch reports and DB metrics right now.",
+            "fsm": {"mode": "intent_v2", "intent": "schedule_unsupported", "skill_id": skill_key},
             "gmail": None,
         }
 
-    raw_skill_id = cand.skill_key.split("websearch_", 1)[1] if "websearch_" in cand.skill_key else ""
     if not raw_skill_id:
         return None
 
@@ -651,18 +647,30 @@ def _schedule_candidate(
         }
 
     try:
-        row = upsert_daily_schedule(
-            db,
-            user,
-            web_search_skill_id=raw_skill_id,
-            hour=int(sched.hour),
-            minute=int(sched.minute),
-            timezone=sched.timezone,
-            channel=channel,
-            destination=sched.destination,
-        )
+        if kind == "websearch":
+            upsert_daily_schedule(
+                db,
+                user,
+                web_search_skill_id=raw_skill_id,
+                hour=int(sched.hour),
+                minute=int(sched.minute),
+                timezone=sched.timezone,
+                channel=channel,
+                destination=sched.destination,
+            )
+        else:
+            upsert_daily_schedule_dbquery(
+                db,
+                user,
+                db_query_skill_id=raw_skill_id,
+                hour=int(sched.hour),
+                minute=int(sched.minute),
+                timezone=sched.timezone,
+                channel=channel,
+                destination=sched.destination,
+            )
     except Exception:
-        logger.exception("INTENT_V2_SCHEDULE_UPSERT_FAIL skill_key=%s", cand.skill_key)
+        logger.exception("INTENT_V2_SCHEDULE_UPSERT_FAIL skill_key=%s", skill_key)
         return {
             "spoken_reply": "Sorry — I couldn't save that schedule yet.",
             "fsm": {"mode": "intent_v2", "intent": "schedule_error"},
@@ -670,7 +678,7 @@ def _schedule_candidate(
         }
 
     if call_id:
-        session_store.set(call_id, "intent_v2_last_skill_key", cand.skill_key)
+        session_store.set(call_id, "intent_v2_last_skill_key", skill_key)
 
     time_of_day = f"{int(sched.hour):02d}:{int(sched.minute):02d}"
     spoken = (
@@ -682,7 +690,7 @@ def _schedule_candidate(
         "fsm": {
             "mode": "intent_v2",
             "intent": "schedule_created",
-            "skill_id": cand.skill_key,
+            "skill_id": skill_key,
             "schedule_time_of_day": time_of_day,
             "schedule_timezone": sched.timezone,
         },

@@ -1,3 +1,13 @@
+"""VOZLIA FILE PURPOSE
+Purpose: CRUD + dynamic registration for WebSearch skills and their scheduled deliveries.
+Hot path: no
+Public interfaces: create_web_search_skill, delete_web_search_skill, upsert_daily_schedule, list_schedules.
+Reads/Writes: web_search_skills, scheduled_deliveries, user_settings (skills_config, skills_priority_order).
+Feature flags: n/a (called by routers and intent_v2 when enabled).
+Failure mode: raises on invalid skill IDs; scheduling failures return handled errors upstream.
+Last touched: 2026-01-31 (backfill scheduled_deliveries.skill_key for websearch schedules)
+"""
+
 # services/web_search_skill_store.py
 from __future__ import annotations
 
@@ -268,6 +278,7 @@ def list_schedules(db: Session, user: User) -> List[ScheduledDelivery]:
     return (
         db.query(ScheduledDelivery)
         .filter(ScheduledDelivery.tenant_id == user.id)
+        .filter(ScheduledDelivery.web_search_skill_id != None)  # noqa: E711
         .order_by(ScheduledDelivery.created_at.asc())
         .all()
     )
@@ -342,6 +353,12 @@ def upsert_daily_schedule(
             next_run_at=next_run_at,
         )
         db.add(row)
+
+    # Always maintain the polymorphic key for back-compat + future multi-skill scheduling.
+    try:
+        row.skill_key = f"websearch_{skill.id}"
+    except Exception:
+        pass
 
     db.commit()
     db.refresh(row)
