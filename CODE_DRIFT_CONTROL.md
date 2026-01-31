@@ -178,6 +178,43 @@ Add entries like:
   - Flags: `INTENT_V2_MODE`, `INTENT_V2_DEBUG`, `OPENAI_INTENT_MODEL`, `OPENAI_INTENT_TIMEOUT_S`, `OPENAI_INTENT_MAX_TOKENS`
   - Last touched: 2026-01-27 (category-aware candidates + plan schema extension)
 
+
+- `backend/models.py`
+  - Purpose: ORM models including ScheduledDelivery polymorphic skill_key for scheduling.
+  - Invariants: tenant_id always scopes queries; ScheduledDelivery may reference websearch via FK or any dynamic skill via skill_key.
+  - Flags: n/a
+  - Last touched: 2026-01-31 (added scheduled_deliveries.skill_key for dbquery scheduling)
+
+- `backend/services/web_search_skill_store.py`
+  - Purpose: WebSearch skill CRUD + schedule upsert (daily).
+  - Invariants: upsert is idempotent per (tenant, web_search_skill_id); sets ScheduledDelivery.skill_key for back-compat.
+  - Flags: n/a
+  - Last touched: 2026-01-31 (set skill_key + filter list_schedules to websearch only)
+
+- `backend/services/db_query_skill_store.py`
+  - Purpose: DBQuery skill CRUD + schedule upsert (daily) for dbquery_* dynamic skills.
+  - Invariants: upsert is idempotent per (tenant, skill_key=dbquery_<id>); never runs without tenant scoping.
+  - Flags: DBQUERY_SCHEDULE_ENABLED
+  - Last touched: 2026-01-31 (added upsert_daily_schedule_dbquery + list_dbquery_schedules)
+
+- `backend/services/intent_router_v2.py`
+  - Purpose: LLM-first routing and schedule creation/updates via strict JSON plans.
+  - Invariants: Python validates plan; scheduling is gated by flags; no heavy work in voice WS hot path.
+  - Flags: INTENT_V2_MODE, INTENT_V2_SCHEDULE_ENABLED, DBQUERY_SCHEDULE_ENABLED
+  - Last touched: 2026-01-31 (enable scheduling for dbquery_* behind flag)
+
+- `backend/api/routers/dbquery.py`
+  - Purpose: Admin DBQuery skill CRUD + DBQuery schedules list/upsert.
+  - Invariants: admin-key protected; schedules only write scheduled_deliveries rows; no free-form SQL execution.
+  - Flags: DBQUERY_SCHEDULE_ENABLED
+  - Last touched: 2026-01-31 (added /admin/dbquery/schedules endpoints)
+
+- `backend/workers/scheduled_deliveries_worker.py`
+  - Purpose: Executes scheduled_deliveries and sends notifications.
+  - Invariants: never executes unknown skill types; dbquery_* execution gated behind DBQUERY_SCHEDULE_ENABLED.
+  - Flags: DBQUERY_SCHEDULE_ENABLED
+  - Last touched: 2026-01-31 (execute dbquery_* schedules)
+
 (Keep this list short and useful; do not document every line—document intent + invariants.)
 
 ---

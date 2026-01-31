@@ -1,3 +1,13 @@
+"""VOZLIA FILE PURPOSE
+Purpose: SQLAlchemy models for Vozlia backend (Postgres schema).
+Hot path: no
+Public interfaces: ORM model classes imported across services/workers.
+Reads/Writes: Postgres tables (users, skills, schedules, memory, etc.).
+Feature flags: n/a
+Failure mode: schema mismatches raise DB errors at runtime.
+Last touched: 2026-01-31 (add skill_key to scheduled_deliveries for dbquery scheduling compatibility)
+"""
+
 # models.py
 from datetime import datetime
 from uuid import uuid4
@@ -329,7 +339,10 @@ class ScheduledDelivery(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
 
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    web_search_skill_id = Column(UUID(as_uuid=True), ForeignKey("web_search_skills.id", ondelete="CASCADE"), nullable=False, index=True)
+    web_search_skill_id = Column(UUID(as_uuid=True), ForeignKey("web_search_skills.id", ondelete="CASCADE"), nullable=True, index=True)
+    # Polymorphic dynamic skill key (e.g., "websearch_<uuid>", "dbquery_<uuid>").
+    # Back-compat: web_search_skill_id remains populated for websearch schedules.
+    skill_key = Column(String, nullable=True, index=True)
 
     enabled = Column(Boolean, nullable=False, default=True)
     cadence = Column(SAEnum(DeliveryCadence), nullable=False, default=DeliveryCadence.daily)
@@ -350,5 +363,6 @@ class ScheduledDelivery(Base):
 
     __table_args__ = (
         Index("ix_scheduled_deliveries_tenant_next", "tenant_id", "next_run_at"),
-        Index("ix_scheduled_deliveries_skill", "web_search_skill_id"),
+        Index("ix_scheduled_deliveries_skill_key", "skill_key"),
+        Index("ix_scheduled_deliveries_websearch_skill", "web_search_skill_id"),
     )
