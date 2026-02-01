@@ -258,3 +258,66 @@ Keep analytics events separate, and optionally derived.
 ---
 
 **End of document.**
+
+
+- `backend/services/delivery_destination.py`
+  - Purpose: Normalize/resolve schedule delivery destinations (email/phone) and prevent placeholder values.
+  - Invariants: never persists destination='email'; defaults email destination to primary user email when missing/placeholder; does not guess phone numbers.
+  - Flags: n/a
+  - Last touched: 2026-02-01 (new helper module)
+
+- `backend/services/web_search_skill_store.py`
+  - Purpose: WebSearch skill CRUD + schedule upsert (daily).
+  - Invariants: upsert is idempotent per (tenant, web_search_skill_id); sets ScheduledDelivery.skill_key for back-compat; destination is normalized before persisting.
+  - Flags: n/a
+  - Last touched: 2026-02-01 (normalize destination to avoid placeholder)
+
+- `backend/services/db_query_skill_store.py`
+  - Purpose: DBQuery skill CRUD + schedule upsert (daily) for dbquery_* dynamic skills.
+  - Invariants: upsert is idempotent per (tenant, skill_key=dbquery_<id>); destination is normalized before persisting.
+  - Flags: DBQUERY_SCHEDULE_ENABLED
+  - Last touched: 2026-02-01 (normalize destination to avoid placeholder)
+
+- `backend/services/intent_router_v2.py`
+  - Purpose: LLM-assisted intent router (natural language → strict plan → deterministic execution) with optional scheduling.
+  - Invariants: schedule destinations are normalized before upsert; placeholder destination values never persisted; minimal clarification if phone destination missing.
+  - Flags: INTENT_V2_MODE, INTENT_V2_SCHEDULE_ENABLED, DBQUERY_SCHEDULE_ENABLED
+  - Last touched: 2026-02-01 (destination normalization + missing destination disambiguation)
+
+- `backend/services/db_query_service.py`
+  - Purpose: Deterministic, tenant-scoped DBQuery executor for dbquery_* dynamic skills and schedules.
+  - Invariants: no raw tuple/Row objects in summaries; single-element containers scalarized for readability.
+  - Flags: DB_QUERY_MAX_SPOKEN_CHARS
+  - Last touched: 2026-02-01 (flatten aggregate output, avoid '(0,)' formatting)
+
+
+- `backend/migrations/2026_02_01_concept_codes`
+  - Purpose: Add Concept Code tables (definitions/assignments/batches) for deterministic analytics tagging.
+  - Invariants: additive; tenant_id scoped; safe to re-run.
+  - Flags: `CONCEPTS_ENABLED` (controls usage; tables can exist regardless)
+  - Last touched: 2026-02-01 (new)
+
+- `backend/services/concepts_store.py`
+  - Purpose: Tenant-scoped CRUD helpers for concept_definitions / concept_assignments / concept_batches.
+  - Invariants: manual override rule: locked/manual rows block llm_auto overwrites.
+  - Flags: `CONCEPTS_ENABLED`
+  - Last touched: 2026-02-01 (new)
+
+- `backend/api/routers/concepts.py`
+  - Purpose: Admin endpoints for Concept Codes (definitions/assignments/batches).
+  - Invariants: returns 404 when concepts disabled; strict tenant scoping; admin-key gated.
+  - Flags: `CONCEPTS_ENABLED`
+  - Last touched: 2026-02-01 (new)
+
+- `backend/models.py`
+  - Purpose: ORM models including Concept Codes tables.
+  - Invariants: all concept tables are tenant-scoped; source is stored as text for migration simplicity.
+  - Flags: n/a
+  - Last touched: 2026-02-01 (add Concept Code ORM models)
+
+- `backend/main.py`
+  - Purpose: FastAPI bootstrap + route registration only.
+  - Invariants: no heavy logic; routers gate features internally.
+  - Flags: n/a
+  - Last touched: 2026-02-01 (include admin concepts router)
+

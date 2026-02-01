@@ -1,3 +1,13 @@
+"""VOZLIA FILE PURPOSE
+Purpose: FastAPI app bootstrap + route registration only.
+Hot path: no
+Public interfaces: create_app(), app
+Reads/Writes: none directly (routers/services handle IO).
+Feature flags: n/a (routers may gate internally).
+Failure mode: startup errors prevent serving.
+Last touched: 2026-02-01 (add admin concepts router behind CONCEPTS_ENABLED)
+"""
+
 # main.py
 from fastapi import FastAPI
 
@@ -15,6 +25,7 @@ from api.routers.kb import router as kb_router
 from api.routers.notify import router as notify_router
 from api.routers.websearch import router as websearch_router
 from api.routers.dbquery import router as dbquery_router
+from api.routers.concepts import router as concepts_router
 
 # Admin troubleshooting routes
 from api.routers.admin_settings import router as admin_settings_router
@@ -43,6 +54,7 @@ def create_app() -> FastAPI:
     app.include_router(notify_router)
     app.include_router(websearch_router)
     app.include_router(dbquery_router)
+    app.include_router(concepts_router)
 
     # Admin settings + troubleshooting
     app.include_router(admin_settings_router)

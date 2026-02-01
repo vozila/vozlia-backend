@@ -5,7 +5,7 @@ Public interfaces: ORM model classes imported across services/workers.
 Reads/Writes: Postgres tables (users, skills, schedules, memory, etc.).
 Feature flags: n/a
 Failure mode: schema mismatches raise DB errors at runtime.
-Last touched: 2026-01-31 (add skill_key to scheduled_deliveries for dbquery scheduling compatibility)
+Last touched: 2026-02-01 (add Concept Code ORM models for deterministic analytics)
 """
 
 # models.py
@@ -366,3 +366,87 @@ class ScheduledDelivery(Base):
         Index("ix_scheduled_deliveries_skill_key", "skill_key"),
         Index("ix_scheduled_deliveries_websearch_skill", "web_search_skill_id"),
     )
+
+
+# =========================
+# Concept Codes (semantic tagging for deterministic analytics)
+# =========================
+
+class ConceptDefinition(Base):
+    __tablename__ = "concept_definitions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Stable identifier (unique per tenant): e.g. "menu.steak", "lead.intent.purchase_inquiry"
+    concept_code = Column(String, nullable=False)
+
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    parent_code = Column(String, nullable=True)
+
+    synonyms_json = Column(JSONB, nullable=False, default=list)
+    active = Column(Boolean, nullable=False, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "concept_code", name="uq_concept_definitions_tenant_code"),
+        Index("ix_concept_definitions_tenant_code", "tenant_id", "concept_code"),
+    )
+
+
+class ConceptBatch(Base):
+    __tablename__ = "concept_batches"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    model_version = Column(String, nullable=True)
+    summary_json = Column(JSONB, nullable=False, default=dict)
+    notified_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_concept_batches_tenant_created", "tenant_id", "created_at"),
+    )
+
+
+class ConceptAssignment(Base):
+    __tablename__ = "concept_assignments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Polymorphic target link (store target_id as text for maximum compatibility)
+    target_type = Column(String, nullable=False)
+    target_id = Column(String, nullable=False)
+
+    concept_code = Column(String, nullable=False)
+
+    source = Column(String, nullable=False, default="llm_auto")
+    confidence = Column(Float, nullable=True)
+    rationale = Column(Text, nullable=True)
+    evidence_json = Column(JSONB, nullable=True)
+
+    # Manual overrides should lock the assignment so future LLM batches don't overwrite.
+    locked = Column(Boolean, nullable=False, default=False)
+
+    batch_id = Column(UUID(as_uuid=True), ForeignKey("concept_batches.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "target_type", "target_id", "concept_code", name="uq_concept_assignments_tenant_target_concept"),
+        Index("ix_concept_assignments_tenant_code", "tenant_id", "concept_code"),
+        Index("ix_concept_assignments_tenant_target", "tenant_id", "target_type", "target_id"),
+        Index("ix_concept_assignments_tenant_batch", "tenant_id", "batch_id"),
+    )
+
+
