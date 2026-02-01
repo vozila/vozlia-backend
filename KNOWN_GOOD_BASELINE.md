@@ -1,3 +1,418 @@
+### Next step toward “agentic communication” (Goal → Steps → FSM executes)
+
+The next practical milestone is to formalize a **multi-step “Goal Plan” contract** that the LLM can emit and the FSM can execute deterministically, where each step is:
+
+* **ensure_skill** (reuse if it already exists; otherwise create)
+* **run_skill** (execute an existing dynamic skill)
+* **schedule_skill** (optional, if the user includes time/cadence)
+
+…and *all steps* use the same dynamic runtime abstraction you now have for:
+
+* `websearch_<uuid>`
+* `dbquery_<uuid>`
+
+So the owner can speak only in high-level goals (“Send me my daily callers report”, “Track steak dinner sales”, “Alert me if calls spike”), the LLM chooses steps and emits strict JSON, and the FSM handles creation/reuse/execution/scheduling deterministically with tenant isolation.
+
+---
+
+## ⚠️ File note (important for the next chat)
+
+Some earlier uploads in this session can expire. In the next chat, **re-upload the repo zip(s) + key docs/env files** (list below) so the new session can open code and give exact replacement-file bundles without guessing.
+
+---
+
+# CHECKPOINT — COPY/PASTE INTO NEW CHAT (DETAILED HANDOVER)
+
+## 0) What to upload in the next session (handover bundle)
+
+Re-upload these to avoid “expired file” issues:
+
+### Repos
+
+1. **Backend repo** (the one deployed to Render; contains `/assistant/route`, dynamic skills, and worker)
+
+   * e.g. `repos.zip` (or a backend-only zip)
+2. **Control plane repo** (portal + KB ingestion worker)
+
+   * if separate, include that zip too
+
+### Critical docs
+
+3. `VOZLIA_NORTH_STAR.md`
+4. `CODE_DRIFT_CONTROL.md`
+5. Any canonical PRD doc you referenced (VOZ-PRD-GOALS-001 if separate)
+
+### Env/config
+
+6. `vozlia-backend-2.env`
+7. `Vozlia-Control-2.env`
+
+### Test artifacts (optional but helpful)
+
+8. Render worker logs CSV (scheduled deliveries) if new failures appear
+9. `vozlia_metric_questions_500_db_based.md` (for NL→DBQuerySpec future work)
+
+---
+
+## 1) Current Goal (where we are and where we’re going)
+
+**Goal:** Make Vozlia agentic by allowing a business owner to state a goal in natural language, after which:
+
+1. LLM determines steps to reach the goal
+2. LLM emits **structured JSON steps**
+3. FSM validates JSON, enforces tenant isolation, and executes deterministically
+4. Steps mostly map to dynamic skills:
+
+   * `dbquery_<uuid>` (metrics)
+   * `websearch_<uuid>` (knowledge/report searches)
+5. Scheduling is optional (only when time/cadence is provided)
+
+**Near-term requirement:** FSM should treat DBQuery and WebSearch skills as similarly as possible (same runtime pattern).
+
+---
+
+## 2) Verified working state (DBQuery scheduling + worker execution)
+
+### A) DB migration applied successfully
+
+Database: `vozlia_db` user `vozlia_db_user`.
+
+`scheduled_deliveries` now has:
+
+* `skill_key text NULL`
+* `web_search_skill_id uuid NULL` (was NOT NULL before)
+* No error column exists (no `last_error`)
+
+Schema confirmed via:
+
+```sql
+select ordinal_position, column_name, data_type, is_nullable
+from information_schema.columns
+where table_name='scheduled_deliveries'
+order by ordinal_position;
+```
+
+### B) WebSearch schedules unaffected
+
+Existing schedules were backfilled with `skill_key = websearch_<uuid>` and still execute.
+
+### C) DBQuery schedule creation works (Intent V2)
+
+**Key fix:** needed `DBQUERY_SCHEDULE_ENABLED=1` on the backend web service.
+Without it, `/assistant/route` returned:
+
+* `intent=schedule_unsupported` with message “Scheduling is not enabled for database metrics yet.”
+
+With the env var set, scheduling works.
+
+### D) DBQuery schedule row exists & upsert works
+
+A DBQuery skill (test) scheduled daily; later updated from 09:00 → 10:00 without creating a duplicate row.
+
+Row example:
+
+* `skill_key = dbquery_484c09ed-...`
+* `cadence = daily`
+* `time_of_day = 10:00`
+* `timezone = America/New_York`
+* `next_run_at` shifts accordingly
+
+### E) Worker execution confirmed for DBQuery schedules
+
+Forced-run technique confirmed worker picks up dbquery schedules and updates:
+
+* `last_run_at`
+* `last_latency_ms`
+* `updated_at`
+* `next_run_at`
+
+---
+
+## 3) Key operational issues found (and current workaround)
+
+### Issue: schedule destination was set to literal `"email"`
+
+When scheduling DBQuery via natural language, the created `scheduled_deliveries` row had:
+
+* `channel=email`
+* `destination=email`  ❌ (placeholder)
+
+Workaround used:
+
+```sql
+update scheduled_deliveries
+set destination = 'yasinc74@gmail.com',
+    updated_at = now()
+where id = '226bc512-3bfd-464f-9845-3514064523bb';
+```
+
+After this change, scheduled email delivery succeeded.
+
+**Follow-up needed (code):**
+Scheduling should default destination to the owner email (or disambiguate) and must never write `"email"` as a destination.
+
+### Issue: scheduled email content shows tuple formatting
+
+Email contained:
+
+* `value: (0,)`
+
+This is likely because the DBQuery result is being formatted as a raw Python tuple/row.
+**Follow-up needed (code):** flatten single-value results into scalars and produce a clean narrative summary.
+
+---
+
+## 4) DBQuery metric correctness validation (why result was 0)
+
+Schedule’s tenant:
+
+* schedule id: `226bc512-...`
+* tenant_id: `b4d2353b-667f-4fd2-8ca7-a882e20b9ec3`
+
+`caller_memory_events` has recent rows (mostly 2026-01-31 and some 2026-01-30), but the query for “today” in NY timezone returned 0.
+
+Confirmed with:
+
+```sql
+with bounds as (
+  select
+    (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York') as start_utc,
+    ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York') as end_utc
+)
+select
+  count(distinct caller_id) as unique_callers_today
+from caller_memory_events, bounds
+where tenant_id = (select tenant_id from scheduled_deliveries where id = '226bc512-...')
+  and (created_at at time zone 'UTC') >= start_utc
+  and (created_at at time zone 'UTC') < end_utc;
+```
+
+Result:
+
+* `unique_callers_today = 0`
+
+So the scheduled report’s 0 result is consistent with the DB and timeframe boundaries.
+
+---
+
+## 5) DBQuery skill duplicates cleanup
+
+Multiple duplicate DBQuery skills were created during testing. Deleting them works (the earlier “Internal Server Error” was due to malformed curl usage, not a broken endpoint).
+
+Working delete command:
+
+```bash
+export DEL_ID="dc20b09b-3f60-414f-a418-2ba4663662bf"
+curl -sS -i -X DELETE "$BASE_URL/admin/dbquery/skills/$DEL_ID" \
+  -H "x-vozlia-admin-key: $ADMIN_API_KEY"
+```
+
+Returns HTTP 200 `{"ok": true}`.
+
+---
+
+## 6) Current env flags that matter (backend + worker)
+
+### Backend web service (required)
+
+* `INTENT_V2_MODE=assist`
+* `INTENT_V2_SCHEDULE_ENABLED=1`
+* `DBQUERY_SCHEDULE_ENABLED=1`
+
+### Worker service
+
+* must have DB access and run scheduled deliveries loop
+* if it gates dbquery execution too, set:
+
+  * `DBQUERY_SCHEDULE_ENABLED=1`
+
+---
+
+## 7) The next engineering milestone for agentic goals (what to build next)
+
+### Milestone: Multi-step plan schema + deterministic executor
+
+Add a new structured “Goal Plan / Step Plan” returned by the LLM (planner) and executed by FSM.
+
+**Core behavior:**
+
+* LLM emits: `steps[]`
+* Each step is one of:
+
+  1. `ensure_skill` (create if missing; else reuse)
+  2. `run_skill` (execute existing)
+  3. `schedule_skill` (upsert schedule if requested)
+* Steps must support both `dbquery_*` and `websearch_*`.
+
+**Key requirement:** skill reuse should be deterministic:
+
+* compute a canonical `signature_hash` from the “template/spec”
+* reuse existing skill if signature matches; else create new
+* store `last_used_at` and allow TTL cleanup later
+
+### Immediate fixes to implement next (low risk, high ROI)
+
+1. **Schedule destination defaulting**
+
+   * if `channel=email`, destination must be a real email
+   * default to owner email if known
+   * otherwise return `disambiguate`
+
+2. **DBQuery output formatting**
+
+   * flatten single cell row tuples `(0,)` → `0`
+   * produce friendly summary: “Unique callers today: 0”
+
+3. **“ensure skill” layer**
+
+   * allow LLM to express a high-level metric request and the FSM either:
+
+     * finds an existing DBQuerySkill (hash match)
+     * or creates one, then runs it
+
+4. Expand to include WebSearch steps inside the same multi-step plan (already dynamic skills exist).
+
+---
+
+## 8) Verification commands (repeatable)
+
+### Check schedule row for a skill_key
+
+```bash
+psql "$DATABASE_URL" -c "
+select id, skill_key, channel, destination, cadence, time_of_day, timezone, next_run_at, last_run_at, last_latency_ms, updated_at
+from scheduled_deliveries
+where skill_key = 'dbquery_<uuid>';
+"
+```
+
+### Force-run a schedule (proves worker execution)
+
+```bash
+psql "$DATABASE_URL" -c "
+update scheduled_deliveries
+set last_run_at = null,
+    next_run_at = now() - interval '2 minutes'
+where id = '<schedule_uuid>';
+"
+```
+
+Watch updates:
+
+```bash
+for i in $(seq 1 10); do
+  psql "$DATABASE_URL" -c "
+  select now() as now, last_run_at, last_latency_ms, next_run_at, updated_at
+  from scheduled_deliveries
+  where id = '<schedule_uuid>';
+  "
+  sleep 3
+done
+```
+
+---
+
+## 9) Safe defaults & rollback levers
+
+* Disable DBQuery scheduling instantly:
+
+  * `DBQUERY_SCHEDULE_ENABLED=0`
+* Disable all scheduling behavior from Intent V2:
+
+  * `INTENT_V2_SCHEDULE_ENABLED=0`
+* Disable Intent V2 routing (fallback to legacy):
+
+  * `INTENT_V2_MODE=off`
+
+---
+
+## 10) Open questions to resolve next
+
+1. Where should the “default email destination” come from?
+
+   * owner user record email?
+   * a tenant notification preferences table?
+2. Do we want “1 schedule per skill_key” enforced by DB uniqueness?
+3. For “agentic goals,” do we store new objects now (Goal/WizardSession/Playbook), or do we MVP with a single stored plan and later split into objects?
+
+---
+
+## 11) Known “session responsiveness” issue
+
+This chat session is becoming unresponsive due to context size. Start a new chat and paste this checkpoint + re-upload files listed in section 0.
+
+---
+
+# AUTO-SUMMARY PACK
+
+1. **Current Goal**
+   Move from “skills + schedules working” to true agentic goals: user states a goal, LLM emits multi-step structured JSON, FSM ensures/reuses/creates dynamic skills (DBQuery and WebSearch) and executes deterministically, optionally scheduling.
+
+2. **Refactor Step Completed**
+   Operational verification completed: DBQuery scheduling + worker execution + email delivery confirmed end-to-end.
+
+3. **What Changed (Code/Config/Infra)**
+
+* Config: `DBQUERY_SCHEDULE_ENABLED=1` enabled on backend web service (and worker as needed).
+* DB: schedule destination manually corrected from placeholder `"email"` to real email.
+
+4. **Known Issues**
+
+* Scheduler created schedules with `destination='email'` placeholder; needs code fix (default to owner email or disambiguate).
+* Scheduled DBQuery email content shows tuple formatting (`(0,)`) and should be flattened for readability.
+* Some uploaded files may expire; re-upload in next session.
+
+5. **Evidence (≤5 log lines)**
+
+* `scheduled_deliveries` row created for `skill_key=dbquery_484c09ed-...`
+* Worker forced-run updated `last_run_at`, `last_latency_ms`, and advanced `next_run_at`
+* Email received: “value: (0,)”
+* SQL verification returned `unique_callers_today = 0`
+
+6. **Tests Performed / To Perform**
+   Performed:
+
+* DBQuery schedule creation/upsert
+* Worker execution forced-run
+* Email delivery confirmed
+* SQL correctness check for unique callers
+
+To perform next:
+
+* Implement default destination logic + formatting improvements
+* Implement multi-step plan schema + ensure-skill reuse (hash-based)
+
+7. **Next Actions (ordered)**
+
+1) Re-upload repos + env files in new chat (handover list provided).
+2) Implement schedule destination defaulting (no placeholder “email”).
+3) Improve DBQuery result formatting for scheduled emails (flatten single tuples).
+4) Implement multi-step “Goal Plan” JSON schema and FSM executor:
+
+   * ensure_skill (reuse/create) + run_skill + schedule_skill
+5) Extend ensure-skill to WebSearch + DBQuery uniformly.
+
+8. **Safe Defaults + Rollback Point**
+
+* `DBQUERY_SCHEDULE_ENABLED=0` disables DBQuery scheduling instantly
+* `INTENT_V2_SCHEDULE_ENABLED=0` disables scheduling behavior overall
+* `INTENT_V2_MODE=off` reverts to legacy routing
+
+9. **Open Questions**
+
+* Default email destination source (owner email vs tenant prefs)
+* Enforce unique schedule per (tenant_id, skill_key)?
+* When to introduce persisted Goal/Playbook objects vs MVP plan storage?
+
+10. **Goal/Wizard Status**
+    Scheduling substrate is now proven for both WebSearch and DBQuery (flag-gated). Next is agentic goals: step-based plans that create/reuse skills and optionally schedule, without touching realtime Flow A hot path.
+
+11. **Drift Control Notes (touched files + flags + rollback var)**
+    Flags involved: `DBQUERY_SCHEDULE_ENABLED`, `INTENT_V2_SCHEDULE_ENABLED`, `INTENT_V2_MODE`.
+    No new code touched in this message; next work requires repo re-upload due to possible file expiry.
+
+
+
 Good — that **category disambiguation path is now working** in `INTENT_V2_MODE=assist`, based on your latest smoke test:
 
 * `sports update` → returns a **disambiguation list** of skills in the **sports** category
