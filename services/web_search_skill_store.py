@@ -5,7 +5,7 @@ Public interfaces: create_web_search_skill, delete_web_search_skill, upsert_dail
 Reads/Writes: web_search_skills, scheduled_deliveries, user_settings (skills_config, skills_priority_order).
 Feature flags: n/a (called by routers and intent_v2 when enabled).
 Failure mode: raises on invalid skill IDs; scheduling failures return handled errors upstream.
-Last touched: 2026-01-31 (backfill scheduled_deliveries.skill_key for websearch schedules)
+Last touched: 2026-02-01 (normalize schedule destinations to avoid placeholders)
 """
 
 # services/web_search_skill_store.py
@@ -26,6 +26,7 @@ from models import (
     DeliveryChannel,
     DeliveryCadence,
 )
+from services.delivery_destination import resolve_delivery_destination
 from services.settings_service import (
     get_skills_config,
     get_skills_priority_order,
@@ -318,6 +319,12 @@ def upsert_daily_schedule(
     )
     if not skill:
         raise ValueError(f"WebSearchSkill not found for id={sid}")
+
+    # Destination safety: prevent placeholder destinations like destination='email'.
+    resolved_dest, _reason = resolve_delivery_destination(channel=channel, destination=destination, user=user)
+    if not resolved_dest:
+        raise ValueError(f"Invalid destination for channel={channel}: {destination!r}")
+    destination = resolved_dest
 
     time_of_day = f"{int(hour):02d}:{int(minute):02d}"
     tz = (timezone or "America/New_York").strip() or "America/New_York"

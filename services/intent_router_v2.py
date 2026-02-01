@@ -6,7 +6,7 @@ Public interfaces: maybe_route_and_execute, maybe_consume_disambiguation_choice.
 Reads/Writes: user_settings (skills_config), scheduled_deliveries (via stores), session_store.
 Feature flags: INTENT_V2_MODE, INTENT_V2_SCHEDULE_ENABLED, DBQUERY_SCHEDULE_ENABLED.
 Failure mode: falls back to legacy routing; scheduling failures return safe errors.
-Last touched: 2026-01-31 (extend scheduling to dbquery dynamic skills behind flag)
+Last touched: 2026-02-01 (normalize schedule destinations; disambiguate missing destination)
 """
 
 # (legacy module docs removed to keep __future__ import valid)
@@ -29,6 +29,7 @@ from services.session_store import session_store
 from services.settings_service import get_skills_config
 from services.web_search_skill_store import upsert_daily_schedule
 from services.db_query_skill_store import upsert_daily_schedule_dbquery
+from services.delivery_destination import resolve_delivery_destination
 
 try:
     from openai import OpenAI
@@ -646,6 +647,21 @@ def _schedule_candidate(
             "gmail": None,
         }
 
+
+    # Destination safety: prevent placeholder destinations like destination='email'.
+    resolved_dest, dest_reason = resolve_delivery_destination(channel=channel, destination=destination, user=user)
+    if not resolved_dest:
+        # Ask a single clarification question (minimal-question principle).
+        if channel == DeliveryChannel.email:
+            prompt = "What email address should I send this to?"
+        else:
+            prompt = "What phone number should I send this to?"
+        return {
+            "spoken_reply": prompt,
+            "fsm": {"mode": "intent_v2", "intent": "schedule_missing_destination", "channel": sched.channel},
+            "gmail": None,
+        }
+    destination = resolved_dest
     try:
         if kind == "websearch":
             upsert_daily_schedule(
@@ -656,7 +672,7 @@ def _schedule_candidate(
                 minute=int(sched.minute),
                 timezone=sched.timezone,
                 channel=channel,
-                destination=sched.destination,
+                destination=destination,
             )
         else:
             upsert_daily_schedule_dbquery(
@@ -667,7 +683,7 @@ def _schedule_candidate(
                 minute=int(sched.minute),
                 timezone=sched.timezone,
                 channel=channel,
-                destination=sched.destination,
+                destination=destination,
             )
     except Exception:
         logger.exception("INTENT_V2_SCHEDULE_UPSERT_FAIL skill_key=%s", skill_key)
@@ -683,7 +699,7 @@ def _schedule_candidate(
     time_of_day = f"{int(sched.hour):02d}:{int(sched.minute):02d}"
     spoken = (
         f"Okay — scheduled {cand.label} daily at {time_of_day} {sched.timezone} "
-        f"and will deliver by {sched.channel} to {sched.destination}."
+        f"and will deliver by {sched.channel} to {destination}."
     )
     return {
         "spoken_reply": spoken,

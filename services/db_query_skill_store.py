@@ -5,7 +5,7 @@ Public interfaces: create_db_query_skill, list_db_query_skills, delete_db_query_
 Reads/Writes: db_query_skills, scheduled_deliveries, user_settings (skills_config, skills_priority_order).
 Feature flags: DBQUERY_SCHEDULE_ENABLED (scheduling path).
 Failure mode: raises on invalid skill IDs; scheduling errors are handled upstream by callers.
-Last touched: 2026-01-31 (add upsert scheduling helper for dbquery_* skills)
+Last touched: 2026-02-01 (normalize schedule destinations to avoid placeholders)
 """
 
 # NOTE (LEGACY / SLATED FOR REMOVAL)
@@ -36,6 +36,7 @@ from services.settings_service import (
     set_skills_priority_order,
 )
 from core.logging import logger
+from services.delivery_destination import resolve_delivery_destination
 from services.web_search_skill_store import compute_next_run_at
 
 
@@ -180,6 +181,12 @@ def upsert_daily_schedule_dbquery(
     )
     if not skill:
         raise ValueError(f"DBQuerySkill not found for id={sid}")
+
+    # Destination safety: prevent placeholder destinations like destination='email'.
+    resolved_dest, _reason = resolve_delivery_destination(channel=channel, destination=destination, user=user)
+    if not resolved_dest:
+        raise ValueError(f"Invalid destination for channel={channel}: {destination!r}")
+    destination = resolved_dest
 
     skill_key = f"dbquery_{skill.id}"
     time_of_day = f"{int(hour):02d}:{int(minute):02d}"

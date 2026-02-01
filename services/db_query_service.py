@@ -1,3 +1,13 @@
+"""VOZLIA FILE PURPOSE
+Purpose: Deterministic, tenant-scoped DBQuery execution (safe-field registry + bounded filters) used by dbquery_* dynamic skills and scheduled deliveries.
+Hot path: no (called from /assistant/route and background workers; do not call from realtime audio frame loops)
+Public interfaces: run_db_query(spec, tenant_uuid)
+Reads/Writes: reads from whitelisted tables via SQLAlchemy; no writes.
+Feature flags: DB_QUERY_MAX_SPOKEN_CHARS (limits summary size)
+Failure mode: returns ok=false with spoken_summary on validation/unsupported fields.
+Last touched: 2026-02-01 (flatten aggregate row outputs and avoid tuple/Row formatting in summaries)
+"""
+
 # NOTE (LEGACY / SLATED FOR REMOVAL)
 # ---------------------------------
 # This module was part of the earlier DBQuery/Wizard experimentation.
@@ -121,7 +131,7 @@ def _entity_registry() -> dict[str, _EntityDef]:
     # Local imports to avoid import cycles
     from models import CallerMemoryEvent, WebSearchSkill, ScheduledDelivery, Task, KBDocument
 
-    return {
+    reg = {
         # Long-term memory events (turns + skills)
         "caller_memory_events": _EntityDef(
             name="caller_memory_events",
@@ -168,6 +178,39 @@ def _entity_registry() -> dict[str, _EntityDef]:
             exclude_fields=("storage_key",),  # internal storage path
         ),
     }
+
+    # Optional: Concept Code tables (behind CONCEPTS_ENABLED).
+    v = (os.getenv("CONCEPTS_ENABLED") or "0").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        from models import ConceptDefinition, ConceptAssignment, ConceptBatch
+        reg.update({
+            "concept_definitions": _EntityDef(
+                name="concept_definitions",
+                model=ConceptDefinition,
+                tenant_field="tenant_id",
+                tenant_is_uuid=True,
+                created_at_field="created_at",
+                exclude_fields=(),
+            ),
+            "concept_assignments": _EntityDef(
+                name="concept_assignments",
+                model=ConceptAssignment,
+                tenant_field="tenant_id",
+                tenant_is_uuid=True,
+                created_at_field="created_at",
+                exclude_fields=(),
+            ),
+            "concept_batches": _EntityDef(
+                name="concept_batches",
+                model=ConceptBatch,
+                tenant_field="tenant_id",
+                tenant_is_uuid=True,
+                created_at_field="created_at",
+                exclude_fields=(),
+            ),
+        })
+
+    return reg
 
 
 def supported_entities() -> dict[str, dict[str, Any]]:
@@ -408,19 +451,38 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
         raw_rows = q2.all()
         for r in raw_rows:
-            # SQLAlchemy returns tuples when selecting columns
+            # SQLAlchemy can return tuple() or Row() depending on version/dialect.
+            d: dict[str, Any] = {}
+
+            # Preferred: Row has a _mapping we can convert to a dict keyed by labels.
+            if hasattr(r, "_mapping"):
+                try:
+                    m = dict(getattr(r, "_mapping") or {})
+                except Exception:
+                    m = {}
+                # Keep a stable subset (group_by keys then aggregate labels)
+                for gb in parsed.group_by or []:
+                    if gb in m:
+                        d[gb] = m.get(gb)
+                for ac in agg_cols:
+                    if ac.key in m:
+                        d[ac.key] = m.get(ac.key)
+                if d:
+                    rows_out.append(d)
+                    continue
+
+            # Fallback: treat as tuple (group_by values first, then aggs)
             if isinstance(r, tuple):
-                d: dict[str, Any] = {}
-                # group_by columns first
                 idx = 0
                 for gb in parsed.group_by or []:
-                    d[gb] = r[idx]
+                    d[gb] = r[idx] if idx < len(r) else None
                     idx += 1
                 for ac in agg_cols:
-                    d[ac.key] = r[idx]
+                    d[ac.key] = r[idx] if idx < len(r) else None
                     idx += 1
                 rows_out.append(d)
             else:
+                # Last resort: store as value and let summarizer stringify.
                 rows_out.append({"value": r})
 
         # If no group_by, collapse to aggregates
@@ -476,6 +538,26 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
     return DBQueryResult(ok=True, entity=entity_key, count=int(cnt), rows=rows_out, aggregates=aggregates, spoken_summary=spoken)
 
 
+def _scalarize_value(v: Any) -> Any:
+    """
+    Convert annoying single-element containers like (0,) or Row(0) into scalars for human-readable output.
+    """
+    if v is None:
+        return None
+    # Tuples/lists like (0,) -> 0
+    if isinstance(v, (tuple, list)) and len(v) == 1:
+        return _scalarize_value(v[0])
+    # SQLAlchemy Row-like objects can be iterable; if they contain 1 value, scalarize.
+    if hasattr(v, "_mapping") or hasattr(v, "__iter__"):
+        try:
+            seq = list(v)  # type: ignore[arg-type]
+            if len(seq) == 1:
+                return _scalarize_value(seq[0])
+        except Exception:
+            pass
+    return v
+
+
 def _summarize_for_voice(entity: str, rows: list[dict], aggregates: dict | None) -> str:
     max_chars = int((os.getenv("DB_QUERY_MAX_SPOKEN_CHARS") or os.getenv("MAX_SPOKEN_CHARS") or "900").strip() or "900")
 
@@ -483,7 +565,10 @@ def _summarize_for_voice(entity: str, rows: list[dict], aggregates: dict | None)
         # Simple: speak key metrics
         parts = []
         for k, v in list(aggregates.items())[:6]:
-            parts.append(f"{k}: {v}")
+            vv = _scalarize_value(v)
+            if isinstance(vv, datetime):
+                vv = vv.isoformat(timespec="seconds")
+            parts.append(f"{k}: {vv}")
         out = f"Here’s what I found in {entity}: " + ", ".join(parts) + "."
     elif rows:
         # Speak first few rows lightly
@@ -493,7 +578,10 @@ def _summarize_for_voice(entity: str, rows: list[dict], aggregates: dict | None)
             # pick 2-3 fields
             items = []
             for k, v in list(r.items())[:3]:
-                items.append(f"{k}={v}")
+                vv = _scalarize_value(v)
+                if isinstance(vv, datetime):
+                    vv = vv.isoformat(timespec="seconds")
+                items.append(f"{k}={vv}")
             bulletish.append("; ".join(items))
         out = f"Here are the latest results from {entity}: " + " | ".join(bulletish)
         if len(rows) > 5:
