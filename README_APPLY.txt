@@ -1,98 +1,58 @@
-Vozlia Patch — DB Scheduling Destination Fix + DBQuery Formatting + Concept Codes Scaffold
-Date: 2026-02-01
+README — Vozlia Patch: DBQuery has_concept filter (2026-02-01)
 
-This patch implements two milestones from the checkpoint:
-(A) Phase A paper-cuts (high ROI correctness)
-(B) Phase B Concept Codes data model (foundation for deterministic cross-vertical analytics)
+Goal
+- Improve DB searches by allowing deterministic concept-based filtering in DBQuerySpec:
+  DBFilter.op = "has_concept" => safe EXISTS() against concept_assignments
 
---------------------------------------------------------------------------------
-A) Phase A fixes
---------------------------------------------------------------------------------
-1) Prevents placeholder schedule destinations like destination='email' from being persisted.
-   - If channel=email and destination is missing/placeholder/non-email-ish, it defaults to the primary user's email.
-   - Intent Router V2 now speaks the resolved destination.
+What this enables
+- DBQuery can filter entities (e.g., kb_documents, caller_memory_events) to only rows that have a specific Concept Code.
+- This is a prerequisite for concept-driven analytics. (Multi-table metrics come later via dataset registry / join templates.)
 
-2) Flattens DBQuery aggregate outputs so scheduled emails don't show tuple/Row formatting like '(0,)'.
-   - Prefer Row._mapping when available.
-   - Scalarizes single-element containers in summaries.
-
---------------------------------------------------------------------------------
-B) Phase B scaffold: Concept Codes tables + admin API
---------------------------------------------------------------------------------
-Adds tenant-scoped tables:
-- concept_definitions
-- concept_batches
-- concept_assignments
-
-Adds admin endpoints (admin-key gated):
-- GET/POST  /admin/concepts/definitions
-- POST      /admin/concepts/batches
-- GET/POST  /admin/concepts/assignments
-
-Feature flag (default OFF):
-- CONCEPTS_ENABLED=0|1
-
-NOTE: This patch only adds the data model + CRUD/admin endpoints.
-It does NOT yet:
-- run LLM enrichment batches automatically
-- join concept assignments inside DBQuerySpec compilation
-Those are the next patches (Phase C/D).
-
---------------------------------------------------------------------------------
-Changed files (whole-file replacements)
---------------------------------------------------------------------------------
-NEW:
-- services/delivery_destination.py
-- services/concepts_store.py
-- api/routers/concepts.py
-- migrations/2026_02_01_concept_codes
-
-UPDATED:
-- services/intent_router_v2.py
-- services/web_search_skill_store.py
-- services/db_query_skill_store.py
+Files (whole-file replacement)
 - services/db_query_service.py
-- models.py
-- main.py
 - CODE_DRIFT_CONTROL.md
 
---------------------------------------------------------------------------------
-How to apply
---------------------------------------------------------------------------------
-1) Copy files from this zip into your backend repo at the same relative paths.
-2) Apply the migration:
-   psql "$DATABASE_URL" -f migrations/2026_02_01_concept_codes
-
-3) Deploy backend + worker.
-
---------------------------------------------------------------------------------
 Env flags
---------------------------------------------------------------------------------
-Existing (already in use):
-- INTENT_V2_MODE=assist
-- INTENT_V2_SCHEDULE_ENABLED=1
-- DBQUERY_SCHEDULE_ENABLED=1
+- CONCEPTS_ENABLED=1 (required at runtime for has_concept filters)
 
-New:
-- CONCEPTS_ENABLED=1   # to enable /admin/concepts/* endpoints
+How to apply
+1) Copy these files into the backend repo (preserve paths)
+2) Deploy backend (worker does not need changes for this patch)
 
---------------------------------------------------------------------------------
-Recommended smoke tests
---------------------------------------------------------------------------------
-A) Schedule via natural language (email destination unspecified)
-1. Call /assistant/route with: "Send me my daily callers report at 10am."
-2. Confirm scheduled_deliveries.destination is your real email (not 'email').
+Smoke test (admin API)
+A) Pick an existing KB document id:
+  psql "$DATABASE_URL" -c "select id, title from kb_documents order by created_at desc limit 5;"
 
-B) Forced-run worker
-1. Force-run schedule:
-   update scheduled_deliveries set last_run_at=null, next_run_at=now()-interval '2 minutes' where id='<uuid>';
-2. Confirm email body does NOT include '(0,)'.
+B) Create a concept definition (if not already present)
+  curl -sS -X POST "$BASE_URL/admin/concepts/definitions" \
+    -H "x-vozlia-admin-key: $ADMIN_API_KEY" \
+    -H "content-type: application/json" \
+    -d '{"concept_code":"menu.steak","name":"Steak","description":"Steak dinners","active":true}'
 
-C) Concepts CRUD
-1. Set CONCEPTS_ENABLED=1 and redeploy.
-2. Create a concept definition:
-   POST /admin/concepts/definitions { "concept_code":"menu.steak", "name":"Steak", ... }
-3. Create a manual assignment:
-   POST /admin/concepts/assignments { "target_type":"kb_document", "target_id":"<id>", "concept_code":"menu.steak", "source":"manual" }
-4. List:
-   GET /admin/concepts/assignments?concept_code=menu.steak
+C) Assign that concept to the real kb_document id
+  curl -sS -X POST "$BASE_URL/admin/concepts/assignments" \
+    -H "x-vozlia-admin-key: $ADMIN_API_KEY" \
+    -H "content-type: application/json" \
+    -d '{"target_type":"kb_document","target_id":"<KB_DOC_ID>","concept_code":"menu.steak","source":"manual"}'
+
+D) Run DBQuery with has_concept filter
+  curl -sS -X POST "$BASE_URL/admin/dbquery/run" \
+    -H "x-vozlia-admin-key: $ADMIN_API_KEY" \
+    -H "content-type: application/json" \
+    -d '{
+      "spec": {
+        "entity": "kb_documents",
+        "filters": [
+          { "field": "id", "op": "has_concept", "value": { "concept_code": "menu.steak" } }
+        ],
+        "limit": 25
+      }
+    }'
+
+Expected
+- ok=true
+- count >= 1
+- returned rows include your kb_document id
+
+Rollback
+- Set CONCEPTS_ENABLED=0 (disables concepts filtering and concept endpoints).
