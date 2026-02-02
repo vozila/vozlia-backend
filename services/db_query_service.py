@@ -132,7 +132,7 @@ class _EntityDef:
 
 def _entity_registry() -> dict[str, _EntityDef]:
     # Local imports to avoid import cycles
-    from models import CallerMemoryEvent, WebSearchSkill, ScheduledDelivery, Task, KBDocument
+    from models import CallerMemoryEvent, WebSearchSkill, ScheduledDelivery, Task, KBDocument, KBFile, KBChunk
 
     reg = {
         # Long-term memory events (turns + skills)
@@ -181,6 +181,27 @@ def _entity_registry() -> dict[str, _EntityDef]:
             created_at_field="created_at",
             exclude_fields=("storage_key",),  # internal storage path
             concept_target_type="kb_document",
+        ),
+
+        # KB files (Control Plane Phase 1)
+        "kb_files": _EntityDef(
+            name="kb_files",
+            model=KBFile,
+            tenant_field="tenant_id",  # stored as string(uuid) in control plane
+            tenant_is_uuid=False,
+            created_at_field="created_at",
+            exclude_fields=("storage_key",),  # internal storage path
+            concept_target_type="kb_file",
+        ),
+        # KB text chunks (Control Plane Phase 2)
+        "kb_chunks": _EntityDef(
+            name="kb_chunks",
+            model=KBChunk,
+            tenant_field="tenant_id",  # UUID
+            tenant_is_uuid=True,
+            created_at_field="created_at",
+            exclude_fields=(),
+            concept_target_type="kb_chunk",
         ),
     }
 
@@ -285,6 +306,7 @@ def _apply_concept_filters(
 
     # Concept tables are tenant-scoped by UUID; coerce tenant id to UUID.
     try:
+        from uuid import UUID
         tenant_uuid_obj = UUID(str(tenant_uuid))
     except Exception:
         raise ValueError("Invalid tenant id for concept filters.")

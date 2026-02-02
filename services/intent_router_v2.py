@@ -6,7 +6,7 @@ Public interfaces: maybe_route_and_execute, maybe_consume_disambiguation_choice.
 Reads/Writes: user_settings (skills_config), scheduled_deliveries (via stores), session_store.
 Feature flags: INTENT_V2_MODE, INTENT_V2_SCHEDULE_ENABLED, DBQUERY_SCHEDULE_ENABLED.
 Failure mode: falls back to legacy routing; scheduling failures return safe errors.
-Last touched: 2026-02-01 (normalize schedule destinations; disambiguate missing destination)
+Last touched: 2026-01-31 (extend scheduling to dbquery dynamic skills behind flag)
 """
 
 # (legacy module docs removed to keep __future__ import valid)
@@ -29,7 +29,6 @@ from services.session_store import session_store
 from services.settings_service import get_skills_config
 from services.web_search_skill_store import upsert_daily_schedule
 from services.db_query_skill_store import upsert_daily_schedule_dbquery
-from services.delivery_destination import resolve_delivery_destination
 
 try:
     from openai import OpenAI
@@ -307,7 +306,7 @@ class ScheduleRequest(BaseModel):
     minute: int = Field(..., ge=0, le=59)
     timezone: str = Field(..., min_length=1)
     channel: str = Field(..., min_length=1)      # email|sms|whatsapp|call
-    destination: str = Field(..., min_length=1)  # email address or phone number
+    destination: str | None = Field(None, min_length=1)  # email address or phone number (null if unknown)
 
 
 class IntentPlanV2(BaseModel):
@@ -380,7 +379,8 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
         "2) For route='run_skill', set skill_key to an exact candidate skill_key.\n"
         "3) For schedule-related requests, populate schedule_request with:\n"
         "   cadence='daily', hour (0-23), minute (0-59), timezone (e.g., 'America/New_York'),\n"
-        "   channel ('email' or 'sms' preferred), destination (email or phone number).\n"
+        "   channel ('email' or 'sms' preferred), and destination (email or phone number) *only if explicitly provided*.\n"
+        "   If destination is missing, set destination to null (do NOT guess).\n"
         "4) If the user talks about sports, parking, etc., you may use candidate.category to do category-based routing\n"
         "   (e.g., 'sports report' → a sports-category skill).\n"
         "5) If schedule details are ambiguous or missing, you may use route='disambiguate' or 'chitchat' rather than guessing.\n"
@@ -410,7 +410,7 @@ def llm_plan_intent(utterance: str, *, candidates: List[SkillCandidate]) -> Inte
                 "minute": "0-59 integer",
                 "timezone": "IANA timezone string (e.g., America/New_York)",
                 "channel": "email|sms|whatsapp|call",
-                "destination": "email address or phone number",
+                "destination": "email address or phone number (string) OR null if unknown",
             },
             "confidence": "0.0-1.0",
             "rationale": "short string (optional)",
@@ -590,6 +590,42 @@ def _to_delivery_channel(channel: str) -> DeliveryChannel | None:
     return None
 
 
+# ----------------------------
+# Schedule destination helpers
+# ----------------------------
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PHONE_RE = re.compile(r"^\+?[0-9][0-9\-\(\)\s]{6,}$")
+
+
+def _normalize_schedule_destination(channel: DeliveryChannel, destination: str | None, user) -> str | None:
+    """Validate + normalize schedule destination.
+
+    Goal: never persist placeholder strings like "email" as a destination.
+
+    Rules (MVP):
+      - If channel=email and destination is missing/invalid → default to user.email.
+      - If channel is sms/whatsapp/call and destination is missing/invalid → return None (caller must specify).
+    """
+    d = (destination or "").strip()
+
+    # Email channel: prefer a real email, otherwise default to owner email.
+    if channel == DeliveryChannel.email:
+        if not d or d.lower() in ("email", "e-mail", "mail"):
+            return (getattr(user, "email", "") or "").strip() or None
+        if _EMAIL_RE.match(d):
+            return d
+        # Fail-safe: don't save garbage; fall back to owner email.
+        return (getattr(user, "email", "") or "").strip() or None
+
+    # Phone-like channels: require a plausible phone number.
+    if not d or d.lower() in ("sms", "text", "phone", "call"):
+        return None
+    if _PHONE_RE.match(d):
+        return d
+    return None
+
+
 def _schedule_candidate(
     db: Session,
     user,
@@ -647,21 +683,16 @@ def _schedule_candidate(
             "gmail": None,
         }
 
-
-    # Destination safety: prevent placeholder destinations like destination='email'.
-    resolved_dest, dest_reason = resolve_delivery_destination(channel=channel, destination=destination, user=user)
-    if not resolved_dest:
-        # Ask a single clarification question (minimal-question principle).
-        if channel == DeliveryChannel.email:
-            prompt = "What email address should I send this to?"
-        else:
-            prompt = "What phone number should I send this to?"
+    dest = _normalize_schedule_destination(channel, sched.destination, user)
+    if not dest:
+        # For SMS/WhatsApp/Call we cannot guess; ask.
+        ask = "What phone number should I use for that schedule?"
         return {
-            "spoken_reply": prompt,
-            "fsm": {"mode": "intent_v2", "intent": "schedule_missing_destination", "channel": sched.channel},
+            "spoken_reply": ask,
+            "fsm": {"mode": "intent_v2", "intent": "schedule_missing_destination", "channel": getattr(channel, "value", str(channel))},
             "gmail": None,
         }
-    destination = resolved_dest
+
     try:
         if kind == "websearch":
             upsert_daily_schedule(
@@ -672,7 +703,7 @@ def _schedule_candidate(
                 minute=int(sched.minute),
                 timezone=sched.timezone,
                 channel=channel,
-                destination=destination,
+                destination=dest,
             )
         else:
             upsert_daily_schedule_dbquery(
@@ -683,7 +714,7 @@ def _schedule_candidate(
                 minute=int(sched.minute),
                 timezone=sched.timezone,
                 channel=channel,
-                destination=destination,
+                destination=dest,
             )
     except Exception:
         logger.exception("INTENT_V2_SCHEDULE_UPSERT_FAIL skill_key=%s", skill_key)
@@ -699,7 +730,7 @@ def _schedule_candidate(
     time_of_day = f"{int(sched.hour):02d}:{int(sched.minute):02d}"
     spoken = (
         f"Okay — scheduled {cand.label} daily at {time_of_day} {sched.timezone} "
-        f"and will deliver by {sched.channel} to {destination}."
+        f"and will deliver by {sched.channel} to {dest}."
     )
     return {
         "spoken_reply": spoken,
