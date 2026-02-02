@@ -5,7 +5,7 @@ Public interfaces: ORM model classes imported across services/workers.
 Reads/Writes: Postgres tables (users, skills, schedules, memory, etc.).
 Feature flags: n/a
 Failure mode: schema mismatches raise DB errors at runtime.
-Last touched: 2026-02-01 (add Concept Code ORM models for deterministic analytics)
+Last touched: 2026-01-31 (add skill_key to scheduled_deliveries for dbquery scheduling compatibility)
 """
 
 # models.py
@@ -367,10 +367,81 @@ class ScheduledDelivery(Base):
         Index("ix_scheduled_deliveries_websearch_skill", "web_search_skill_id"),
     )
 
+# =========================
+# KB Files / Chunks (Control Plane shared tables)
+# =========================
+
+class KBFile(Base):
+    """Tenant-uploaded knowledge/policy files (Control Plane Phase 1).
+
+    NOTE:
+    - This table is owned by the Control Plane service, but lives in the shared Postgres DB.
+    - We define it here so DBQuery can query it deterministically (single-table, tenant-scoped).
+    - tenant_id is stored as a string(uuid) for backward compatibility with earlier schemas.
+    """
+
+    __tablename__ = "kb_files"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+    tenant_id = Column(String, index=True, nullable=False)
+
+    kind = Column(String, index=True, nullable=False, default="knowledge")   # knowledge|policy
+    status = Column(String, index=True, nullable=False, default="uploaded")  # uploaded|ingesting|ready|failed
+
+    filename = Column(String, nullable=False)
+    content_type = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    sha256 = Column(String, nullable=True)
+
+    storage_bucket = Column(String, nullable=False)
+    storage_key = Column(String, nullable=False)
+
+    uploaded_by = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True, nullable=False)
+
+
+Index("ix_kb_files_tenant_created", KBFile.tenant_id, KBFile.created_at.desc())
+Index("ix_kb_files_tenant_filename", KBFile.tenant_id, KBFile.filename)
+
+
+class KBChunk(Base):
+    """Extracted KB text chunks (Control Plane Phase 2).
+
+    NOTE:
+    - Stored in shared Postgres so both Control Plane and Backend can query by tenant.
+    - tenant_id is UUID in this table.
+    """
+
+    __tablename__ = "kb_chunks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    tenant_id = Column(UUID(as_uuid=True), index=True, nullable=False)
+    file_id = Column(String, ForeignKey("kb_files.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    kind = Column(String, index=True, nullable=False, default="knowledge")
+
+    chunk_index = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("file_id", "chunk_index", name="uq_kb_chunks_file_chunk_index"),
+        Index("ix_kb_chunks_tenant_file_chunk", "tenant_id", "file_id", "chunk_index"),
+    )
+
 
 # =========================
-# Concept Codes (semantic tagging for deterministic analytics)
+# Concept Codes (deterministic semantic tags)
 # =========================
+
+class ConceptSource(enum.Enum):
+    llm_auto = "llm_auto"
+    manual = "manual"
+    import_ = "import"
+
 
 class ConceptDefinition(Base):
     __tablename__ = "concept_definitions"
@@ -379,14 +450,15 @@ class ConceptDefinition(Base):
 
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
 
-    # Stable identifier (unique per tenant): e.g. "menu.steak", "lead.intent.purchase_inquiry"
+    # Stable per tenant, e.g. "menu.steak"
     concept_code = Column(String, nullable=False)
-
-    name = Column(String, nullable=False)
+    name = Column(String, nullable=False, default="")
     description = Column(Text, nullable=True)
+
     parent_code = Column(String, nullable=True)
 
     synonyms_json = Column(JSONB, nullable=False, default=list)
+
     active = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -402,11 +474,11 @@ class ConceptBatch(Base):
     __tablename__ = "concept_batches"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
-
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
 
     model_version = Column(String, nullable=True)
-    summary_json = Column(JSONB, nullable=False, default=dict)
+    summary = Column(Text, nullable=True)
+
     notified_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -423,18 +495,16 @@ class ConceptAssignment(Base):
 
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
 
-    # Polymorphic target link (store target_id as text for maximum compatibility)
-    target_type = Column(String, nullable=False)
-    target_id = Column(String, nullable=False)
+    # Polymorphic link
+    target_type = Column(String, nullable=False, index=True)  # e.g. "kb_file", "kb_chunk", "caller_memory_event"
+    target_id = Column(String, nullable=False, index=True)    # UUID/text coerced to string
+    concept_code = Column(String, nullable=False, index=True)
 
-    concept_code = Column(String, nullable=False)
-
-    source = Column(String, nullable=False, default="llm_auto")
+    source = Column(SAEnum(ConceptSource), nullable=False, default=ConceptSource.llm_auto)
     confidence = Column(Float, nullable=True)
     rationale = Column(Text, nullable=True)
-    evidence_json = Column(JSONB, nullable=True)
+    evidence_json = Column(JSONB, nullable=False, default=dict)
 
-    # Manual overrides should lock the assignment so future LLM batches don't overwrite.
     locked = Column(Boolean, nullable=False, default=False)
 
     batch_id = Column(UUID(as_uuid=True), ForeignKey("concept_batches.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -443,10 +513,7 @@ class ConceptAssignment(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("tenant_id", "target_type", "target_id", "concept_code", name="uq_concept_assignments_tenant_target_concept"),
-        Index("ix_concept_assignments_tenant_code", "tenant_id", "concept_code"),
         Index("ix_concept_assignments_tenant_target", "tenant_id", "target_type", "target_id"),
+        Index("ix_concept_assignments_tenant_code", "tenant_id", "concept_code"),
         Index("ix_concept_assignments_tenant_batch", "tenant_id", "batch_id"),
     )
-
-

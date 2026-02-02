@@ -1,13 +1,3 @@
-"""VOZLIA FILE PURPOSE
-Purpose: FastAPI app bootstrap + route registration only.
-Hot path: no
-Public interfaces: create_app(), app
-Reads/Writes: none directly (routers/services handle IO).
-Feature flags: n/a (routers may gate internally).
-Failure mode: startup errors prevent serving.
-Last touched: 2026-02-01 (add admin concepts router behind CONCEPTS_ENABLED)
-"""
-
 # main.py
 from fastapi import FastAPI
 
