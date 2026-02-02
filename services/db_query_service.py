@@ -5,7 +5,7 @@ Public interfaces: run_db_query(spec, tenant_uuid)
 Reads/Writes: reads from whitelisted tables via SQLAlchemy; no writes.
 Feature flags: DB_QUERY_MAX_SPOKEN_CHARS (limits summary size)
 Failure mode: returns ok=false with spoken_summary on validation/unsupported fields.
-Last touched: 2026-02-01 (flatten aggregate row outputs and avoid tuple/Row formatting in summaries)
+Last touched: 2026-02-01 (add deterministic has_concept filter + keep scalarized summaries)
 """
 
 # NOTE (LEGACY / SLATED FOR REMOVAL)
@@ -22,6 +22,7 @@ Last touched: 2026-02-01 (flatten aggregate row outputs and avoid tuple/Row form
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -51,6 +52,7 @@ FilterOp = Literal[
     "between",
     "is_null",
     "not_null",
+    "has_concept",
 ]
 
 AggOp = Literal["count", "count_distinct", "sum", "avg", "min", "max"]
@@ -125,6 +127,7 @@ class _EntityDef:
     tenant_is_uuid: bool = True
     created_at_field: str | None = "created_at"
     exclude_fields: Tuple[str, ...] = ()
+    concept_target_type: str | None = None
 
 
 def _entity_registry() -> dict[str, _EntityDef]:
@@ -140,6 +143,7 @@ def _entity_registry() -> dict[str, _EntityDef]:
             tenant_is_uuid=False,
             created_at_field="created_at",
             exclude_fields=(),
+            concept_target_type="caller_memory_event",
         ),
         # Saved web search skills
         "web_search_skills": _EntityDef(
@@ -176,6 +180,7 @@ def _entity_registry() -> dict[str, _EntityDef]:
             tenant_is_uuid=True,
             created_at_field="created_at",
             exclude_fields=("storage_key",),  # internal storage path
+            concept_target_type="kb_document",
         ),
     }
 
@@ -224,9 +229,90 @@ def supported_entities() -> dict[str, dict[str, Any]]:
             "fields": sorted(allowed),
             "created_at_field": ed.created_at_field,
             "tenant_field": ed.tenant_field,
+            "concept_target_type": ed.concept_target_type,
         }
     return out
 
+
+
+def _concepts_enabled() -> bool:
+    v = (os.getenv("CONCEPTS_ENABLED") or "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+_CONCEPT_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+
+
+def _parse_concept_codes(f: DBFilter) -> list[str]:
+    """Extract concept codes from a DBFilter used with op='has_concept'."""
+    codes: list[str] = []
+    if isinstance(f.values, list) and f.values:
+        codes = [str(x) for x in f.values]
+    elif isinstance(f.value, str) and f.value.strip():
+        codes = [f.value.strip()]
+    elif isinstance(f.value, dict):
+        # Accept {"concept_code": "menu.steak"} or {"concept_codes": ["menu.steak", ...]}
+        if isinstance(f.value.get("concept_codes"), list):
+            codes = [str(x) for x in f.value.get("concept_codes") if str(x).strip()]
+        elif isinstance(f.value.get("concept_code"), str):
+            codes = [str(f.value.get("concept_code")).strip()]
+    # Validate
+    codes = [c for c in codes if c]
+    if not codes:
+        raise ValueError("has_concept requires a concept_code (value) or concept_codes (values)")
+    bad = [c for c in codes if not _CONCEPT_CODE_RE.match(c)]
+    if bad:
+        raise ValueError(f"Invalid concept_code(s): {', '.join(bad[:3])}")
+    return codes
+
+
+def _apply_concept_filters(
+    *,
+    tenant_uuid: str,
+    ed: _EntityDef,
+    model: Any,
+    q,
+    concept_filters: list[DBFilter],
+    allowed_fields: set[str],
+):
+    """Apply concept-based filters using a safe EXISTS subquery."""
+    if not concept_filters:
+        return q
+    if not _concepts_enabled():
+        raise ValueError("Concept filters are not enabled (set CONCEPTS_ENABLED=1).")
+    if not ed.concept_target_type:
+        raise ValueError(f"Entity '{ed.name}' does not support concept filters.")
+
+    # Concept tables are tenant-scoped by UUID; coerce tenant id to UUID.
+    try:
+        tenant_uuid_obj = UUID(str(tenant_uuid))
+    except Exception:
+        raise ValueError("Invalid tenant id for concept filters.")
+
+    from sqlalchemy import String as SAString, cast, select
+    from models import ConceptAssignment
+
+    for f in concept_filters:
+        field = (f.field or "").strip()
+        if not field or field not in allowed_fields:
+            raise ValueError(f"Unsupported field for has_concept: {field}")
+        col = getattr(model, field)
+
+        codes = _parse_concept_codes(f)
+
+        sub = (
+            select(1)
+            .select_from(ConceptAssignment)
+            .where(
+                ConceptAssignment.tenant_id == tenant_uuid_obj,
+                ConceptAssignment.target_type == ed.concept_target_type,
+                ConceptAssignment.target_id == cast(col, SAString),
+                ConceptAssignment.concept_code.in_(codes),
+            )
+        )
+        q = q.filter(sub.exists())
+
+    return q
 
 # ---------------------------------------------------------------------------
 # Execution
@@ -380,7 +466,17 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
     # Filters
     try:
-        q = _apply_filters(model, q, parsed.filters, allowed_fields=allowed_fields)
+        normal_filters = [f for f in (parsed.filters or []) if f.op != "has_concept"]
+        concept_filters = [f for f in (parsed.filters or []) if f.op == "has_concept"]
+        q = _apply_filters(model, q, normal_filters, allowed_fields=allowed_fields)
+        q = _apply_concept_filters(
+            tenant_uuid=str(tenant_uuid),
+            ed=ed,
+            model=model,
+            q=q,
+            concept_filters=concept_filters,
+            allowed_fields=allowed_fields,
+        )
     except Exception as e:
         return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=str(e))
 
