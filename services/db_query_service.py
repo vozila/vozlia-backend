@@ -1,11 +1,11 @@
 """VOZLIA FILE PURPOSE
-Purpose: Deterministic, tenant-scoped DBQuery runner (admin + scheduler support). Single-table queries only.
-Hot path: no
-Public interfaces: services.run_db_query (called by /admin/dbquery/run and DBQuery skill runtime).
-Reads/Writes: reads analytics tables; no writes.
-Feature flags: DB_QUERY_MAX_SPOKEN_CHARS (summary size), CONCEPTS_ENABLED (enables has_concept filter).
-Failure mode: returns DBQueryResult(ok=false, ...) on validation/exec errors; never raises raw exceptions to callers.
-Last touched: 2026-02-03 (flatten aggregate Row results to avoid tuple formatting)
+Purpose: Deterministic DBQuery execution (admin metrics) with strict tenant isolation.
+Hot path: no (admin endpoints / worker).
+Public interfaces: DBQuerySpec, run_db_query(), supported_entities().
+Reads/Writes: tenant-scoped SELECTs over approved entities.
+Feature flags: DBQUERY_TRACE, DBQUERY_TRACE_SQL (debug only).
+Failure mode: returns ok=false with safe summary; never writes.
+Last touched: 2026-02-03 (add debug trace logs + request correlation)
 """
 
 # NOTE (LEGACY / SLATED FOR REMOVAL)
@@ -25,39 +25,58 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
-from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import and_, func, cast, String as SAString
-from sqlalchemy.sql import exists
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
 from core.logging import logger
 
+# -------------------------
+# Debug flags (safe-by-default)
+# -------------------------
 
-def _concepts_enabled() -> bool:
-    # Default OFF. Turn on explicitly via env var.
-    return (os.getenv("CONCEPTS_ENABLED", "0") or "0").strip() == "1"
-
-
-# Map (entity, field) -> target_type for has_concept filters.
-# Fallback: if field == 'id' and entity endswith('s'), target_type = entity[:-1].
-_CONCEPT_TARGET_TYPE_MAP: dict[tuple[str, str], str] = {
-    ("kb_files", "id"): "kb_file",
-    ("kb_chunks", "id"): "kb_chunk",
-    # Convenience: allow retrieving kb_chunks for a concept-tagged kb_file.
-    ("kb_chunks", "file_id"): "kb_file",
-}
+def _truthy_env(name: str, default: str = "0") -> bool:
+    v = (os.getenv(name) or default).strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
-def _concept_target_type(entity_key: str, field: str) -> str:
-    t = _CONCEPT_TARGET_TYPE_MAP.get((entity_key, field))
-    if t:
-        return t
-    if field == "id" and entity_key.endswith("s"):
-        return entity_key[:-1]
-    raise ValueError(f"has_concept is not configured for entity={entity_key} field={field}")
+def _dbquery_trace_enabled() -> bool:
+    # High-level per-query trace (no SQL, safe summaries).
+    return _truthy_env("DBQUERY_TRACE", "0")
+
+
+def _dbquery_trace_sql_enabled() -> bool:
+    # SQL trace is more sensitive/noisy. Keep OFF by default.
+    return _truthy_env("DBQUERY_TRACE_SQL", "0")
+
+
+def _safe_short(v: Any, *, max_len: int = 120) -> str:
+    try:
+        s = str(v)
+    except Exception:
+        return "<unprintable>"
+    s = s.replace("\n", "\\n")
+    if len(s) > max_len:
+        return s[: max_len - 3] + "..."
+    return s
+
+
+def _filters_summary(filters: list[DBFilter]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for f in filters or []:
+        try:
+            out.append(
+                {
+                    "field": _safe_short(getattr(f, "field", "")),
+                    "op": _safe_short(getattr(f, "op", "")),
+                    "value": _safe_short(getattr(f, "value", None)),
+                }
+            )
+        except Exception:
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +96,6 @@ FilterOp = Literal[
     "between",
     "is_null",
     "not_null",
-    "has_concept",
 ]
 
 AggOp = Literal["count", "count_distinct", "sum", "avg", "min", "max"]
@@ -156,7 +174,7 @@ class _EntityDef:
 
 def _entity_registry() -> dict[str, _EntityDef]:
     # Local imports to avoid import cycles
-    from models import CallerMemoryEvent, WebSearchSkill, ScheduledDelivery, Task, KBDocument, KBFile, KBChunk
+    from models import CallerMemoryEvent, WebSearchSkill, ScheduledDelivery, Task, KBDocument
 
     return {
         # Long-term memory events (turns + skills)
@@ -203,23 +221,6 @@ def _entity_registry() -> dict[str, _EntityDef]:
             tenant_is_uuid=True,
             created_at_field="created_at",
             exclude_fields=("storage_key",),  # internal storage path
-        ),
-        # Control Plane KB files/chunks (owned by control plane; mirrored here for analytics queries)
-        "kb_files": _EntityDef(
-            name="kb_files",
-            model=KBFile,
-            tenant_field="tenant_id",
-            tenant_is_uuid=False,
-            created_at_field="created_at",
-            exclude_fields=("storage_key",),
-        ),
-        "kb_chunks": _EntityDef(
-            name="kb_chunks",
-            model=KBChunk,
-            tenant_field="tenant_id",
-            tenant_is_uuid=True,
-            created_at_field="created_at",
-            exclude_fields=(),
         ),
     }
 
@@ -300,15 +301,7 @@ def _resolve_time_window(tf: DBTimeframe, *, now_utc: datetime) -> tuple[datetim
     return (start_utc, end_utc)
 
 
-def _apply_filters(
-    model: Any,
-    q,
-    filters: list[DBFilter],
-    allowed_fields: set[str],
-    *,
-    tenant_uuid: UUID,
-    entity_key: str,
-):
+def _apply_filters(model: Any, q, filters: list[DBFilter], allowed_fields: set[str]):
     clauses = []
     for f in filters or []:
         field = (f.field or "").strip()
@@ -332,42 +325,19 @@ def _apply_filters(
         elif op == "contains":
             clauses.append(col.like(f"%{f.value}%"))
         elif op == "icontains":
-            clauses.append(func.lower(col).like(f"%{str(f.value).lower()}%"))
+            clauses.append(col.ilike(f"%{f.value}%"))
         elif op == "in":
-            vs = f.values or []
-            clauses.append(col.in_(vs))
+            vals = f.values if isinstance(f.values, list) else ([f.value] if f.value is not None else [])
+            clauses.append(col.in_(vals))
         elif op == "between":
-            vs = f.values or []
-            if len(vs) != 2:
-                raise ValueError("between requires exactly 2 values")
-            clauses.append(col.between(vs[0], vs[1]))
+            vals = f.values if isinstance(f.values, list) else None
+            if not vals or len(vals) != 2:
+                raise ValueError("between requires values=[low, high]")
+            clauses.append(col.between(vals[0], vals[1]))
         elif op == "is_null":
             clauses.append(col.is_(None))
         elif op == "not_null":
             clauses.append(col.is_not(None))
-        elif op == "has_concept":
-            if not _concepts_enabled():
-                raise ValueError("has_concept requires CONCEPTS_ENABLED=1")
-
-            concept_code = str(f.value or "").strip()
-            if not concept_code:
-                raise ValueError("has_concept requires value=concept_code")
-
-            target_type = _concept_target_type(entity_key, field)
-
-            # Local import avoids circular imports in legacy module
-            from models import ConceptAssignment
-
-            clauses.append(
-                exists().where(
-                    and_(
-                        ConceptAssignment.tenant_id == tenant_uuid,
-                        ConceptAssignment.target_type == target_type,
-                        ConceptAssignment.target_id == cast(col, SAString),
-                        ConceptAssignment.concept_code == concept_code,
-                    )
-                )
-            )
         else:
             raise ValueError(f"Unsupported op: {op}")
 
@@ -410,6 +380,20 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
     q = db.query(model).filter(tenant_col == tenant_val)
 
+    if _dbquery_trace_enabled():
+        logger.info(
+            "DBQUERY_RUN entity=%s tenant=%s select=%s filters=%s timeframe=%s group_by=%s aggs=%s order_by=%s limit=%s",
+            entity_key,
+            _safe_short(tenant_val),
+            _safe_short(parsed.select),
+            _filters_summary(parsed.filters),
+            _safe_short(parsed.timeframe.model_dump() if parsed.timeframe else None),
+            _safe_short(parsed.group_by),
+            _safe_short([a.model_dump() for a in (parsed.aggregations or [])]) if parsed.aggregations else None,
+            _safe_short([o.model_dump() for o in (parsed.order_by or [])]) if parsed.order_by else None,
+            parsed.limit,
+        )
+
     now_utc = _now_utc()
 
     # Time window
@@ -422,8 +406,15 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
     # Filters
     try:
-        q = _apply_filters(model, q, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=UUID(str(tenant_uuid)), entity_key=entity_key)
+        q = _apply_filters(model, q, parsed.filters, allowed_fields=allowed_fields)
+
+        if _dbquery_trace_sql_enabled():
+            try:
+                logger.info("DBQUERY_SQL entity=%s sql=%s", entity_key, str(q.statement))
+            except Exception:
+                pass
     except Exception as e:
+        logger.exception("DBQUERY_FILTERS_FAIL entity=%s err=%s", entity_key, e)
         return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=str(e))
 
     # Group-by / aggregations
@@ -468,7 +459,7 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
                 q2 = q2.filter(getattr(model, ed.created_at_field) >= start)
             if end and ed.created_at_field in allowed_fields:
                 q2 = q2.filter(getattr(model, ed.created_at_field) < end)
-        q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=UUID(str(tenant_uuid)), entity_key=entity_key)
+        q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields)
 
         if group_cols:
             q2 = q2.group_by(*group_cols)
@@ -493,19 +484,7 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
         raw_rows = q2.all()
         for r in raw_rows:
-            # SQLAlchemy may return:
-            # - Row objects (v1.4+/2.0) with a ._mapping of selected labels
-            # - plain tuples (older behavior)
-            # - ORM instances (rare in this branch)
-            if hasattr(r, "_mapping"):
-                d = dict(getattr(r, "_mapping"))  # type: ignore[arg-type]
-                # JSON-safe serialization for common types
-                for k, v in list(d.items()):
-                    if isinstance(v, datetime):
-                        d[k] = v.isoformat(timespec="seconds")
-                rows_out.append(d)
-                continue
-
+            # SQLAlchemy returns tuples when selecting columns
             if isinstance(r, tuple):
                 d: dict[str, Any] = {}
                 # group_by columns first
@@ -517,9 +496,8 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
                     d[ac.key] = r[idx]
                     idx += 1
                 rows_out.append(d)
-                continue
-
-            rows_out.append({"value": r})
+            else:
+                rows_out.append({"value": r})
 
         # If no group_by, collapse to aggregates
         if not group_cols and rows_out:
