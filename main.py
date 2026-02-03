@@ -1,6 +1,8 @@
 # main.py
 from fastapi import FastAPI
 
+import os
+
 from core.logging import logger  # IMPORTANT: initializes logging early
 
 from db import Base, engine, SessionLocal
@@ -44,7 +46,10 @@ def create_app() -> FastAPI:
     app.include_router(notify_router)
     app.include_router(websearch_router)
     app.include_router(dbquery_router)
-    app.include_router(concepts_router)
+
+    # Concept codes (semantic tags) are optional and flag-gated
+    if (os.getenv("CONCEPTS_ENABLED", "0") or "0").strip() == "1":
+        app.include_router(concepts_router)
 
     # Admin settings + troubleshooting
     app.include_router(admin_settings_router)
