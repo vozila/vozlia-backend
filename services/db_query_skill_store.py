@@ -5,7 +5,7 @@ Public interfaces: create_db_query_skill, list_db_query_skills, delete_db_query_
 Reads/Writes: db_query_skills, scheduled_deliveries, user_settings (skills_config, skills_priority_order).
 Feature flags: DBQUERY_SCHEDULE_ENABLED (scheduling path).
 Failure mode: raises on invalid skill IDs; scheduling errors are handled upstream by callers.
-Last touched: 2026-02-01 (normalize schedule destinations to avoid placeholders)
+Last touched: 2026-02-03 (default email destination for schedules)
 """
 
 # NOTE (LEGACY / SLATED FOR REMOVAL)
@@ -36,8 +36,30 @@ from services.settings_service import (
     set_skills_priority_order,
 )
 from core.logging import logger
-from services.delivery_destination import resolve_delivery_destination
 from services.web_search_skill_store import compute_next_run_at
+
+
+def _normalize_destination(channel: DeliveryChannel, destination: str, user: User) -> str:
+    """Normalize schedule destination.
+
+    Fixes a known UX bug where callers passed destination='email' as a placeholder.
+    For email schedules, we default to the tenant owner's email when destination is missing/invalid.
+    """
+    dest = (destination or "").strip()
+
+    if channel == DeliveryChannel.email:
+        # Basic sanity: must look like an email address.
+        if dest and "@" in dest:
+            return dest
+
+        owner_email = (getattr(user, "email", "") or "").strip()
+        if owner_email and "@" in owner_email:
+            return owner_email
+
+        raise ValueError("Email destination is required (no default owner email available)")
+
+    # For non-email channels, preserve existing behavior (callers must provide a destination).
+    return dest
 
 
 def _skill_key_for(skill: DBQuerySkill) -> str:
@@ -182,16 +204,12 @@ def upsert_daily_schedule_dbquery(
     if not skill:
         raise ValueError(f"DBQuerySkill not found for id={sid}")
 
-    # Destination safety: prevent placeholder destinations like destination='email'.
-    resolved_dest, _reason = resolve_delivery_destination(channel=channel, destination=destination, user=user)
-    if not resolved_dest:
-        raise ValueError(f"Invalid destination for channel={channel}: {destination!r}")
-    destination = resolved_dest
-
     skill_key = f"dbquery_{skill.id}"
     time_of_day = f"{int(hour):02d}:{int(minute):02d}"
     tz = (timezone or "America/New_York").strip() or "America/New_York"
     next_run_at = compute_next_run_at(hour=int(hour), minute=int(minute), timezone=tz)
+
+    destination = _normalize_destination(channel, destination, user)
 
     row = (
         db.query(ScheduledDelivery)

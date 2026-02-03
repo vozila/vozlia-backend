@@ -1,11 +1,11 @@
 """VOZLIA FILE PURPOSE
-Purpose: Deterministic, tenant-scoped DBQuery execution (safe-field registry + bounded filters) used by dbquery_* dynamic skills and scheduled deliveries.
-Hot path: no (called from /assistant/route and background workers; do not call from realtime audio frame loops)
-Public interfaces: run_db_query(spec, tenant_uuid)
-Reads/Writes: reads from whitelisted tables via SQLAlchemy; no writes.
-Feature flags: DB_QUERY_MAX_SPOKEN_CHARS (limits summary size)
-Failure mode: returns ok=false with spoken_summary on validation/unsupported fields.
-Last touched: 2026-02-01 (add deterministic has_concept filter + keep scalarized summaries)
+Purpose: Deterministic, tenant-scoped DBQuery runner (admin + scheduler support). Single-table queries only.
+Hot path: no
+Public interfaces: services.run_db_query (called by /admin/dbquery/run and DBQuery skill runtime).
+Reads/Writes: reads analytics tables; no writes.
+Feature flags: DB_QUERY_MAX_SPOKEN_CHARS (summary size), CONCEPTS_ENABLED (enables has_concept filter).
+Failure mode: returns DBQueryResult(ok=false, ...) on validation/exec errors; never raises raw exceptions to callers.
+Last touched: 2026-02-03 (flatten aggregate Row results to avoid tuple formatting)
 """
 
 # NOTE (LEGACY / SLATED FOR REMOVAL)
@@ -22,17 +22,42 @@ Last touched: 2026-02-01 (add deterministic has_concept filter + keep scalarized
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
+from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import and_, func
+from sqlalchemy import and_, func, cast, String as SAString
+from sqlalchemy.sql import exists
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
 from core.logging import logger
+
+
+def _concepts_enabled() -> bool:
+    # Default OFF. Turn on explicitly via env var.
+    return (os.getenv("CONCEPTS_ENABLED", "0") or "0").strip() == "1"
+
+
+# Map (entity, field) -> target_type for has_concept filters.
+# Fallback: if field == 'id' and entity endswith('s'), target_type = entity[:-1].
+_CONCEPT_TARGET_TYPE_MAP: dict[tuple[str, str], str] = {
+    ("kb_files", "id"): "kb_file",
+    ("kb_chunks", "id"): "kb_chunk",
+    # Convenience: allow retrieving kb_chunks for a concept-tagged kb_file.
+    ("kb_chunks", "file_id"): "kb_file",
+}
+
+
+def _concept_target_type(entity_key: str, field: str) -> str:
+    t = _CONCEPT_TARGET_TYPE_MAP.get((entity_key, field))
+    if t:
+        return t
+    if field == "id" and entity_key.endswith("s"):
+        return entity_key[:-1]
+    raise ValueError(f"has_concept is not configured for entity={entity_key} field={field}")
 
 
 # ---------------------------------------------------------------------------
@@ -127,14 +152,13 @@ class _EntityDef:
     tenant_is_uuid: bool = True
     created_at_field: str | None = "created_at"
     exclude_fields: Tuple[str, ...] = ()
-    concept_target_type: str | None = None
 
 
 def _entity_registry() -> dict[str, _EntityDef]:
     # Local imports to avoid import cycles
     from models import CallerMemoryEvent, WebSearchSkill, ScheduledDelivery, Task, KBDocument, KBFile, KBChunk
 
-    reg = {
+    return {
         # Long-term memory events (turns + skills)
         "caller_memory_events": _EntityDef(
             name="caller_memory_events",
@@ -143,7 +167,6 @@ def _entity_registry() -> dict[str, _EntityDef]:
             tenant_is_uuid=False,
             created_at_field="created_at",
             exclude_fields=(),
-            concept_target_type="caller_memory_event",
         ),
         # Saved web search skills
         "web_search_skills": _EntityDef(
@@ -180,63 +203,25 @@ def _entity_registry() -> dict[str, _EntityDef]:
             tenant_is_uuid=True,
             created_at_field="created_at",
             exclude_fields=("storage_key",),  # internal storage path
-            concept_target_type="kb_document",
         ),
-
-        # KB files (Control Plane Phase 1)
+        # Control Plane KB files/chunks (owned by control plane; mirrored here for analytics queries)
         "kb_files": _EntityDef(
             name="kb_files",
             model=KBFile,
-            tenant_field="tenant_id",  # stored as string(uuid) in control plane
+            tenant_field="tenant_id",
             tenant_is_uuid=False,
             created_at_field="created_at",
-            exclude_fields=("storage_key",),  # internal storage path
-            concept_target_type="kb_file",
+            exclude_fields=("storage_key",),
         ),
-        # KB text chunks (Control Plane Phase 2)
         "kb_chunks": _EntityDef(
             name="kb_chunks",
             model=KBChunk,
-            tenant_field="tenant_id",  # UUID
+            tenant_field="tenant_id",
             tenant_is_uuid=True,
             created_at_field="created_at",
             exclude_fields=(),
-            concept_target_type="kb_chunk",
         ),
     }
-
-    # Optional: Concept Code tables (behind CONCEPTS_ENABLED).
-    v = (os.getenv("CONCEPTS_ENABLED") or "0").strip().lower()
-    if v in ("1", "true", "yes", "on"):
-        from models import ConceptDefinition, ConceptAssignment, ConceptBatch
-        reg.update({
-            "concept_definitions": _EntityDef(
-                name="concept_definitions",
-                model=ConceptDefinition,
-                tenant_field="tenant_id",
-                tenant_is_uuid=True,
-                created_at_field="created_at",
-                exclude_fields=(),
-            ),
-            "concept_assignments": _EntityDef(
-                name="concept_assignments",
-                model=ConceptAssignment,
-                tenant_field="tenant_id",
-                tenant_is_uuid=True,
-                created_at_field="created_at",
-                exclude_fields=(),
-            ),
-            "concept_batches": _EntityDef(
-                name="concept_batches",
-                model=ConceptBatch,
-                tenant_field="tenant_id",
-                tenant_is_uuid=True,
-                created_at_field="created_at",
-                exclude_fields=(),
-            ),
-        })
-
-    return reg
 
 
 def supported_entities() -> dict[str, dict[str, Any]]:
@@ -250,91 +235,9 @@ def supported_entities() -> dict[str, dict[str, Any]]:
             "fields": sorted(allowed),
             "created_at_field": ed.created_at_field,
             "tenant_field": ed.tenant_field,
-            "concept_target_type": ed.concept_target_type,
         }
     return out
 
-
-
-def _concepts_enabled() -> bool:
-    v = (os.getenv("CONCEPTS_ENABLED") or "0").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-_CONCEPT_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
-
-
-def _parse_concept_codes(f: DBFilter) -> list[str]:
-    """Extract concept codes from a DBFilter used with op='has_concept'."""
-    codes: list[str] = []
-    if isinstance(f.values, list) and f.values:
-        codes = [str(x) for x in f.values]
-    elif isinstance(f.value, str) and f.value.strip():
-        codes = [f.value.strip()]
-    elif isinstance(f.value, dict):
-        # Accept {"concept_code": "menu.steak"} or {"concept_codes": ["menu.steak", ...]}
-        if isinstance(f.value.get("concept_codes"), list):
-            codes = [str(x) for x in f.value.get("concept_codes") if str(x).strip()]
-        elif isinstance(f.value.get("concept_code"), str):
-            codes = [str(f.value.get("concept_code")).strip()]
-    # Validate
-    codes = [c for c in codes if c]
-    if not codes:
-        raise ValueError("has_concept requires a concept_code (value) or concept_codes (values)")
-    bad = [c for c in codes if not _CONCEPT_CODE_RE.match(c)]
-    if bad:
-        raise ValueError(f"Invalid concept_code(s): {', '.join(bad[:3])}")
-    return codes
-
-
-def _apply_concept_filters(
-    *,
-    tenant_uuid: str,
-    ed: _EntityDef,
-    model: Any,
-    q,
-    concept_filters: list[DBFilter],
-    allowed_fields: set[str],
-):
-    """Apply concept-based filters using a safe EXISTS subquery."""
-    if not concept_filters:
-        return q
-    if not _concepts_enabled():
-        raise ValueError("Concept filters are not enabled (set CONCEPTS_ENABLED=1).")
-    if not ed.concept_target_type:
-        raise ValueError(f"Entity '{ed.name}' does not support concept filters.")
-
-    # Concept tables are tenant-scoped by UUID; coerce tenant id to UUID.
-    try:
-        from uuid import UUID
-        tenant_uuid_obj = UUID(str(tenant_uuid))
-    except Exception:
-        raise ValueError("Invalid tenant id for concept filters.")
-
-    from sqlalchemy import String as SAString, cast, select
-    from models import ConceptAssignment
-
-    for f in concept_filters:
-        field = (f.field or "").strip()
-        if not field or field not in allowed_fields:
-            raise ValueError(f"Unsupported field for has_concept: {field}")
-        col = getattr(model, field)
-
-        codes = _parse_concept_codes(f)
-
-        sub = (
-            select(1)
-            .select_from(ConceptAssignment)
-            .where(
-                ConceptAssignment.tenant_id == tenant_uuid_obj,
-                ConceptAssignment.target_type == ed.concept_target_type,
-                ConceptAssignment.target_id == cast(col, SAString),
-                ConceptAssignment.concept_code.in_(codes),
-            )
-        )
-        q = q.filter(sub.exists())
-
-    return q
 
 # ---------------------------------------------------------------------------
 # Execution
@@ -397,7 +300,15 @@ def _resolve_time_window(tf: DBTimeframe, *, now_utc: datetime) -> tuple[datetim
     return (start_utc, end_utc)
 
 
-def _apply_filters(model: Any, q, filters: list[DBFilter], allowed_fields: set[str]):
+def _apply_filters(
+    model: Any,
+    q,
+    filters: list[DBFilter],
+    allowed_fields: set[str],
+    *,
+    tenant_uuid: UUID,
+    entity_key: str,
+):
     clauses = []
     for f in filters or []:
         field = (f.field or "").strip()
@@ -421,19 +332,42 @@ def _apply_filters(model: Any, q, filters: list[DBFilter], allowed_fields: set[s
         elif op == "contains":
             clauses.append(col.like(f"%{f.value}%"))
         elif op == "icontains":
-            clauses.append(col.ilike(f"%{f.value}%"))
+            clauses.append(func.lower(col).like(f"%{str(f.value).lower()}%"))
         elif op == "in":
-            vals = f.values if isinstance(f.values, list) else ([f.value] if f.value is not None else [])
-            clauses.append(col.in_(vals))
+            vs = f.values or []
+            clauses.append(col.in_(vs))
         elif op == "between":
-            vals = f.values if isinstance(f.values, list) else None
-            if not vals or len(vals) != 2:
-                raise ValueError("between requires values=[low, high]")
-            clauses.append(col.between(vals[0], vals[1]))
+            vs = f.values or []
+            if len(vs) != 2:
+                raise ValueError("between requires exactly 2 values")
+            clauses.append(col.between(vs[0], vs[1]))
         elif op == "is_null":
             clauses.append(col.is_(None))
         elif op == "not_null":
             clauses.append(col.is_not(None))
+        elif op == "has_concept":
+            if not _concepts_enabled():
+                raise ValueError("has_concept requires CONCEPTS_ENABLED=1")
+
+            concept_code = str(f.value or "").strip()
+            if not concept_code:
+                raise ValueError("has_concept requires value=concept_code")
+
+            target_type = _concept_target_type(entity_key, field)
+
+            # Local import avoids circular imports in legacy module
+            from models import ConceptAssignment
+
+            clauses.append(
+                exists().where(
+                    and_(
+                        ConceptAssignment.tenant_id == tenant_uuid,
+                        ConceptAssignment.target_type == target_type,
+                        ConceptAssignment.target_id == cast(col, SAString),
+                        ConceptAssignment.concept_code == concept_code,
+                    )
+                )
+            )
         else:
             raise ValueError(f"Unsupported op: {op}")
 
@@ -488,17 +422,7 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
     # Filters
     try:
-        normal_filters = [f for f in (parsed.filters or []) if f.op != "has_concept"]
-        concept_filters = [f for f in (parsed.filters or []) if f.op == "has_concept"]
-        q = _apply_filters(model, q, normal_filters, allowed_fields=allowed_fields)
-        q = _apply_concept_filters(
-            tenant_uuid=str(tenant_uuid),
-            ed=ed,
-            model=model,
-            q=q,
-            concept_filters=concept_filters,
-            allowed_fields=allowed_fields,
-        )
+        q = _apply_filters(model, q, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=UUID(str(tenant_uuid)), entity_key=entity_key)
     except Exception as e:
         return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=str(e))
 
@@ -544,7 +468,7 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
                 q2 = q2.filter(getattr(model, ed.created_at_field) >= start)
             if end and ed.created_at_field in allowed_fields:
                 q2 = q2.filter(getattr(model, ed.created_at_field) < end)
-        q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields)
+        q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=UUID(str(tenant_uuid)), entity_key=entity_key)
 
         if group_cols:
             q2 = q2.group_by(*group_cols)
@@ -569,39 +493,33 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
         raw_rows = q2.all()
         for r in raw_rows:
-            # SQLAlchemy can return tuple() or Row() depending on version/dialect.
-            d: dict[str, Any] = {}
-
-            # Preferred: Row has a _mapping we can convert to a dict keyed by labels.
+            # SQLAlchemy may return:
+            # - Row objects (v1.4+/2.0) with a ._mapping of selected labels
+            # - plain tuples (older behavior)
+            # - ORM instances (rare in this branch)
             if hasattr(r, "_mapping"):
-                try:
-                    m = dict(getattr(r, "_mapping") or {})
-                except Exception:
-                    m = {}
-                # Keep a stable subset (group_by keys then aggregate labels)
-                for gb in parsed.group_by or []:
-                    if gb in m:
-                        d[gb] = m.get(gb)
-                for ac in agg_cols:
-                    if ac.key in m:
-                        d[ac.key] = m.get(ac.key)
-                if d:
-                    rows_out.append(d)
-                    continue
+                d = dict(getattr(r, "_mapping"))  # type: ignore[arg-type]
+                # JSON-safe serialization for common types
+                for k, v in list(d.items()):
+                    if isinstance(v, datetime):
+                        d[k] = v.isoformat(timespec="seconds")
+                rows_out.append(d)
+                continue
 
-            # Fallback: treat as tuple (group_by values first, then aggs)
             if isinstance(r, tuple):
+                d: dict[str, Any] = {}
+                # group_by columns first
                 idx = 0
                 for gb in parsed.group_by or []:
-                    d[gb] = r[idx] if idx < len(r) else None
+                    d[gb] = r[idx]
                     idx += 1
                 for ac in agg_cols:
-                    d[ac.key] = r[idx] if idx < len(r) else None
+                    d[ac.key] = r[idx]
                     idx += 1
                 rows_out.append(d)
-            else:
-                # Last resort: store as value and let summarizer stringify.
-                rows_out.append({"value": r})
+                continue
+
+            rows_out.append({"value": r})
 
         # If no group_by, collapse to aggregates
         if not group_cols and rows_out:
@@ -656,26 +574,6 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
     return DBQueryResult(ok=True, entity=entity_key, count=int(cnt), rows=rows_out, aggregates=aggregates, spoken_summary=spoken)
 
 
-def _scalarize_value(v: Any) -> Any:
-    """
-    Convert annoying single-element containers like (0,) or Row(0) into scalars for human-readable output.
-    """
-    if v is None:
-        return None
-    # Tuples/lists like (0,) -> 0
-    if isinstance(v, (tuple, list)) and len(v) == 1:
-        return _scalarize_value(v[0])
-    # SQLAlchemy Row-like objects can be iterable; if they contain 1 value, scalarize.
-    if hasattr(v, "_mapping") or hasattr(v, "__iter__"):
-        try:
-            seq = list(v)  # type: ignore[arg-type]
-            if len(seq) == 1:
-                return _scalarize_value(seq[0])
-        except Exception:
-            pass
-    return v
-
-
 def _summarize_for_voice(entity: str, rows: list[dict], aggregates: dict | None) -> str:
     max_chars = int((os.getenv("DB_QUERY_MAX_SPOKEN_CHARS") or os.getenv("MAX_SPOKEN_CHARS") or "900").strip() or "900")
 
@@ -683,10 +581,7 @@ def _summarize_for_voice(entity: str, rows: list[dict], aggregates: dict | None)
         # Simple: speak key metrics
         parts = []
         for k, v in list(aggregates.items())[:6]:
-            vv = _scalarize_value(v)
-            if isinstance(vv, datetime):
-                vv = vv.isoformat(timespec="seconds")
-            parts.append(f"{k}: {vv}")
+            parts.append(f"{k}: {v}")
         out = f"Here’s what I found in {entity}: " + ", ".join(parts) + "."
     elif rows:
         # Speak first few rows lightly
@@ -696,10 +591,7 @@ def _summarize_for_voice(entity: str, rows: list[dict], aggregates: dict | None)
             # pick 2-3 fields
             items = []
             for k, v in list(r.items())[:3]:
-                vv = _scalarize_value(v)
-                if isinstance(vv, datetime):
-                    vv = vv.isoformat(timespec="seconds")
-                items.append(f"{k}={vv}")
+                items.append(f"{k}={v}")
             bulletish.append("; ".join(items))
         out = f"Here are the latest results from {entity}: " + " | ".join(bulletish)
         if len(rows) > 5:
