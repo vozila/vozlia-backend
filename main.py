@@ -5,7 +5,7 @@ Public interfaces: create_app(), app.
 Reads/Writes: DB schema init (Base.metadata.create_all), skills loader.
 Feature flags: HTTP_REQUEST_LOG_ENABLED, HTTP_CAPTURE_BODY_ON_ERROR, DYNAMIC_SKILLS_AUTOSYNC.
 Failure mode: never fails startup due to optional recovery paths (autosync is best-effort).
-Last touched: 2026-02-03 (add request_id + optional debug request logging middleware)
+Last touched: 2026-02-03 (mount concepts router + log 422 validation errors for admin debugging)
 """
 
 # main.py
@@ -16,6 +16,8 @@ from time import perf_counter
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from core.logging import logger  # IMPORTANT: initializes logging early
 from core.request_context import set_request_id, reset_request_id
@@ -32,6 +34,7 @@ from api.routers.kb import router as kb_router
 from api.routers.notify import router as notify_router
 from api.routers.websearch import router as websearch_router
 from api.routers.dbquery import router as dbquery_router
+from api.routers.concepts import router as concepts_router
 
 # Admin troubleshooting routes
 from api.routers.admin_settings import router as admin_settings_router
@@ -133,6 +136,38 @@ def create_app() -> FastAPI:
             pass
         return response
 
+
+    # -------------------------
+    # Validation error logging (captures 422s that never reach route handlers)
+    # -------------------------
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(request: Request, exc: RequestValidationError):
+        preview = None
+        if capture_body_on_error and request.url.path.startswith(capture_body_prefix):
+            try:
+                body = await request.body()
+                preview = body[:capture_body_max].decode('utf-8', errors='replace')
+            except Exception:
+                preview = None
+        try:
+            errs = exc.errors()
+        except Exception:
+            errs = []
+        # Keep logs small; errors can be large.
+        err_s = str(errs)
+        if len(err_s) > 1200:
+            err_s = err_s[:1197] + '...'
+        if preview is not None and len(preview) > 1200:
+            preview = preview[:1197] + '...'
+        logger.warning(
+            'HTTP_422_VALIDATION method=%s path=%s qs=%s errors=%s body_preview=%s',
+            request.method,
+            request.url.path,
+            request.url.query,
+            err_s,
+            preview,
+        )
+        return JSONResponse(status_code=422, content={'detail': errs})
     # -------------------------
     # Core routes
     # -------------------------
@@ -154,6 +189,7 @@ def create_app() -> FastAPI:
     app.include_router(notify_router)
     app.include_router(websearch_router)
     app.include_router(dbquery_router)
+    app.include_router(concepts_router)
 
     # Admin settings + troubleshooting
     app.include_router(admin_settings_router)
