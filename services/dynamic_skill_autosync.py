@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 import re
 from typing import Any, Tuple
 
@@ -171,6 +172,181 @@ def _merge_cfg(existing: dict[str, Any], desired: dict[str, Any]) -> Tuple[dict[
     return merged, changed
 
 
+def _legacy_migrate_enabled() -> bool:
+    """
+    Feature flag: migrate config-only dynamic skills into DB tables so they are
+    manageable in the web UI (create/delete/schedule).
+    """
+    return os.getenv("DYNAMIC_SKILL_LEGACY_MIGRATE_ENABLED", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _parse_uuid_from_skill_key(prefix: str, skill_key: str) -> uuid.UUID | None:
+    if not skill_key.startswith(prefix):
+        return None
+    raw = skill_key[len(prefix) :].strip()
+    try:
+        return uuid.UUID(raw)
+    except Exception:
+        return None
+
+
+def _normalize_db_skill_name(name: str) -> str:
+    raw = (name or "").strip()
+    if not raw:
+        return "DB: Query"
+    m = re.match(r"^db\s*:\s*(.*)$", raw, flags=re.IGNORECASE)
+    if m:
+        rest = (m.group(1) or "").strip()
+        return f"DB: {rest}" if rest else "DB:"
+    return f"DB: {raw}"
+
+
+def _migrate_legacy_dynamic_skills_to_db(db: Session, user: User, cfg: dict) -> int:
+    """
+    If a dynamic skill exists in skills_config but does not have a DB row (legacy),
+    create the DB row so it appears in /admin/* skills lists and becomes schedulable.
+
+    This is intentionally conservative:
+    - Only handles keys that look like 'websearch_<uuid>' or 'dbquery_<uuid>'.
+    - Only migrates entries with the expected shape ('type', 'query'/'spec', etc).
+    """
+    if not _legacy_migrate_enabled():
+        return 0
+
+    created = 0
+
+    # Local imports to avoid circulars at import time.
+    from models import ScheduledDelivery
+
+    # --- WebSearch legacy entries ---
+    for skill_key, entry in list(cfg.items()):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") != "web_search":
+            continue
+
+        sid = None
+        if entry.get("web_search_skill_id"):
+            try:
+                sid = uuid.UUID(str(entry["web_search_skill_id"]))
+            except Exception:
+                sid = None
+        if sid is None:
+            sid = _parse_uuid_from_skill_key("websearch_", skill_key)
+
+        if sid is None:
+            continue
+
+        exists = (
+            db.query(WebSearchSkill)
+            .filter(WebSearchSkill.tenant_id == user.id, WebSearchSkill.id == sid)
+            .first()
+        )
+        if exists:
+            continue
+
+        query = (entry.get("query") or entry.get("original_query") or "").strip()
+        if not query:
+            continue
+
+        name = (entry.get("label") or entry.get("name") or query[:80]).strip()
+        triggers = entry.get("triggers") or []
+
+        ws = WebSearchSkill(
+            id=sid,
+            tenant_id=user.id,
+            name=name,
+            query=query,
+            triggers=triggers,
+            enabled=bool(entry.get("enabled", True)),
+        )
+        db.add(ws)
+        created += 1
+
+        # Backfill config field (helps other tooling/UI)
+        entry["web_search_skill_id"] = str(sid)
+        cfg[skill_key] = entry
+
+        # Backfill schedules that were saved via skill_key only
+        db.query(ScheduledDelivery).filter(
+            ScheduledDelivery.tenant_id == user.id,
+            ScheduledDelivery.skill_key == skill_key,
+            ScheduledDelivery.web_search_skill_id.is_(None),
+        ).update({"web_search_skill_id": sid})
+
+        logger.info(
+            "DYNAMIC_SKILL_LEGACY_MIGRATE_CREATED type=web_search skill_key=%s web_search_skill_id=%s",
+            skill_key,
+            str(sid),
+        )
+
+    # --- DBQuery legacy entries ---
+    for skill_key, entry in list(cfg.items()):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") != "db_query":
+            continue
+
+        sid = None
+        if entry.get("db_query_skill_id"):
+            try:
+                sid = uuid.UUID(str(entry["db_query_skill_id"]))
+            except Exception:
+                sid = None
+        if sid is None:
+            sid = _parse_uuid_from_skill_key("dbquery_", skill_key)
+
+        if sid is None:
+            continue
+
+        exists = (
+            db.query(DBQuerySkill)
+            .filter(DBQuerySkill.tenant_id == user.id, DBQuerySkill.id == sid)
+            .first()
+        )
+        if exists:
+            continue
+
+        spec = entry.get("spec")
+        entity = entry.get("entity") or (spec.get("entity") if isinstance(spec, dict) else None)
+        if not entity or not isinstance(spec, dict):
+            continue
+
+        name_raw = (entry.get("label") or entry.get("name") or "").strip()
+        name = _normalize_db_skill_name(name_raw) if name_raw else "DB: Query"
+
+        dq = DBQuerySkill(
+            id=sid,
+            tenant_id=user.id,
+            name=name,
+            entity=str(entity),
+            spec_json=spec,
+            triggers=entry.get("engagement_phrases") or [],
+            enabled=bool(entry.get("enabled", True)),
+        )
+        db.add(dq)
+        created += 1
+
+        entry["db_query_skill_id"] = str(sid)
+        entry["entity"] = str(entity)
+        cfg[skill_key] = entry
+
+        logger.info(
+            "DYNAMIC_SKILL_LEGACY_MIGRATE_CREATED type=db_query skill_key=%s db_query_skill_id=%s",
+            skill_key,
+            str(sid),
+        )
+
+    if created:
+        db.commit()
+
+    return created
+
 def autosync_dynamic_skills(db: Session, user: User, *, force: bool = False) -> dict[str, Any]:
     """Sync DB rows into skills_config (best-effort).
 
@@ -180,6 +356,14 @@ def autosync_dynamic_skills(db: Session, user: User, *, force: bool = False) -> 
     cfg = get_skills_config(db, user) or {}
     if not isinstance(cfg, dict):
         cfg = {}
+
+    migrated = _migrate_legacy_dynamic_skills_to_db(db, user, cfg)
+    if migrated:
+        logger.info(
+            "DYNAMIC_SKILL_LEGACY_MIGRATE_SUMMARY tenant_id=%s created=%s",
+            str(user.id),
+            migrated,
+        )
 
     added = 0
     updated = 0

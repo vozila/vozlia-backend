@@ -63,6 +63,13 @@ def get_setting(db: Session, user: User, key: str) -> dict:
 
 
 def set_setting(db: Session, user: User, key: str, value: dict) -> None:
+    # NOTE: `skills_config` has historically been stored in two shapes:
+    #  A) {"skills": {<skill_key>: {...}}}
+    #  B) {<skill_key>: {...}}
+    # We standardize writes to shape A to prevent control-plane/UI merges from
+    # accidentally dropping dynamic skills.
+    if key == "skills_config" and isinstance(value, dict) and "skills" not in value:
+        value = {"skills": value}
     row = _get_setting_row(db, user, key)
     if row:
         row.value = value or {}

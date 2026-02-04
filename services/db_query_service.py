@@ -5,7 +5,7 @@ Public interfaces: DBQuerySpec, run_db_query(), supported_entities().
 Reads/Writes: tenant-scoped SELECTs over approved entities.
 Feature flags: DBQUERY_TRACE, DBQUERY_TRACE_SQL (debug only).
 Failure mode: returns ok=false with safe summary; never writes.
-Last touched: 2026-02-03 (add has_concept filter + kb_files/kb_chunks entities + concept trace logging)
+Last touched: 2026-02-03 (add debug trace logs + request correlation)
 """
 
 # NOTE (LEGACY / SLATED FOR REMOVAL)
@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import and_, func, select, cast, String as SAString
+from sqlalchemy import and_, func, cast, String, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
@@ -223,16 +223,16 @@ def _entity_registry() -> dict[str, _EntityDef]:
             created_at_field="created_at",
             exclude_fields=("storage_key",),  # internal storage path
         ),
-        # KB files (uploaded via control plane)
+
+        # KB files + chunks (used by concept-tagging + chunk-level analytics)
         "kb_files": _EntityDef(
             name="kb_files",
             model=KBFile,
             tenant_field="tenant_id",
-            tenant_is_uuid=False,
+            tenant_is_uuid=True,
             created_at_field="created_at",
-            exclude_fields=("storage_key",),  # internal storage path
+            exclude_fields=(),
         ),
-        # KB chunks (ingested text for retrieval/analytics)
         "kb_chunks": _EntityDef(
             name="kb_chunks",
             model=KBChunk,
@@ -320,29 +320,15 @@ def _resolve_time_window(tf: DBTimeframe, *, now_utc: datetime) -> tuple[datetim
     return (start_utc, end_utc)
 
 
-
-# -------------------------
-# Concept filter support (deterministic joins via concept_assignments)
-# -------------------------
-
-def _concepts_enabled() -> bool:
-    return _truthy_env('CONCEPTS_ENABLED', '0')
-
-
-# Map (entity, field) -> concept_assignments.target_type
-# Example: querying kb_chunks where file_id has_concept('menu.steak') means:
-#   kb_chunks.file_id IN (select target_id from concept_assignments where target_type='kb_file' and concept_code='menu.steak')
-_CONCEPT_TARGET_MAP: dict[tuple[str, str], str] = {
-    ('kb_files', 'id'): 'kb_file',
-    ('kb_chunks', 'id'): 'kb_chunk',
-    ('kb_chunks', 'file_id'): 'kb_file',
-}
-
-
-def _concept_target_type(entity_key: str, field: str) -> str | None:
-    return _CONCEPT_TARGET_MAP.get((entity_key, field))
-
-def _apply_filters(model: Any, q, filters: list[DBFilter], allowed_fields: set[str], *, entity_key: str, tenant_uuid_obj):
+def _apply_filters(
+    model: Any,
+    q,
+    filters: list[DBFilter],
+    allowed_fields: set[str],
+    *,
+    tenant_uuid: UUID | None = None,
+    entity_key: str | None = None,
+):
     clauses = []
     for f in filters or []:
         field = (f.field or "").strip()
@@ -380,32 +366,51 @@ def _apply_filters(model: Any, q, filters: list[DBFilter], allowed_fields: set[s
         elif op == "not_null":
             clauses.append(col.is_not(None))
         elif op == "has_concept":
-            if not _concepts_enabled():
-                raise ValueError("Concepts are disabled")
-            concept_code = (str(f.value) if f.value is not None else "").strip()
+            # Concept membership filter (polymorphic targets via concept_assignments).
+            # NOTE: This is intentionally narrow: we only support entity/field pairs
+            # we actually use today, to avoid surprising behavior.
+            if tenant_uuid is None:
+                raise ValueError("has_concept requires tenant_uuid")
+            if not entity_key:
+                raise ValueError("has_concept requires entity_key")
+
+            concept_code = str(f.value or "").strip()
             if not concept_code:
-                raise ValueError("has_concept requires value=<concept_code>")
-            target_type = _concept_target_type(entity_key, field)
+                raise ValueError("has_concept requires a non-empty concept_code in `value`")
+
+            # Map (entity, field) to a concept_assignments.target_type
+            target_type: str | None = None
+            if entity_key == "kb_chunks":
+                if field == "id":
+                    target_type = "kb_chunk"
+                elif field == "file_id":
+                    target_type = "kb_file"
+            elif entity_key in ("kb_files", "kb_documents"):
+                if field == "id":
+                    target_type = "kb_file"
+
             if not target_type:
-                raise ValueError(f"has_concept not supported for {entity_key}.{field}")
-            if tenant_uuid_obj is None:
-                raise ValueError("Invalid tenant UUID for has_concept")
-            # Local import to avoid cycles
-            from models import ConceptAssignment
-            subq = select(ConceptAssignment.target_id).where(
-                ConceptAssignment.tenant_id == tenant_uuid_obj,
-                ConceptAssignment.target_type == target_type,
-                ConceptAssignment.concept_code == concept_code,
+                raise ValueError(f"has_concept unsupported for entity={entity_key} field={field}")
+
+            from models import ConceptAssignment  # local import to avoid circulars
+
+            logger.info(
+                "DBQUERY_HAS_CONCEPT entity=%s field=%s target_type=%s concept=%s",
+                entity_key,
+                field,
+                target_type,
+                concept_code,
             )
-            clauses.append(cast(col, SAString).in_(subq))
-            if _dbquery_trace_enabled():
-                logger.info(
-                    "DBQUERY_HAS_CONCEPT entity=%s field=%s target_type=%s concept=%s",
-                    entity_key,
-                    field,
-                    target_type,
-                    _safe_short(concept_code),
+
+            subq = (
+                select(ConceptAssignment.target_id)
+                .where(
+                    ConceptAssignment.tenant_id == tenant_uuid,
+                    ConceptAssignment.target_type == target_type,
+                    ConceptAssignment.concept_code == concept_code,
                 )
+            )
+            clauses.append(cast(col, String).in_(subq))
         else:
             raise ValueError(f"Unsupported op: {op}")
 
@@ -446,15 +451,6 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
         tenant_val = str(tenant_uuid)
     tenant_col = getattr(model, ed.tenant_field)
 
-    # UUID form of tenant id (used by concept_assignments which stores tenant_id as UUID).
-    tenant_uuid_obj = None
-    try:
-        from uuid import UUID
-        tenant_uuid_obj = UUID(str(tenant_uuid))
-    except Exception:
-        tenant_uuid_obj = None
-
-
     q = db.query(model).filter(tenant_col == tenant_val)
 
     if _dbquery_trace_enabled():
@@ -483,7 +479,14 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
     # Filters
     try:
-        q = _apply_filters(model, q, parsed.filters, allowed_fields=allowed_fields, entity_key=entity_key, tenant_uuid_obj=tenant_uuid_obj)
+        q = _apply_filters(
+            model,
+            q,
+            parsed.filters,
+            allowed_fields=allowed_fields,
+            tenant_uuid=tenant_uuid,
+            entity_key=parsed.entity,
+        )
 
         if _dbquery_trace_sql_enabled():
             try:
@@ -536,7 +539,14 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
                 q2 = q2.filter(getattr(model, ed.created_at_field) >= start)
             if end and ed.created_at_field in allowed_fields:
                 q2 = q2.filter(getattr(model, ed.created_at_field) < end)
-        q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields, entity_key=entity_key, tenant_uuid_obj=tenant_uuid_obj)
+        q2 = _apply_filters(
+            model,
+            q2,
+            parsed.filters,
+            allowed_fields=allowed_fields,
+            tenant_uuid=tenant_uuid,
+            entity_key=parsed.entity,
+        )
 
         if group_cols:
             q2 = q2.group_by(*group_cols)

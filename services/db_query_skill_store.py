@@ -22,6 +22,7 @@ Last touched: 2026-02-03 (default email destination for schedules)
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from uuid import UUID
 
 from typing import Any, List
@@ -60,6 +61,31 @@ def _normalize_destination(channel: DeliveryChannel, destination: str, user: Use
 
     # For non-email channels, preserve existing behavior (callers must provide a destination).
     return dest
+
+
+def _normalize_db_skill_name(name: str) -> str:
+    """Normalize DB-query skill names for display and UI search.
+
+    We use a prefix similar to websearch skills (e.g. 'WebSearch: ...').
+    Convention: 'DB: <Natural Language Skill Name>'.
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return "DB:"
+
+    # Accept either 'DB:' or 'DB :' from callers and normalize to 'DB:'.
+    m = re.match(r"^db\s*:\s*(.*)$", raw, flags=re.IGNORECASE)
+    if m:
+        rest = (m.group(1) or "").strip()
+        return f"DB: {rest}" if rest else "DB:"
+
+    return f"DB: {raw}"
+
+
+
+def normalize_db_skill_name(name: str) -> str:
+    """Public alias for DB skill name normalization."""
+    return _normalize_db_skill_name(name)
 
 
 def _skill_key_for(skill: DBQuerySkill) -> str:
@@ -110,14 +136,15 @@ def create_db_query_skill(
     entity: str,
     spec: dict[str, Any],
     triggers: List[str] | None = None,
+    enabled: bool = True,
 ) -> DBQuerySkill:
     skill = DBQuerySkill(
         tenant_id=user.id,
-        name=(name or "").strip() or "DB Query",
+        name=_normalize_db_skill_name((name or "").strip()) if (name or "").strip() else "DB: Query",
         entity=(entity or "").strip() or "caller_memory_events",
         spec=(spec or {}),
         triggers=(triggers or []),
-        enabled=True,
+        enabled=bool(enabled),
     )
     db.add(skill)
     db.commit()
@@ -177,6 +204,7 @@ def upsert_daily_schedule_dbquery(
     timezone: str,
     channel: DeliveryChannel,
     destination: str,
+    enabled: bool = True,
 ) -> ScheduledDelivery:
     """
     Create or update a daily ScheduledDelivery for a DBQuery skill.
@@ -218,7 +246,7 @@ def upsert_daily_schedule_dbquery(
         .first()
     )
     if row:
-        row.enabled = True
+        row.enabled = bool(enabled)
         row.cadence = DeliveryCadence.daily
         row.time_of_day = time_of_day
         row.timezone = tz
@@ -231,7 +259,7 @@ def upsert_daily_schedule_dbquery(
             tenant_id=user.id,
             web_search_skill_id=None,
             skill_key=skill_key,
-            enabled=True,
+            enabled=bool(enabled),
             cadence=DeliveryCadence.daily,
             time_of_day=time_of_day,
             timezone=tz,
