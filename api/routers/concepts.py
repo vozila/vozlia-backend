@@ -5,7 +5,7 @@ Public interfaces: /admin/concepts/definitions, /admin/concepts/assignments
 Reads/Writes: concept_definitions, concept_assignments, concept_batches
 Feature flags: CONCEPTS_ENABLED (default OFF)
 Failure mode: returns HTTP 4xx for validation/auth; never writes without admin key.
-Last touched: 2026-02-03 (initial concept code MVP endpoints)
+Last touched: 2026-02-03 (concept assignment idempotency + safe errors)
 """
 
 from __future__ import annotations
@@ -17,6 +17,9 @@ from typing import Any, Optional, List, Dict
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+
+from core.logging import logger
 
 from api.deps.admin_key import require_admin_key
 from deps import get_db
@@ -199,6 +202,7 @@ def create_assignment(
             batch_uuid = UUID(payload.batch_id)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid batch_id (must be UUID)")
+
     d = (
         db.query(ConceptDefinition)
         .filter(ConceptDefinition.tenant_id == user.id, ConceptDefinition.concept_code == code)
@@ -207,14 +211,92 @@ def create_assignment(
     if not d:
         raise HTTPException(status_code=404, detail=f"Concept definition not found: {code}")
 
-    locked = bool(payload.locked) if payload.locked is not None else (payload.source.strip() == "manual")
+    target_type = payload.target_type.strip()
+    target_id = payload.target_id.strip()
+    source = payload.source.strip()
+
+    # Idempotency: if an identical assignment already exists, return it.
+    # Manual overrides always win:
+    # - manual POST upgrades an existing llm_auto assignment to manual+locked
+    # - llm_auto POST never overwrites locked/manual assignments
+    existing = (
+        db.query(ConceptAssignment)
+        .filter(
+            ConceptAssignment.tenant_id == user.id,
+            ConceptAssignment.target_type == target_type,
+            ConceptAssignment.target_id == target_id,
+            ConceptAssignment.concept_code == code,
+        )
+        .first()
+    )
+    if existing:
+        upgraded = False
+        if source == "manual":
+            if existing.source != "manual":
+                existing.source = "manual"
+                upgraded = True
+            if not existing.locked:
+                existing.locked = True
+                upgraded = True
+
+            # If caller provides rationale/evidence, merge it (manual edits are auditable).
+            if payload.rationale is not None:
+                existing.rationale = payload.rationale
+                upgraded = True
+            if payload.evidence_json:
+                merged = dict(existing.evidence_json or {})
+                merged.update(payload.evidence_json or {})
+                existing.evidence_json = merged
+                upgraded = True
+
+            if upgraded:
+                existing.updated_at = datetime.utcnow()
+                db.commit()
+                db.refresh(existing)
+
+        elif bool(existing.locked):
+            # Locked/manual assignment exists; do not overwrite.
+            pass
+        else:
+            # Non-locked assignment exists; keep idempotent and return as-is.
+            pass
+
+        logger.info(
+            "CONCEPT_ASSIGNMENT_EXISTS tenant_id=%s target_type=%s target_id=%s concept_code=%s source_in=%s source_existing=%s locked=%s upgraded=%s",
+            str(existing.tenant_id),
+            existing.target_type,
+            existing.target_id,
+            existing.concept_code,
+            source,
+            existing.source,
+            bool(existing.locked),
+            upgraded,
+        )
+
+        return ConceptAssignmentOut(
+            id=str(existing.id),
+            tenant_id=str(existing.tenant_id),
+            target_type=existing.target_type,
+            target_id=existing.target_id,
+            concept_code=existing.concept_code,
+            source=existing.source,
+            confidence=existing.confidence,
+            rationale=existing.rationale,
+            evidence_json=dict(existing.evidence_json or {}),
+            locked=bool(existing.locked),
+            batch_id=str(existing.batch_id) if existing.batch_id else None,
+            created_at=existing.created_at.isoformat(),
+            updated_at=existing.updated_at.isoformat(),
+        )
+
+    locked = bool(payload.locked) if payload.locked is not None else (source == "manual")
 
     row = ConceptAssignment(
         tenant_id=user.id,
-        target_type=payload.target_type.strip(),
-        target_id=payload.target_id.strip(),
+        target_type=target_type,
+        target_id=target_id,
         concept_code=code,
-        source=payload.source.strip(),
+        source=source,
         confidence=payload.confidence,
         rationale=payload.rationale,
         evidence_json=payload.evidence_json or {},
@@ -224,9 +306,53 @@ def create_assignment(
     db.add(row)
     try:
         db.commit()
-    except Exception as e:
+    except IntegrityError:
+        # Race-safe idempotency: if we lost a race to create, fetch and return the winner.
         db.rollback()
-        raise HTTPException(status_code=400, detail=f"Failed to create assignment: {e}")
+        winner = (
+            db.query(ConceptAssignment)
+            .filter(
+                ConceptAssignment.tenant_id == user.id,
+                ConceptAssignment.target_type == target_type,
+                ConceptAssignment.target_id == target_id,
+                ConceptAssignment.concept_code == code,
+            )
+            .first()
+        )
+        if winner:
+            logger.info(
+                "CONCEPT_ASSIGNMENT_RACE tenant_id=%s target_type=%s target_id=%s concept_code=%s",
+                str(winner.tenant_id),
+                winner.target_type,
+                winner.target_id,
+                winner.concept_code,
+            )
+            return ConceptAssignmentOut(
+                id=str(winner.id),
+                tenant_id=str(winner.tenant_id),
+                target_type=winner.target_type,
+                target_id=winner.target_id,
+                concept_code=winner.concept_code,
+                source=winner.source,
+                confidence=winner.confidence,
+                rationale=winner.rationale,
+                evidence_json=dict(winner.evidence_json or {}),
+                locked=bool(winner.locked),
+                batch_id=str(winner.batch_id) if winner.batch_id else None,
+                created_at=winner.created_at.isoformat(),
+                updated_at=winner.updated_at.isoformat(),
+            )
+        raise HTTPException(status_code=409, detail="Concept assignment already exists")
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "CONCEPT_ASSIGNMENT_CREATE_FAILED tenant_id=%s target_type=%s target_id=%s concept_code=%s",
+            str(user.id),
+            target_type,
+            target_id,
+            code,
+        )
+        raise HTTPException(status_code=400, detail="Failed to create assignment")
 
     db.refresh(row)
 
@@ -245,3 +371,4 @@ def create_assignment(
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
+
