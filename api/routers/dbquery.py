@@ -82,7 +82,7 @@ def admin_dbquery_list_skills(db: Session = Depends(get_db)):
         {
             "id": str(s.id),
             "skill_key": f"dbquery_{s.id}",
-            "name": s.name,
+            "name": normalize_db_skill_name(s.name),
             "entity": s.entity,
             "spec": s.spec or {},
             "triggers": s.triggers or [],
@@ -130,6 +130,7 @@ class DBQueryScheduleUpsertIn(BaseModel):
     timezone: str = "America/New_York"
     channel: DeliveryChannel
     destination: str = Field(..., min_length=3)
+    enabled: bool = True
 
 
 class DBQueryScheduledDeliveryOut(BaseModel):
@@ -184,6 +185,7 @@ def admin_dbquery_upsert_schedule(payload: DBQueryScheduleUpsertIn, db: Session 
         timezone=payload.timezone,
         channel=payload.channel,
         destination=payload.destination,
+        enabled=payload.enabled,
     )
     sk = (row.skill_key or "").strip()
     raw_id = sk.replace("dbquery_", "", 1) if sk.startswith("dbquery_") else ""
