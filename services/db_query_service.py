@@ -5,7 +5,7 @@ Public interfaces: DBQuerySpec, run_db_query(), supported_entities().
 Reads/Writes: tenant-scoped SELECTs over approved entities.
 Feature flags: DBQUERY_TRACE, DBQUERY_TRACE_SQL (debug only).
 Failure mode: returns ok=false with safe summary; never writes.
-Last touched: 2026-02-06 (add KBFile/KBChunk/ConceptAssignment entities for has_concept + wizard)
+Last touched: 2026-02-06 (harden run_db_query error handling; support DBFilter.values for in/between)
 """
 
 # NOTE (LEGACY / SLATED FOR REMOVAL)
@@ -433,13 +433,15 @@ def _apply_filters(
                 raise ValueError("icontains requires value")
             clauses.append(col.ilike(f"%{value}%"))
         elif op == "in":
-            if not isinstance(value, list):
-                raise ValueError("in requires list value")
-            clauses.append(col.in_(value))
+            vals = value if isinstance(value, list) else (f.values if isinstance(getattr(f, "values", None), list) else None)
+            if not isinstance(vals, list):
+                raise ValueError("in requires list value (use value=[...] or values=[...])")
+            clauses.append(col.in_(vals))
         elif op == "between":
-            if not (isinstance(value, list) and len(value) == 2):
-                raise ValueError("between requires [low, high]")
-            clauses.append(col.between(value[0], value[1]))
+            vals = value if isinstance(value, list) else (f.values if isinstance(getattr(f, "values", None), list) else None)
+            if not (isinstance(vals, list) and len(vals) == 2):
+                raise ValueError("between requires [low, high] (use value=[low,high] or values=[low,high])")
+            clauses.append(col.between(vals[0], vals[1]))
         elif op == "is_null":
             clauses.append(col.is_(None))
         elif op == "not_null":
@@ -455,208 +457,235 @@ def _apply_filters(
 
 def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> DBQueryResult:
     """Run a tenant-scoped DB query from a validated spec (single-table only)."""
+
+    entity_guess = str((spec or {}).get("entity") if isinstance(spec, dict) else "unknown")
+
     try:
         parsed = spec if isinstance(spec, DBQuerySpec) else DBQuerySpec.model_validate(spec)
     except ValidationError as e:
-        return DBQueryResult(ok=False, entity=str((spec or {}).get("entity") if isinstance(spec, dict) else "unknown"), count=0, rows=[], aggregates=None, spoken_summary=f"Invalid query spec: {e}")
-
-    entity_key = parsed.entity.strip()
-    reg = _entity_registry()
-    if entity_key not in reg:
-        return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported entity: {entity_key}")
-
-    ed = reg[entity_key]
-    model = ed.model
-
-    # Determine allowed fields dynamically from SQLAlchemy model columns
-    cols = [c.name for c in model.__table__.columns]  # type: ignore[attr-defined]
-    allowed_fields = set([c for c in cols if c not in set(ed.exclude_fields or ())])
-
-    # Base query with tenant filter
-    # Tenant column type differs across tables (UUID vs string).
-    tenant_val = None
-    if ed.tenant_is_uuid:
-        try:
-            from uuid import UUID
-            tenant_val = UUID(str(tenant_uuid))
-        except Exception:
-            tenant_val = str(tenant_uuid)
-    else:
-        tenant_val = str(tenant_uuid)
-    tenant_col = getattr(model, ed.tenant_field)
-
-    q = db.query(model).filter(tenant_col == tenant_val)
-
-    if _dbquery_trace_enabled():
-        logger.info(
-            "DBQUERY_RUN entity=%s tenant=%s select=%s filters=%s timeframe=%s group_by=%s aggs=%s order_by=%s limit=%s",
-            entity_key,
-            _safe_short(tenant_val),
-            _safe_short(parsed.select),
-            _filters_summary(parsed.filters),
-            _safe_short(parsed.timeframe.model_dump() if parsed.timeframe else None),
-            _safe_short(parsed.group_by),
-            _safe_short([a.model_dump() for a in (parsed.aggregations or [])]) if parsed.aggregations else None,
-            _safe_short([o.model_dump() for o in (parsed.order_by or [])]) if parsed.order_by else None,
-            parsed.limit,
+        return DBQueryResult(
+            ok=False,
+            entity=entity_guess,
+            count=0,
+            rows=[],
+            aggregates=None,
+            spoken_summary=f"Invalid query spec: {e}",
         )
 
-    now_utc = _now_utc()
+    entity_key = (parsed.entity or "").strip() or entity_guess
 
-    # Time window
-    if parsed.timeframe and ed.created_at_field and parsed.timeframe:
-        start, end = _resolve_time_window(parsed.timeframe, now_utc=now_utc)
-        if start and ed.created_at_field in allowed_fields:
-            q = q.filter(getattr(model, ed.created_at_field) >= start)
-        if end and ed.created_at_field in allowed_fields:
-            q = q.filter(getattr(model, ed.created_at_field) < end)
-
-    # Filters
     try:
-        q = _apply_filters(model, q, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=tenant_uuid, entity_key=entity_key)
+        reg = _entity_registry()
+        if entity_key not in reg:
+            return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported entity: {entity_key}")
 
-        if _dbquery_trace_sql_enabled():
+        ed = reg[entity_key]
+        model = ed.model
+
+        # Determine allowed fields dynamically from SQLAlchemy model columns
+        cols = [c.name for c in model.__table__.columns]  # type: ignore[attr-defined]
+        allowed_fields = set([c for c in cols if c not in set(ed.exclude_fields or ())])
+
+        # Base query with tenant filter
+        # Tenant column type differs across tables (UUID vs string).
+        if ed.tenant_is_uuid:
             try:
-                logger.info("DBQUERY_SQL entity=%s sql=%s", entity_key, str(q.statement))
+                from uuid import UUID
+
+                tenant_val = UUID(str(tenant_uuid))
             except Exception:
-                pass
-    except Exception as e:
-        logger.exception("DBQUERY_FILTERS_FAIL entity=%s err=%s", entity_key, e)
-        return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=str(e))
+                tenant_val = str(tenant_uuid)
+        else:
+            tenant_val = str(tenant_uuid)
 
-    # Group-by / aggregations
-    aggregates: dict[str, Any] | None = None
-    rows_out: list[dict] = []
+        tenant_col = getattr(model, ed.tenant_field)
+        q = db.query(model).filter(tenant_col == tenant_val)
 
-    if parsed.aggregations:
-        group_cols = []
-        for gb in parsed.group_by or []:
-            if gb not in allowed_fields:
-                return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported group_by field: {gb}")
-            group_cols.append(getattr(model, gb))
+        if _dbquery_trace_enabled():
+            logger.info(
+                "DBQUERY_RUN entity=%s tenant=%s select=%s filters=%s timeframe=%s group_by=%s aggs=%s order_by=%s limit=%s",
+                entity_key,
+                _safe_short(tenant_val),
+                _safe_short(parsed.select),
+                _filters_summary(parsed.filters),
+                _safe_short(parsed.timeframe.model_dump() if parsed.timeframe else None),
+                _safe_short(parsed.group_by),
+                _safe_short([a.model_dump() for a in (parsed.aggregations or [])]) if parsed.aggregations else None,
+                _safe_short([o.model_dump() for o in (parsed.order_by or [])]) if parsed.order_by else None,
+                parsed.limit,
+            )
 
-        agg_cols = []
-        for a in parsed.aggregations:
-            as_name = (a.as_name or "").strip() or f"{a.op}_{a.field or 'all'}"
-            if a.op == "count":
-                agg_cols.append(func.count().label(as_name))
-            elif a.op == "count_distinct":
-                if not a.field or a.field not in allowed_fields:
-                    return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported aggregation field: {a.field}")
-                agg_cols.append(func.count(getattr(model, a.field).distinct()).label(as_name))
-            else:
-                if not a.field or a.field not in allowed_fields:
-                    return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported aggregation field: {a.field}")
-                col = getattr(model, a.field)
-                if a.op == "sum":
-                    agg_cols.append(func.sum(col).label(as_name))
-                elif a.op == "avg":
-                    agg_cols.append(func.avg(col).label(as_name))
-                elif a.op == "min":
-                    agg_cols.append(func.min(col).label(as_name))
-                elif a.op == "max":
-                    agg_cols.append(func.max(col).label(as_name))
-                else:
-                    return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported aggregation op: {a.op}")
+        now_utc = _now_utc()
 
-        q2 = db.query(*group_cols, *agg_cols).select_from(model).filter(tenant_col == tenant_val)
-        if parsed.timeframe and ed.created_at_field and parsed.timeframe:
+        # Time window
+        if parsed.timeframe and ed.created_at_field:
             start, end = _resolve_time_window(parsed.timeframe, now_utc=now_utc)
             if start and ed.created_at_field in allowed_fields:
-                q2 = q2.filter(getattr(model, ed.created_at_field) >= start)
+                q = q.filter(getattr(model, ed.created_at_field) >= start)
             if end and ed.created_at_field in allowed_fields:
-                q2 = q2.filter(getattr(model, ed.created_at_field) < end)
-        q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=tenant_uuid, entity_key=entity_key)
+                q = q.filter(getattr(model, ed.created_at_field) < end)
 
-        if group_cols:
-            q2 = q2.group_by(*group_cols)
+        # Filters (shared)
+        try:
+            q = _apply_filters(model, q, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=tenant_uuid, entity_key=entity_key)
 
-        # ordering for aggregated queries: if order_by not given, order by first agg desc
-        if parsed.order_by:
-            for ob in parsed.order_by:
-                if ob.field in allowed_fields:
-                    col = getattr(model, ob.field)
-                    q2 = q2.order_by(col.asc() if ob.direction == "asc" else col.desc())
+            if _dbquery_trace_sql_enabled():
+                try:
+                    logger.info("DBQUERY_SQL entity=%s sql=%s", entity_key, str(q.statement))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.exception("DBQUERY_FILTERS_FAIL entity=%s err=%s", entity_key, e)
+            return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=str(e))
+
+        # Group-by / aggregations
+        aggregates: dict[str, Any] | None = None
+        rows_out: list[dict] = []
+
+        if parsed.aggregations:
+            group_cols = []
+            for gb in parsed.group_by or []:
+                if gb not in allowed_fields:
+                    return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported group_by field: {gb}")
+                group_cols.append(getattr(model, gb))
+
+            agg_cols = []
+            for a in parsed.aggregations:
+                as_name = (a.as_name or "").strip() or f"{a.op}_{a.field or 'all'}"
+                if a.op == "count":
+                    agg_cols.append(func.count().label(as_name))
+                elif a.op == "count_distinct":
+                    if not a.field or a.field not in allowed_fields:
+                        return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported aggregation field: {a.field}")
+                    agg_cols.append(func.count(getattr(model, a.field).distinct()).label(as_name))
                 else:
-                    # allow ordering by agg label
+                    if not a.field or a.field not in allowed_fields:
+                        return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported aggregation field: {a.field}")
+                    col = getattr(model, a.field)
+                    if a.op == "sum":
+                        agg_cols.append(func.sum(col).label(as_name))
+                    elif a.op == "avg":
+                        agg_cols.append(func.avg(col).label(as_name))
+                    elif a.op == "min":
+                        agg_cols.append(func.min(col).label(as_name))
+                    elif a.op == "max":
+                        agg_cols.append(func.max(col).label(as_name))
+                    else:
+                        return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"Unsupported aggregation op: {a.op}")
+
+            try:
+                q2 = db.query(*group_cols, *agg_cols).select_from(model).filter(tenant_col == tenant_val)
+
+                if parsed.timeframe and ed.created_at_field:
+                    start, end = _resolve_time_window(parsed.timeframe, now_utc=now_utc)
+                    if start and ed.created_at_field in allowed_fields:
+                        q2 = q2.filter(getattr(model, ed.created_at_field) >= start)
+                    if end and ed.created_at_field in allowed_fields:
+                        q2 = q2.filter(getattr(model, ed.created_at_field) < end)
+
+                q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=tenant_uuid, entity_key=entity_key)
+
+                if group_cols:
+                    q2 = q2.group_by(*group_cols)
+
+                # ordering for aggregated queries: if order_by not given, order by first agg desc
+                if parsed.order_by:
+                    for ob in parsed.order_by:
+                        if ob.field in allowed_fields:
+                            col = getattr(model, ob.field)
+                            q2 = q2.order_by(col.asc() if ob.direction == "asc" else col.desc())
+                        else:
+                            # allow ordering by agg label
+                            for ac in agg_cols:
+                                if ac.key == ob.field:
+                                    q2 = q2.order_by(ac.asc() if ob.direction == "asc" else ac.desc())
+                                    break
+                else:
+                    if agg_cols:
+                        q2 = q2.order_by(agg_cols[0].desc())
+
+                q2 = q2.limit(parsed.limit)
+
+                raw_rows = q2.all()
+            except Exception as e:
+                logger.exception("DBQUERY_AGG_FAIL entity=%s err=%s", entity_key, e)
+                return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=str(e))
+
+            for r in raw_rows:
+                # SQLAlchemy returns tuples when selecting columns
+                if isinstance(r, tuple):
+                    d: dict[str, Any] = {}
+                    idx = 0
+                    for gb in parsed.group_by or []:
+                        d[gb] = r[idx]
+                        idx += 1
                     for ac in agg_cols:
-                        if ac.key == ob.field:
-                            q2 = q2.order_by(ac.asc() if ob.direction == "asc" else ac.desc())
-                            break
-        else:
-            if agg_cols:
-                q2 = q2.order_by(agg_cols[0].desc())
-
-        q2 = q2.limit(parsed.limit)
-
-        raw_rows = q2.all()
-        for r in raw_rows:
-            # SQLAlchemy returns tuples when selecting columns
-            if isinstance(r, tuple):
-                d: dict[str, Any] = {}
-                # group_by columns first
-                idx = 0
-                for gb in parsed.group_by or []:
-                    d[gb] = r[idx]
-                    idx += 1
-                for ac in agg_cols:
-                    d[ac.key] = r[idx]
-                    idx += 1
-                rows_out.append(d)
-            else:
-                rows_out.append({"value": r})
-
-        # If no group_by, collapse to aggregates
-        if not group_cols and rows_out:
-            aggregates = dict(rows_out[0])
-            rows_out = []
-
-    else:
-        # Row listing
-        select_fields = parsed.select or []
-        # default: choose a few safe, common fields
-        if not select_fields:
-            select_fields = [f for f in ("id", ed.created_at_field or "", "caller_id", "skill_key", "status", "name") if f and f in allowed_fields][:5]
-
-        # enforce allowed
-        clean_fields = [f for f in select_fields if f in allowed_fields]
-
-        # order_by
-        if parsed.order_by:
-            for ob in parsed.order_by:
-                if ob.field in allowed_fields:
-                    col = getattr(model, ob.field)
-                    q = q.order_by(col.asc() if ob.direction == "asc" else col.desc())
-        else:
-            # default newest first if we have created_at
-            if ed.created_at_field and ed.created_at_field in allowed_fields:
-                q = q.order_by(getattr(model, ed.created_at_field).desc())
-
-        q = q.limit(parsed.limit)
-        rows = q.all()
-
-        for row in rows:
-            d = {}
-            for f in clean_fields:
-                v = getattr(row, f, None)
-                if isinstance(v, datetime):
-                    d[f] = v.isoformat(timespec="seconds")
+                        d[ac.key] = r[idx]
+                        idx += 1
+                    rows_out.append(d)
                 else:
-                    d[f] = v
-            rows_out.append(d)
+                    rows_out.append({"value": r})
 
-    # Count: for aggregated queries without rows, use 1; else row length; else full count
-    try:
-        if aggregates is not None:
-            cnt = 1
+            # If no group_by, collapse to aggregates
+            if not group_cols and rows_out:
+                aggregates = dict(rows_out[0])
+                rows_out = []
+
         else:
-            cnt = len(rows_out)
-    except Exception:
-        cnt = 0
+            # Row listing
+            select_fields = parsed.select or []
+            # default: choose a few safe, common fields
+            if not select_fields:
+                select_fields = [f for f in ("id", ed.created_at_field or "", "caller_id", "skill_key", "status", "name") if f and f in allowed_fields][:5]
 
-    spoken = _summarize_for_voice(entity_key, rows_out, aggregates)
+            # enforce allowed
+            clean_fields = [f for f in select_fields if f in allowed_fields]
 
-    return DBQueryResult(ok=True, entity=entity_key, count=int(cnt), rows=rows_out, aggregates=aggregates, spoken_summary=spoken)
+            # order_by
+            if parsed.order_by:
+                for ob in parsed.order_by:
+                    if ob.field in allowed_fields:
+                        col = getattr(model, ob.field)
+                        q = q.order_by(col.asc() if ob.direction == "asc" else col.desc())
+            else:
+                # default newest first if we have created_at
+                if ed.created_at_field and ed.created_at_field in allowed_fields:
+                    q = q.order_by(getattr(model, ed.created_at_field).desc())
+
+            q = q.limit(parsed.limit)
+
+            try:
+                rows = q.all()
+            except Exception as e:
+                logger.exception("DBQUERY_SELECT_FAIL entity=%s err=%s", entity_key, e)
+                return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=str(e))
+
+            for row in rows:
+                d = {}
+                for f in clean_fields:
+                    v = getattr(row, f, None)
+                    if isinstance(v, datetime):
+                        d[f] = v.isoformat(timespec="seconds")
+                    else:
+                        d[f] = v
+                rows_out.append(d)
+
+        # Count: for aggregated queries without rows, use 1; else row length
+        try:
+            if aggregates is not None:
+                cnt = 1
+            else:
+                cnt = len(rows_out)
+        except Exception:
+            cnt = 0
+
+        spoken = _summarize_for_voice(entity_key, rows_out, aggregates)
+
+        return DBQueryResult(ok=True, entity=entity_key, count=int(cnt), rows=rows_out, aggregates=aggregates, spoken_summary=spoken)
+
+    except Exception as e:
+        logger.exception("DBQUERY_RUN_FAIL entity=%s err=%s", entity_key, e)
+        return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=f"DBQuery failed: {_safe_short(e)}")
 
 
 def _summarize_for_voice(entity: str, rows: list[dict], aggregates: dict | None) -> str:
