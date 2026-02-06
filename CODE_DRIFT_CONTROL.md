@@ -191,7 +191,7 @@ Add entries like:
   - Invariants: only whitelisted entities/fields; always tenant-scoped; time presets are bounded; no writes.
   - Concepts: optional deterministic `has_concept` filter compiles to EXISTS() against concept_assignments (no embeddings).
   - Flags: `CONCEPTS_ENABLED`, `DB_QUERY_MAX_SPOKEN_CHARS`
-  - Last touched: 2026-02-06 (re-add kb_files/kb_chunks/concept_assignments entities; enables wizard + has_concept end-to-end)
+  - Last touched: 2026-02-06 (fix dbquery aggregation Row serialization to avoid 500; re-add kb_files/kb_chunks/concept_assignments entities)
 
 - `backend/api/routers/concepts.py`
   - Purpose: Admin CRUD endpoints for concept definitions + assignments (auditable concept codes).
