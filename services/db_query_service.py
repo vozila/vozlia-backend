@@ -5,7 +5,7 @@ Public interfaces: DBQuerySpec, run_db_query(), supported_entities().
 Reads/Writes: tenant-scoped SELECTs over approved entities.
 Feature flags: DBQUERY_TRACE, DBQUERY_TRACE_SQL (debug only).
 Failure mode: returns ok=false with safe summary; never writes.
-Last touched: 2026-02-06 (harden run_db_query error handling; support DBFilter.values for in/between)
+Last touched: 2026-02-06 (fix aggregation Row serialization to prevent 500; support DBFilter.values for in/between)
 """
 
 # NOTE (LEGACY / SLATED FOR REMOVAL)
@@ -61,6 +61,56 @@ def _safe_short(v: Any, *, max_len: int = 120) -> str:
     if len(s) > max_len:
         return s[: max_len - 3] + "..."
     return s
+
+
+
+def _json_safe(v: Any) -> Any:
+    """Best-effort conversion to JSON-serializable primitives for API responses."""
+    if v is None:
+        return None
+    try:
+        # NOTE: imported as `datetime` (class) above
+        if isinstance(v, datetime):
+            return v.isoformat(timespec="seconds")
+    except Exception:
+        pass
+    try:
+        import uuid
+
+        if isinstance(v, uuid.UUID):
+            return str(v)
+    except Exception:
+        pass
+    try:
+        import decimal
+
+        if isinstance(v, decimal.Decimal):
+            # Preserve integers exactly when possible.
+            try:
+                if v == v.to_integral_value():
+                    return int(v)
+            except Exception:
+                pass
+            return float(v)
+    except Exception:
+        pass
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            return v.decode("utf-8", errors="replace")
+        except Exception:
+            return str(v)
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _json_safe(val) for k, val in v.items()}
+    # SQLAlchemy Row / RowMapping objects
+    if hasattr(v, "_mapping"):
+        try:
+            m = dict(v._mapping)  # type: ignore[attr-defined]
+            return {str(k): _json_safe(val) for k, val in m.items()}
+        except Exception:
+            return _safe_short(v)
+    return v
 
 
 def _filters_summary(filters: list[DBFilter]) -> list[dict[str, str]]:
@@ -612,19 +662,19 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
                 return DBQueryResult(ok=False, entity=entity_key, count=0, rows=[], aggregates=None, spoken_summary=str(e))
 
             for r in raw_rows:
-                # SQLAlchemy returns tuples when selecting columns
-                if isinstance(r, tuple):
+                # SQLAlchemy commonly returns Row objects (tuple-like but not tuple instances).
+                if isinstance(r, (tuple, list)) or hasattr(r, "_mapping"):
                     d: dict[str, Any] = {}
                     idx = 0
                     for gb in parsed.group_by or []:
-                        d[gb] = r[idx]
+                        d[gb] = _json_safe(r[idx])
                         idx += 1
                     for ac in agg_cols:
-                        d[ac.key] = r[idx]
+                        d[ac.key] = _json_safe(r[idx])
                         idx += 1
                     rows_out.append(d)
                 else:
-                    rows_out.append({"value": r})
+                    rows_out.append({"value": _json_safe(r)})
 
             # If no group_by, collapse to aggregates
             if not group_cols and rows_out:
