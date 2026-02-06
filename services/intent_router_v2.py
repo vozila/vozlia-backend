@@ -6,7 +6,7 @@ Public interfaces: maybe_route_and_execute, maybe_consume_disambiguation_choice.
 Reads/Writes: user_settings (skills_config), scheduled_deliveries (via stores), session_store.
 Feature flags: INTENT_V2_MODE, INTENT_V2_SCHEDULE_ENABLED, DBQUERY_SCHEDULE_ENABLED.
 Failure mode: falls back to legacy routing; scheduling failures return safe errors.
-Last touched: 2026-01-31 (extend scheduling to dbquery dynamic skills behind flag)
+Last touched: 2026-02-06 (fix on-demand dynamic skill autosync for DBQuery/WebSearch candidates)
 """
 
 # (legacy module docs removed to keep __future__ import valid)
@@ -35,6 +35,11 @@ try:
     from openai import OpenAI
 except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore
+
+
+# Best-effort cache to avoid repeated autosync writes when the caller says activation keywords
+# like 'skill' or 'report'. Keyed by tenant/user id (string).
+_DYNAMIC_SKILLS_AUTOSYNC_LAST: dict[str, float] = {}
 
 
 # ----------------------------
@@ -207,32 +212,33 @@ def allow_dynamic_skill_candidate(utterance: str, *, score: float, reason: str) 
     if not (utterance or "").strip():
         return True
     if utterance_has_activation_keyword(utterance):
-        return True
-
-    # Without activation keywords, allow only explicit mentions.
-    if score >= 90.0:
-        return True
-    r = (reason or "")
-    if r.startswith("label_substring") or r.startswith("trigger_substring"):
-        return True
-    return False
-
-
-def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
-    """Collect + score candidates from skills_config (dynamic skills) and YAML registry (legacy)."""
-    # If the caller is explicitly asking for a skill/report, make sure dynamic skills
-    # have been merged into skills_config (prevents "only legacy skills" regressions).
-    if utterance_has_activation_keyword(utterance):
         try:
-            tenant_key = str(getattr(user, "tenant_id", "") or "")
-            now = time.time()
-            last = _DYNAMIC_SKILLS_AUTOSYNC_LAST.get(tenant_key, 0.0)
-            if tenant_key and (now - last) > 60.0:
-                from services.dynamic_skill_autosync import DynamicSkillAutoSync
-                did = DynamicSkillAutoSync(db).auto_sync_dynamic_skills(tenant_key)
-                _DYNAMIC_SKILLS_AUTOSYNC_LAST[tenant_key] = now
-                if did:
-                    logger.info("DYNAMIC_SKILLS_AUTOSYNC_ON_DEMAND tenant=%s", tenant_key)
+            # Ensure dynamic DB-backed skills are present in skills_config before scoring candidates.
+            # This prevents regressions where only legacy/YAML skills appear after deploy/rollback.
+            from services.dynamic_skill_autosync import autosync_dynamic_skills, dynamic_skills_autosync_enabled
+
+            if dynamic_skills_autosync_enabled():
+                tenant_key = str(getattr(user, "id", "") or getattr(user, "tenant_id", "") or "")
+                now = time.time()
+                last = _DYNAMIC_SKILLS_AUTOSYNC_LAST.get(tenant_key, 0.0)
+                if tenant_key and (now - last) > 60.0:
+                    out_sync = autosync_dynamic_skills(db, user, force=False)
+                    try:
+                        db.commit()
+                    except Exception:
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+                        raise
+                    _DYNAMIC_SKILLS_AUTOSYNC_LAST[tenant_key] = now
+                    if isinstance(out_sync, dict) and (out_sync.get("added") or out_sync.get("updated")):
+                        logger.info(
+                            "DYNAMIC_SKILLS_AUTOSYNC_ON_DEMAND tenant=%s added=%s updated=%s",
+                            tenant_key,
+                            out_sync.get("added"),
+                            out_sync.get("updated"),
+                        )
         except Exception as e:
             logger.warning("DYNAMIC_SKILLS_AUTOSYNC_ON_DEMAND_FAIL err=%s", str(e))
 

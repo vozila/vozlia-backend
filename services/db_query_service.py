@@ -5,7 +5,7 @@ Public interfaces: DBQuerySpec, run_db_query(), supported_entities().
 Reads/Writes: tenant-scoped SELECTs over approved entities.
 Feature flags: DBQUERY_TRACE, DBQUERY_TRACE_SQL (debug only).
 Failure mode: returns ok=false with safe summary; never writes.
-Last touched: 2026-02-03 (add debug trace logs + request correlation)
+Last touched: 2026-02-06 (add KBFile/KBChunk/ConceptAssignment entities for has_concept + wizard)
 """
 
 # NOTE (LEGACY / SLATED FOR REMOVAL)
@@ -222,6 +222,33 @@ def _entity_registry() -> dict[str, _EntityDef]:
             tenant_is_uuid=True,
             created_at_field="created_at",
             exclude_fields=("storage_key",),  # internal storage path
+        ),
+        # KB files (control plane mirrored table; ids are string UUIDs)
+        "kb_files": _EntityDef(
+            name="kb_files",
+            model=KBFile,
+            tenant_field="tenant_id",
+            tenant_is_uuid=False,  # stored as string(uuid)
+            created_at_field="created_at",
+            exclude_fields=("storage_bucket", "storage_key"),
+        ),
+        # KB chunks (tenant_id is UUID)
+        "kb_chunks": _EntityDef(
+            name="kb_chunks",
+            model=KBChunk,
+            tenant_field="tenant_id",
+            tenant_is_uuid=True,
+            created_at_field="created_at",
+            exclude_fields=(),
+        ),
+        # Concept assignments (used by has_concept filter; also useful for admin audits)
+        "concept_assignments": _EntityDef(
+            name="concept_assignments",
+            model=ConceptAssignment,
+            tenant_field="tenant_id",
+            tenant_is_uuid=True,
+            created_at_field="created_at",
+            exclude_fields=(),
         ),
     }
 
