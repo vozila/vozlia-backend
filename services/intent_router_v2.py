@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
@@ -219,46 +220,25 @@ def allow_dynamic_skill_candidate(utterance: str, *, score: float, reason: str) 
 
 def build_skill_candidates(db, user, utterance: str) -> List[SkillCandidate]:
     """Collect + score candidates from skills_config (dynamic skills) and YAML registry (legacy)."""
+    # If the caller is explicitly asking for a skill/report, make sure dynamic skills
+    # have been merged into skills_config (prevents "only legacy skills" regressions).
+    if utterance_has_activation_keyword(utterance):
+        try:
+            tenant_key = str(getattr(user, "tenant_id", "") or "")
+            now = time.time()
+            last = _DYNAMIC_SKILLS_AUTOSYNC_LAST.get(tenant_key, 0.0)
+            if tenant_key and (now - last) > 60.0:
+                from services.dynamic_skill_autosync import DynamicSkillAutoSync
+                did = DynamicSkillAutoSync(db).auto_sync_dynamic_skills(tenant_key)
+                _DYNAMIC_SKILLS_AUTOSYNC_LAST[tenant_key] = now
+                if did:
+                    logger.info("DYNAMIC_SKILLS_AUTOSYNC_ON_DEMAND tenant=%s", tenant_key)
+        except Exception as e:
+            logger.warning("DYNAMIC_SKILLS_AUTOSYNC_ON_DEMAND_FAIL err=%s", str(e))
+
     cfg_all = get_skills_config(db, user) or {}
     if not isinstance(cfg_all, dict):
         cfg_all = {}
-
-    # If the user is explicitly trying to invoke a dynamic skill (via keyword),
-    # but the config appears to have no dynamic skills, attempt an on-demand autosync.
-    # This prevents regressions where the control-plane/UI overwrites skills_config.
-    if allow_dynamic_skill_candidate(utterance, cfg_all):
-        has_dynamic = False
-        for k, v in cfg_all.items():
-            if isinstance(v, dict) and v.get("type") in ("web_search", "db_query"):
-                has_dynamic = True
-                break
-            if isinstance(k, str) and (k.startswith("websearch_") or k.startswith("dbquery_")):
-                has_dynamic = True
-                break
-
-        if not has_dynamic and os.getenv("INTENT_V2_AUTOSYNC_ON_DYNAMIC_MISS", "1").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
-            try:
-                from services.dynamic_skill_autosync import autosync_dynamic_skills
-
-                logger.info(
-                    "INTENT_V2_AUTOSYNC_ON_MISS tenant_id=%s reason=no_dynamic_in_cfg",
-                    str(user.id),
-                )
-                autosync_dynamic_skills(db, user)
-                cfg_all = get_skills_config(db, user) or {}
-                if not isinstance(cfg_all, dict):
-                    cfg_all = {}
-            except Exception as e:
-                logger.warning(
-                    "INTENT_V2_AUTOSYNC_FAILED tenant_id=%s err=%s",
-                    str(user.id),
-                    repr(e),
-                )
 
     out: List[SkillCandidate] = []
 

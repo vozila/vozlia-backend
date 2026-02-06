@@ -175,7 +175,7 @@ class _EntityDef:
 
 def _entity_registry() -> dict[str, _EntityDef]:
     # Local imports to avoid import cycles
-    from models import CallerMemoryEvent, WebSearchSkill, ScheduledDelivery, Task, KBDocument, KBFile, KBChunk
+    from models import CallerMemoryEvent, WebSearchSkill, ScheduledDelivery, Task, KBDocument, KBFile, KBChunk, ConceptAssignment
 
     return {
         # Long-term memory events (turns + skills)
@@ -222,24 +222,6 @@ def _entity_registry() -> dict[str, _EntityDef]:
             tenant_is_uuid=True,
             created_at_field="created_at",
             exclude_fields=("storage_key",),  # internal storage path
-        ),
-
-        # KB files + chunks (used by concept-tagging + chunk-level analytics)
-        "kb_files": _EntityDef(
-            name="kb_files",
-            model=KBFile,
-            tenant_field="tenant_id",
-            tenant_is_uuid=True,
-            created_at_field="created_at",
-            exclude_fields=(),
-        ),
-        "kb_chunks": _EntityDef(
-            name="kb_chunks",
-            model=KBChunk,
-            tenant_field="tenant_id",
-            tenant_is_uuid=True,
-            created_at_field="created_at",
-            exclude_fields=(),
         ),
     }
 
@@ -324,98 +306,123 @@ def _apply_filters(
     model: Any,
     q,
     filters: list[DBFilter],
-    allowed_fields: set[str],
+    allowed_fields: list[str],
     *,
-    tenant_uuid: UUID | None = None,
+    tenant_uuid: str | None = None,
     entity_key: str | None = None,
 ):
+    """Apply DBQuery filters.
+
+    - For normal ops (eq, lt, icontains, etc.) we validate `field` against `allowed_fields`.
+    - For `has_concept`, we join through ConceptAssignment by subquery:
+        * kb_chunks.id    -> target_type=kb_chunk
+        * kb_chunks.file_id -> target_type=kb_file
+        * kb_files.id     -> target_type=kb_file
+    """
+    if not filters:
+        return q
+
+    from models import ConceptAssignment
+
     clauses = []
-    for f in filters or []:
-        field = (f.field or "").strip()
-        if not field or field not in allowed_fields:
-            raise ValueError(f"Unsupported field: {field}")
-        col = getattr(model, field)
 
+    for f in filters:
+        field = f.field
         op = f.op
-        if op == "eq":
-            clauses.append(col == f.value)
-        elif op == "ne":
-            clauses.append(col != f.value)
-        elif op == "lt":
-            clauses.append(col < f.value)
-        elif op == "lte":
-            clauses.append(col <= f.value)
-        elif op == "gt":
-            clauses.append(col > f.value)
-        elif op == "gte":
-            clauses.append(col >= f.value)
-        elif op == "contains":
-            clauses.append(col.like(f"%{f.value}%"))
-        elif op == "icontains":
-            clauses.append(col.ilike(f"%{f.value}%"))
-        elif op == "in":
-            vals = f.values if isinstance(f.values, list) else ([f.value] if f.value is not None else [])
-            clauses.append(col.in_(vals))
-        elif op == "between":
-            vals = f.values if isinstance(f.values, list) else None
-            if not vals or len(vals) != 2:
-                raise ValueError("between requires values=[low, high]")
-            clauses.append(col.between(vals[0], vals[1]))
-        elif op == "is_null":
-            clauses.append(col.is_(None))
-        elif op == "not_null":
-            clauses.append(col.is_not(None))
-        elif op == "has_concept":
-            # Concept membership filter (polymorphic targets via concept_assignments).
-            # NOTE: This is intentionally narrow: we only support entity/field pairs
-            # we actually use today, to avoid surprising behavior.
-            if tenant_uuid is None:
-                raise ValueError("has_concept requires tenant_uuid")
-            if not entity_key:
-                raise ValueError("has_concept requires entity_key")
+        value = f.value
 
-            concept_code = str(f.value or "").strip()
-            if not concept_code:
-                raise ValueError("has_concept requires a non-empty concept_code in `value`")
+        if field not in allowed_fields:
+            raise ValueError(f"Filter field '{field}' not allowed for this entity")
 
-            # Map (entity, field) to a concept_assignments.target_type
-            target_type: str | None = None
+        # Special filter op: has_concept
+        if op == "has_concept":
+            if not tenant_uuid:
+                raise ValueError("has_concept requires tenant_uuid context")
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("has_concept value must be a non-empty concept_code string")
+
+            concept_code = value.strip()
+
+            target_type = None
+            field_expr = None
+
             if entity_key == "kb_chunks":
                 if field == "id":
                     target_type = "kb_chunk"
+                    field_expr = cast(getattr(model, "id"), String)
                 elif field == "file_id":
                     target_type = "kb_file"
-            elif entity_key in ("kb_files", "kb_documents"):
+                    field_expr = cast(getattr(model, "file_id"), String)
+            elif entity_key == "kb_files":
                 if field == "id":
                     target_type = "kb_file"
+                    field_expr = cast(getattr(model, "id"), String)
 
-            if not target_type:
+            if not target_type or field_expr is None:
                 raise ValueError(f"has_concept unsupported for entity={entity_key} field={field}")
 
-            from models import ConceptAssignment  # local import to avoid circulars
-
             logger.info(
-                "DBQUERY_HAS_CONCEPT entity=%s field=%s target_type=%s concept=%s",
+                "DBQUERY_HAS_CONCEPT entity=%s field=%s target_type=%s concept_code=%s tenant=%s",
                 entity_key,
                 field,
                 target_type,
                 concept_code,
+                tenant_uuid,
             )
 
             subq = (
                 select(ConceptAssignment.target_id)
-                .where(
-                    ConceptAssignment.tenant_id == tenant_uuid,
-                    ConceptAssignment.target_type == target_type,
-                    ConceptAssignment.concept_code == concept_code,
-                )
+                .where(ConceptAssignment.tenant_id == tenant_uuid)
+                .where(ConceptAssignment.target_type == target_type)
+                .where(ConceptAssignment.concept_code == concept_code)
             )
-            clauses.append(cast(col, String).in_(subq))
+
+            clauses.append(field_expr.in_(subq))
+            continue
+
+        # Normal ops
+        col = getattr(model, field, None)
+        if col is None:
+            raise ValueError(f"Unknown field: {field}")
+
+        if op == "eq":
+            clauses.append(col == value)
+        elif op == "ne":
+            clauses.append(col != value)
+        elif op == "lt":
+            clauses.append(col < value)
+        elif op == "lte":
+            clauses.append(col <= value)
+        elif op == "gt":
+            clauses.append(col > value)
+        elif op == "gte":
+            clauses.append(col >= value)
+        elif op == "contains":
+            if value is None:
+                raise ValueError("contains requires value")
+            clauses.append(col.like(f"%{value}%"))
+        elif op == "icontains":
+            if value is None:
+                raise ValueError("icontains requires value")
+            clauses.append(col.ilike(f"%{value}%"))
+        elif op == "in":
+            if not isinstance(value, list):
+                raise ValueError("in requires list value")
+            clauses.append(col.in_(value))
+        elif op == "between":
+            if not (isinstance(value, list) and len(value) == 2):
+                raise ValueError("between requires [low, high]")
+            clauses.append(col.between(value[0], value[1]))
+        elif op == "is_null":
+            clauses.append(col.is_(None))
+        elif op == "not_null":
+            clauses.append(col.is_not(None))
         else:
             raise ValueError(f"Unsupported op: {op}")
 
     if clauses:
         q = q.filter(and_(*clauses))
+
     return q
 
 
@@ -479,14 +486,7 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
     # Filters
     try:
-        q = _apply_filters(
-            model,
-            q,
-            parsed.filters,
-            allowed_fields=allowed_fields,
-            tenant_uuid=tenant_uuid,
-            entity_key=parsed.entity,
-        )
+        q = _apply_filters(model, q, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=tenant_uuid, entity_key=entity_key)
 
         if _dbquery_trace_sql_enabled():
             try:
@@ -539,14 +539,7 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
                 q2 = q2.filter(getattr(model, ed.created_at_field) >= start)
             if end and ed.created_at_field in allowed_fields:
                 q2 = q2.filter(getattr(model, ed.created_at_field) < end)
-        q2 = _apply_filters(
-            model,
-            q2,
-            parsed.filters,
-            allowed_fields=allowed_fields,
-            tenant_uuid=tenant_uuid,
-            entity_key=parsed.entity,
-        )
+        q2 = _apply_filters(model, q2, parsed.filters, allowed_fields=allowed_fields, tenant_uuid=tenant_uuid, entity_key=entity_key)
 
         if group_cols:
             q2 = q2.group_by(*group_cols)
