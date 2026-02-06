@@ -176,7 +176,7 @@ Add entries like:
   - Categories: includes candidate `category` + supports optional `category_request` in plan for disambiguation narrowing.
   - Scheduling: plan may include `schedule_request` and, when enabled, will upsert schedules deterministically (with destination normalization to prevent placeholders like "email").
   - Flags: `INTENT_V2_MODE`, `INTENT_V2_SCHEDULE_ENABLED`, `DBQUERY_SCHEDULE_ENABLED`, `INTENT_V2_DEBUG`, `OPENAI_INTENT_MODEL`, `OPENAI_INTENT_TIMEOUT_S`, `OPENAI_INTENT_MAX_TOKENS`
-  - Last touched: 2026-02-02 (schedule destination defaulting + allow null destination in plan)
+  - Last touched: 2026-02-06 (fix on-demand dynamic skills autosync so DBQuery/WebSearch skills surface as candidates)
 
 
 - `backend/models.py`
@@ -191,7 +191,7 @@ Add entries like:
   - Invariants: only whitelisted entities/fields; always tenant-scoped; time presets are bounded; no writes.
   - Concepts: optional deterministic `has_concept` filter compiles to EXISTS() against concept_assignments (no embeddings).
   - Flags: `CONCEPTS_ENABLED`, `DB_QUERY_MAX_SPOKEN_CHARS`
-  - Last touched: 2026-02-02 (Row/tuple scalarization + has_concept filter + kb_files/kb_chunks registry)
+  - Last touched: 2026-02-06 (re-add kb_files/kb_chunks/concept_assignments entities; enables wizard + has_concept end-to-end)
 
 - `backend/api/routers/concepts.py`
   - Purpose: Admin CRUD endpoints for concept definitions + assignments (auditable concept codes).
