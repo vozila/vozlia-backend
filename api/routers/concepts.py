@@ -11,13 +11,13 @@ Last touched: 2026-02-03 (initial concept code MVP endpoints)
 from __future__ import annotations
 
 import os
-import logging
 from datetime import datetime
 from typing import Any, Optional, List, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from api.deps.admin_key import require_admin_key
 from deps import get_db
@@ -184,155 +184,106 @@ def list_assignments(
 def create_assignment(
     payload: ConceptAssignmentIn,
     db: Session = Depends(get_db),
-    user: User = Depends(require_admin_key),
 ):
-    """
-    Create a concept assignment.
-
-    Idempotent semantics:
-    - If the (tenant_id,target_type,target_id,concept_code) tuple already exists,
-      return the existing assignment (200) instead of bubbling up a unique violation.
-    - If the caller provides a "stronger" source (e.g. manual) or locks an unlocked
-      assignment, we "upgrade" the existing row.
-    """
-    if not os.getenv("CONCEPTS_ENABLED", "0").lower() in ("1", "true", "yes", "on"):
+    if not _concepts_enabled():
         raise HTTPException(status_code=404, detail="Concepts disabled")
 
-    # Validate concept exists (definitions are stored by concept_code).
+    user = get_or_create_primary_user(db)
+
+    # Require the concept definition to exist (keeps concept_code stable/auditable)
     code = payload.concept_code.strip()
-    definition = (
+
+    batch_uuid = None
+    if payload.batch_id:
+        try:
+            from uuid import UUID
+            batch_uuid = UUID(payload.batch_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid batch_id (must be UUID)")
+    d = (
         db.query(ConceptDefinition)
         .filter(ConceptDefinition.tenant_id == user.id, ConceptDefinition.concept_code == code)
         .first()
     )
-    if not definition:
-        raise HTTPException(status_code=404, detail="Concept not found")
+    if not d:
+        raise HTTPException(status_code=404, detail=f"Concept definition not found: {code}")
 
-    target_type = payload.target_type.strip()
-    target_id = payload.target_id.strip()
-    source_in = payload.source.strip()
-    locked_in = bool(payload.locked)
+    locked = bool(payload.locked) if payload.locked is not None else (payload.source.strip() == "manual")
 
-    # --- Idempotent "create" (and optional upgrade) ---
+    # Idempotency: if assignment already exists, return it (200)
     existing = (
         db.query(ConceptAssignment)
-        .filter(
-            ConceptAssignment.tenant_id == user.id,
-            ConceptAssignment.target_type == target_type,
-            ConceptAssignment.target_id == target_id,
-            ConceptAssignment.concept_code == code,
-        )
+        .filter(ConceptAssignment.tenant_id == user.id)
+        .filter(ConceptAssignment.target_type == payload.target_type.strip())
+        .filter(ConceptAssignment.target_id == payload.target_id.strip())
+        .filter(ConceptAssignment.concept_code == code)
         .first()
     )
     if existing:
-        upgraded = False
-
-        # Upgrade source: if caller says "manual", prefer that.
-        if source_in and existing.source != source_in:
-            if source_in == "manual":
-                existing.source = source_in
-                upgraded = True
-
-        # Upgrade lock: allow locking an unlocked assignment.
-        if locked_in and not existing.locked:
-            existing.locked = True
-            upgraded = True
-
-        if upgraded:
-            db.commit()
-            db.refresh(existing)
-
         logger.info(
-            "CONCEPT_ASSIGNMENT_EXISTS tenant_id=%s target_type=%s target_id=%s concept_code=%s source_in=%s source_existing=%s locked=%s upgraded=%s",
+            "CONCEPT_ASSIGNMENT_EXISTS tenant=%s target_type=%s target_id=%s concept_code=%s",
             str(user.id),
-            target_type,
-            target_id,
+            payload.target_type.strip(),
+            payload.target_id.strip(),
             code,
-            source_in,
-            existing.source,
-            bool(existing.locked),
-            upgraded,
         )
-
-        return ConceptAssignmentOut(
-            id=existing.id,
-            tenant_id=existing.tenant_id,
-            target_type=existing.target_type,
-            target_id=existing.target_id,
-            concept_code=existing.concept_code,
-            source=existing.source,
-            confidence=existing.confidence,
-            rationale=existing.rationale,
-            evidence_json=existing.evidence_json or {},
-            locked=existing.locked,
-            batch_id=existing.batch_id,
-            created_at=existing.created_at,
-            updated_at=existing.updated_at,
-        )
-
-    # --- Create new row ---
-    try:
-        a = ConceptAssignment(
-            id=uuid.uuid4(),
+        row = existing
+    else:
+        row = ConceptAssignment(
             tenant_id=user.id,
-            target_type=target_type,
-            target_id=target_id,
+            target_type=payload.target_type.strip(),
+            target_id=payload.target_id.strip(),
             concept_code=code,
-            source=source_in,
+            source=payload.source.strip(),
             confidence=payload.confidence,
             rationale=payload.rationale,
             evidence_json=payload.evidence_json or {},
-            locked=locked_in,
-            batch_id=payload.batch_id,
+            locked=locked,
+            batch_id=batch_uuid,
         )
-        db.add(a)
-        db.commit()
-        db.refresh(a)
-        return ConceptAssignmentOut(
-            id=a.id,
-            tenant_id=a.tenant_id,
-            target_type=a.target_type,
-            target_id=a.target_id,
-            concept_code=a.concept_code,
-            source=a.source,
-            confidence=a.confidence,
-            rationale=a.rationale,
-            evidence_json=a.evidence_json or {},
-            locked=a.locked,
-            batch_id=a.batch_id,
-            created_at=a.created_at,
-            updated_at=a.updated_at,
-        )
-    except IntegrityError:
-        # Race: created by another request in the meantime.
-        db.rollback()
-        existing = (
-            db.query(ConceptAssignment)
-            .filter(
-                ConceptAssignment.tenant_id == user.id,
-                ConceptAssignment.target_type == target_type,
-                ConceptAssignment.target_id == target_id,
-                ConceptAssignment.concept_code == code,
+        db.add(row)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Concurrent duplicate insert: treat as idempotent
+            db.rollback()
+            existing = (
+                db.query(ConceptAssignment)
+                .filter(ConceptAssignment.tenant_id == user.id)
+                .filter(ConceptAssignment.target_type == payload.target_type.strip())
+                .filter(ConceptAssignment.target_id == payload.target_id.strip())
+                .filter(ConceptAssignment.concept_code == code)
+                .first()
             )
-            .first()
-        )
-        if existing:
-            return ConceptAssignmentOut(
-                id=existing.id,
-                tenant_id=existing.tenant_id,
-                target_type=existing.target_type,
-                target_id=existing.target_id,
-                concept_code=existing.concept_code,
-                source=existing.source,
-                confidence=existing.confidence,
-                rationale=existing.rationale,
-                evidence_json=existing.evidence_json or {},
-                locked=existing.locked,
-                batch_id=existing.batch_id,
-                created_at=existing.created_at,
-                updated_at=existing.updated_at,
-            )
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=f"Failed to create assignment: {e}")
+            if existing:
+                logger.info(
+                    "CONCEPT_ASSIGNMENT_EXISTS tenant=%s target_type=%s target_id=%s concept_code=%s",
+                    str(user.id),
+                    payload.target_type.strip(),
+                    payload.target_id.strip(),
+                    code,
+                )
+                row = existing
+            else:
+                raise HTTPException(status_code=400, detail="Failed to create assignment (integrity error)")
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=f"Failed to create assignment: {e}")
+
+    db.refresh(row)
+
+    return ConceptAssignmentOut(
+        id=str(row.id),
+        tenant_id=str(row.tenant_id),
+        target_type=row.target_type,
+        target_id=row.target_id,
+        concept_code=row.concept_code,
+        source=row.source,
+        confidence=row.confidence,
+        rationale=row.rationale,
+        evidence_json=dict(row.evidence_json or {}),
+        locked=bool(row.locked),
+        batch_id=str(row.batch_id) if row.batch_id else None,
+        created_at=row.created_at.isoformat(),
+        updated_at=row.updated_at.isoformat(),
+    )
