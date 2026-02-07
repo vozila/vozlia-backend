@@ -204,41 +204,96 @@ def utterance_has_activation_keyword(utterance: str) -> bool:
     return False
 
 
-def allow_dynamic_skill_candidate(utterance: str, *, score: float, reason: str) -> bool:
-    """Return True if a dynamic skill candidate should be considered for this utterance."""
+def dynamic_skill_activation_min_score() -> float:
+    """Minimum candidate score to allow running a dynamic skill without an activation keyword.
+
+    This keeps the old activation-keyword guardrail available, but allows clearly-matching
+    dynamic skills (e.g., "menu steak") to run from natural language.
+    """
+    try:
+        return float(os.getenv("INTENT_V2_DYNAMIC_ACTIVATION_MIN_SCORE", "75"))
+    except Exception:
+        return 75.0
+
+
+def allow_dynamic_skill_candidate(
+    db: Session,
+    user: User,
+    utterance: str,
+    *,
+    score: float,
+    reason: str,
+) -> bool:
     kws = dynamic_skill_activation_keywords()
     if not kws:
-        return True  # gate disabled
-    if not (utterance or "").strip():
         return True
-    if utterance_has_activation_keyword(utterance):
-        try:
-            # Ensure dynamic DB-backed skills are present in skills_config before scoring candidates.
-            # This prevents regressions where only legacy/YAML skills appear after deploy/rollback.
-            from services.dynamic_skill_autosync import autosync_dynamic_skills, dynamic_skills_autosync_enabled
 
-            if dynamic_skills_autosync_enabled():
-                tenant_key = str(getattr(user, "id", "") or getattr(user, "tenant_id", "") or "")
-                now = time.time()
-                last = _DYNAMIC_SKILLS_AUTOSYNC_LAST.get(tenant_key, 0.0)
-                if tenant_key and (now - last) > 60.0:
-                    out_sync = autosync_dynamic_skills(db, user, force=False)
-                    try:
-                        db.commit()
-                    except Exception:
-                        try:
-                            db.rollback()
-                        except Exception:
-                            pass
-                        raise
-                    _DYNAMIC_SKILLS_AUTOSYNC_LAST[tenant_key] = now
-                    if isinstance(out_sync, dict) and (out_sync.get("added") or out_sync.get("updated")):
-                        logger.info(
-                            "DYNAMIC_SKILLS_AUTOSYNC_ON_DEMAND tenant=%s added=%s updated=%s",
-                            tenant_key,
-                            out_sync.get("added"),
-                            out_sync.get("updated"),
-                        )
+    u = _norm(utterance)
+    if any(kw in u for kw in kws):
+        return True
+
+    min_score = dynamic_skill_activation_min_score()
+    if score >= min_score:
+        logger.info(
+            "INTENT_V2_DYNAMIC_ACTIVATION_OVERRIDE score=%.1f min_score=%.1f reason=%s keywords=%s",
+            score,
+            min_score,
+            reason,
+            kws,
+        )
+        return True
+
+    logger.info(
+        "INTENT_V2_DYNAMIC_ACTIVATION_REJECT score=%.1f min_score=%.1f reason=%s keywords=%s",
+        score,
+        min_score,
+        reason,
+        kws,
+    )
+    return False
+
+
+def build_skill_candidates(db: Session, user: User, utterance: str, tz: str | None = None) -> list[SkillCandidate]:
+    """Build a ranked list of candidate skills for the utterance.
+
+    Candidates include:
+      - Dynamic skills registered in skills_config (websearch_* / dbquery_*)
+      - Manifest skills from the static registry (gmail_summary, etc.)
+
+    Note: On-demand autosync of dynamic skills can be triggered via activation keywords
+    (see INTENT_V2_DYNAMIC_ACTIVATION_KEYWORDS), but this function is safe even if
+    autosync is disabled or fails.
+    """
+    u = _norm(utterance)
+    u_tokens = _tokens(u)
+
+    kws = dynamic_skill_activation_keywords()
+    has_kw = any(kw in u for kw in kws) if kws else False
+    if has_kw:
+        logger.info(
+            "INTENT_V2_DYNAMIC_ACTIVATION has_kw=%s keywords=%s candidates=%s",
+            has_kw,
+            kws,
+            [],
+        )
+        # Best-effort: ensure dynamic skills exist in skills_config before planning.
+        try:
+            from services.dynamic_skill_autosync import autosync_dynamic_skills
+            now = time.time()
+            last = _DYNAMIC_SKILLS_AUTOSYNC_LAST.get(str(user.id), 0.0)
+            if now - last > 30.0:
+                cfg_all = get_skills_config(db, user)
+                has_dbq = any(k.startswith("dbquery_") for k in (cfg_all or {}).keys())
+                has_ws = any(k.startswith("websearch_") for k in (cfg_all or {}).keys())
+                if not (has_dbq and has_ws):
+                    autosync_dynamic_skills(
+                        db,
+                        user,
+                        include_dbquery=True,
+                        include_websearch=True,
+                        include_core=False,
+                    )
+                _DYNAMIC_SKILLS_AUTOSYNC_LAST[str(user.id)] = now
         except Exception as e:
             logger.warning("DYNAMIC_SKILLS_AUTOSYNC_ON_DEMAND_FAIL err=%s", str(e))
 
@@ -315,36 +370,6 @@ def allow_dynamic_skill_candidate(utterance: str, *, score: float, reason: str) 
 
     out_sorted = sorted(out, key=lambda c: c.score, reverse=True)
     return out_sorted[: _max_candidates()]
-
-
-# ----------------------------
-# LLM plan schema
-# ----------------------------
-
-class ScheduleRequest(BaseModel):
-    """Structured schedule request extracted by the LLM (MVP: daily schedules)."""
-
-    cadence: Literal["daily"] = "daily"
-    hour: int = Field(..., ge=0, le=23)
-    minute: int = Field(..., ge=0, le=59)
-    timezone: str = Field(..., min_length=1)
-    channel: str = Field(..., min_length=1)      # email|sms|whatsapp|call
-    destination: str | None = Field(None, min_length=1)  # email address or phone number (null if unknown)
-
-
-class IntentPlanV2(BaseModel):
-    """Strict plan returned by the LLM."""
-
-    route: str = Field(..., description="run_skill|schedule_skill|disambiguate|chitchat")
-    skill_key: Optional[str] = Field(None, description="Chosen skill_key if route=run_skill|schedule_skill")
-    choices: Optional[List[str]] = Field(None, description="List of skill_keys if route=disambiguate")
-    schedule_request: Optional[ScheduleRequest] = Field(
-        None,
-        description="If schedule-related: cadence/time/channel/destination",
-    )
-    confidence: float = Field(0.0, ge=0.0, le=1.0)
-    rationale: Optional[str] = Field(None, description="Short reason; not shown to end user")
-
 
 _CLIENT: OpenAI | None = None
 
@@ -995,7 +1020,7 @@ def maybe_route_and_execute(
         if not chosen:
             return schedule_payload
         if chosen.skill_key.startswith(("websearch_", "dbquery_")) and not allow_dynamic_skill_candidate(
-            utterance, score=chosen.score, reason=chosen.reason
+            db, user, utterance, score=chosen.score, reason=chosen.reason
         ):
             # dynamic activation gate says no
             return schedule_payload
