@@ -1,181 +1,209 @@
+"""api/routers/metrics.py
+
+Purpose:
+- Deterministic “metrics” endpoint used by the Control Plane wizard fast-path.
+- Avoids LLM numeric hallucinations by translating common metric questions into DBQuerySpec and executing
+  via services.db_query_service.run_db_query.
+
+Notes:
+- This is an admin endpoint (requires ADMIN_API_KEY).
+- Keep it conservative: only support a small, explicit set of metric patterns for now.
+"""
+
 from __future__ import annotations
 
-import os
 import re
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from api.deps.admin_key import require_admin_key
-from api.deps.db import get_db
-from api.deps.primary_user import get_or_create_primary_user
-from services.db_query_service import DBQuerySpec, run_db_query
-
-# Optional ORM models for lightweight lookups
-from models import ConceptAssignment
+from deps import get_db
+from services.db_query_service import (
+    DBQueryResult,
+    DBQuerySpec,
+    DBTimeframe,
+    DBFilter,
+    DBAggregation,
+    TimePreset,
+    run_db_query,
+)
+from services.user_service import get_or_create_primary_user
 
 
 router = APIRouter(
     prefix="/admin/metrics",
-    tags=["admin_metrics"],
+    tags=["admin-metrics"],
     dependencies=[Depends(require_admin_key)],
 )
 
 
 class MetricsRunIn(BaseModel):
     question: str = Field(..., min_length=1)
-    timezone: Optional[str] = None
+    timezone: str = "America/New_York"
 
 
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
+def _infer_time_preset(q: str) -> Optional[TimePreset]:
+    s = q.lower()
 
+    # Exact preset keywords
+    if "today" in s:
+        return "today"
+    if "yesterday" in s:
+        return "yesterday"
 
-def _parse_timeframe(question: str, tz: str) -> Optional[dict[str, Any]]:
-    q = _norm(question)
+    # Week / month-ish
+    if "this week" in s or "this_week" in s:
+        return "this_week"
+    if "last week" in s or "last_week" in s:
+        return "last_week"
+    if "this month" in s or "this_month" in s:
+        return "this_month"
 
-    # Common phrases
-    if "today" in q:
-        return {"preset": "today", "timezone": tz}
-    if "yesterday" in q:
-        return {"preset": "yesterday", "timezone": tz}
+    # Rolling windows
+    if "last 7 days" in s or "past 7 days" in s or "last_7_days" in s:
+        return "last_7_days"
+    if "last 30 days" in s or "past 30 days" in s or "last_30_days" in s:
+        return "last_30_days"
 
-    if "this week" in q:
-        return {"preset": "this_week", "timezone": tz}
-    if "last week" in q:
-        return {"preset": "last_week", "timezone": tz}
+    # Common phrasing (MVP mapping)
+    if "last month" in s:
+        # We don't have last_month; approximate as rolling 30 days for now.
+        return "last_30_days"
 
-    # "last month" usually means "last 30 days" for most users.
-    if "last month" in q:
-        return {"preset": "last_30_days", "timezone": tz}
-    if "this month" in q:
-        return {"preset": "this_month", "timezone": tz}
-
-    # Explicit ranges
-    m = re.search(r"last\s+(\d+)\s+days?", q)
-    if m:
-        n = int(m.group(1))
-        if n <= 1:
-            return {"preset": "today", "timezone": tz}
-        if n <= 7:
-            return {"preset": "last_7_days", "timezone": tz}
-        if n <= 30:
-            return {"preset": "last_30_days", "timezone": tz}
-
-    # Default: no timeframe
     return None
 
 
-def _best_concept_for_question(db: Session, tenant_id: str, question: str) -> Optional[str]:
-    q = _norm(question)
-    # Cheap keyword extraction
-    tokens = set(re.findall(r"[a-z0-9]{3,}", q))
-    if not tokens:
-        return None
-
-    rows = (
-        db.query(ConceptAssignment.concept_code)
-        .filter(ConceptAssignment.tenant_id == tenant_id)
-        .distinct()
-        .all()
-    )
-    concept_codes = [r[0] for r in rows if r and r[0]]
-
-    if not concept_codes:
-        return None
-
-    best = None
-    best_score = 0
-    for code in concept_codes:
-        c = _norm(code)
-        # Split code "menu.steak" -> {"menu","steak"}
-        parts = set([p for p in re.split(r"[\W_]+", c) if p])
-        score = len(tokens.intersection(parts))
-        if score > best_score:
-            best_score = score
-            best = code
-
-    # Require at least one matching token
-    return best if best_score >= 1 else None
+def _looks_like_unique_callers(q: str) -> bool:
+    s = q.lower()
+    if "caller" in s and ("unique" in s or "how many" in s or "count" in s):
+        return True
+    return False
 
 
-@router.post("/run")
-def metrics_run(payload: MetricsRunIn, db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Answer simple metric questions deterministically.
+def _looks_like_unique_calls(q: str) -> bool:
+    s = q.lower()
+    if "call" in s and ("unique" in s or "how many" in s or "count" in s):
+        # Avoid matching "caller" (callers handled above) unless explicitly "calls"
+        if "caller" in s and "calls" not in s:
+            return False
+        return True
+    return False
 
-    This endpoint exists primarily so the control-plane wizard can fastpath
-    common "how many ..." questions without relying on an LLM plan.
+
+def _looks_like_menu_steak_question(q: str) -> bool:
+    s = q.lower()
+    if "steak" in s and ("menu" in s or "dish" in s or "dishes" in s):
+        return True
+    return False
+
+
+def _extract_steak_dish_lines(text: str) -> list[str]:
+    """Heuristic extraction of menu item lines mentioning steak.
+
+    This is intentionally simple and deterministic. We'll replace with concept enrichment + structured KB later.
     """
-    user = get_or_create_primary_user(db)
-    tz = payload.timezone or os.getenv("DEFAULT_TIMEZONE", "UTC")
-    q = _norm(payload.question)
+    dish_lines: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "steak" not in line.lower():
+            continue
+        # Common menu patterns: "Item Name — $X" or "Item Name - $X"
+        if "—" in line or " - " in line or "$" in line:
+            # Strip trailing price-ish fragments to get a stable title
+            title = re.split(r"\s+—\s+|\s+-\s+|\s+\$", line, maxsplit=1)[0].strip()
+            if title:
+                dish_lines.append(title)
+        else:
+            dish_lines.append(line)
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for d in dish_lines:
+        key = d.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
 
-    # 1) Unique callers
-    if "caller" in q and ("unique" in q or "how many" in q):
-        tf = _parse_timeframe(payload.question, tz) or {"preset": "last_30_days", "timezone": tz}
+
+@router.post("/run", response_model=DBQueryResult)
+def admin_metrics_run(payload: MetricsRunIn, db: Session = Depends(get_db)):
+    """Compute a small set of deterministic metrics from the DB."""
+    user = get_or_create_primary_user(db)
+    tenant_uuid = str(user.id)
+
+    q = (payload.question or "").strip()
+    tz = payload.timezone or "America/New_York"
+    preset = _infer_time_preset(q)
+
+    # 1) Unique callers metric (voice + portal)
+    if _looks_like_unique_callers(q):
         spec = DBQuerySpec(
             entity="caller_memory_events",
-            timeframe=tf,
-            aggregations=[
-                {"op": "count_distinct", "field": "caller_id", "as_name": "unique_callers"}
-            ],
-            filters=[
-                {"field": "kind", "op": "eq", "value": "turn"},
-            ],
+            timeframe=DBTimeframe(preset=preset, timezone=tz) if preset else DBTimeframe(preset="last_30_days", timezone=tz),
+            aggregations=[DBAggregation(op="count_distinct", field="caller_id", as_name="unique_callers")],
             limit=1,
         )
-        res = run_db_query(db, user, spec)
-        out = res.model_dump() if hasattr(res, "model_dump") else res.dict()  # pydantic v2/v1
-        out["ok"] = True
-        out["metric_kind"] = "unique_callers"
-        return out
+        return run_db_query(db, tenant_uuid=tenant_uuid, spec=spec)
 
-    # 2) Menu/Kb concept counts (e.g., "how many items on the menu has steak")
-    if ("menu" in q or "dish" in q or "dishes" in q) and ("how many" in q or "count" in q or "number" in q):
-        concept = _best_concept_for_question(db, str(user.id), payload.question)
-        if concept:
-            spec = DBQuerySpec(
+    # 2) Unique calls metric
+    if _looks_like_unique_calls(q):
+        spec = DBQuerySpec(
+            entity="caller_memory_events",
+            timeframe=DBTimeframe(preset=preset, timezone=tz) if preset else DBTimeframe(preset="last_30_days", timezone=tz),
+            aggregations=[DBAggregation(op="count_distinct", field="call_sid", as_name="unique_calls")],
+            limit=1,
+        )
+        return run_db_query(db, tenant_uuid=tenant_uuid, spec=spec)
+
+    # 3) Menu steak questions (MVP heuristic using KB text search)
+    if _looks_like_menu_steak_question(q):
+        # Pull all chunks that mention "steak" and do a deterministic extraction.
+        chunks = run_db_query(
+            db,
+            tenant_uuid=tenant_uuid,
+            spec=DBQuerySpec(
                 entity="kb_chunks",
-                aggregations=[
-                    {"op": "count_distinct", "field": "id", "as_name": "matching_chunks"}
-                ],
-                filters=[
-                    {"field": "id", "op": "has_concept", "value": concept},
-                ],
-                limit=1,
-            )
-            res = run_db_query(db, user, spec)
-            out = res.model_dump() if hasattr(res, "model_dump") else res.dict()
-            out["ok"] = True
-            out["metric_kind"] = "kb_concept_count"
-            out["concept_code"] = concept
-            return out
+                select=["id", "file_id", "chunk_index", "text"],
+                filters=[DBFilter(field="text", op="icontains", value="steak")],
+                order_by=[{"field": "chunk_index", "direction": "asc"}],
+                limit=200,
+            ),
+        )
 
-        # Fallback: basic keyword text match (first non-trivial token)
-        kws = [t for t in re.findall(r"[a-z0-9]{4,}", q) if t not in {"menu", "dishes", "dish", "items"}]
-        if kws:
-            kw = kws[0]
-            spec = DBQuerySpec(
-                entity="kb_chunks",
-                aggregations=[
-                    {"op": "count_distinct", "field": "id", "as_name": "matching_chunks"}
-                ],
-                filters=[
-                    {"field": "text", "op": "ilike", "value": kw},
-                ],
-                limit=1,
-            )
-            res = run_db_query(db, user, spec)
-            out = res.model_dump() if hasattr(res, "model_dump") else res.dict()
-            out["ok"] = True
-            out["metric_kind"] = "kb_text_count"
-            out["keyword"] = kw
-            return out
+        dish_titles: list[str] = []
+        for row in chunks.rows:
+            dish_titles.extend(_extract_steak_dish_lines(str(row.get("text") or "")))
 
-    # Default: we don't know how to answer deterministically
-    return {
-        "ok": False,
-        "spoken_summary": "I couldn't compute that metric deterministically yet.",
-    }
+        count = len(dish_titles)
+        preview = dish_titles[:10]
+
+        spoken = (
+            f"I found {count} menu line(s) that mention steak."
+            + (f" Examples: {', '.join(preview)}." if preview else "")
+        )
+
+        return DBQueryResult(
+            ok=True,
+            entity="kb_chunks",
+            count=count,
+            rows=[{"dish": d} for d in preview],
+            aggregates={"steak_dish_count": count},
+            spoken_summary=spoken,
+        )
+
+    # Default: return a safe message (keeps wizard stable)
+    return DBQueryResult(
+        ok=True,
+        entity="metrics",
+        count=0,
+        rows=[],
+        aggregates=None,
+        spoken_summary="I can’t compute that metric yet from the current database.",
+    )
