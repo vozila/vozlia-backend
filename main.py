@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from core.logging import logger  # IMPORTANT: initializes logging early
+from core.logging import logger, env_flag, is_debug  # IMPORTANT: initializes logging early
 from core.request_context import set_request_id, reset_request_id
 
 from db import Base, engine, SessionLocal
@@ -53,8 +53,16 @@ def create_app() -> FastAPI:
     # -------------------------
     # Request correlation + debug logging (safe-by-default)
     # -------------------------
-    http_log_enabled = _truthy_env("HTTP_REQUEST_LOG_ENABLED", "0")
-    http_log_prefix = (os.getenv("HTTP_REQUEST_LOG_PATH_PREFIX") or "/admin").strip() or "/admin"
+    http_log_enabled = env_flag("HTTP_REQUEST_LOG_ENABLED", "0", inherit_debug=True)
+    prefixes_raw = (os.getenv("HTTP_REQUEST_LOG_PATH_PREFIXES") or "").strip()
+    if prefixes_raw:
+        http_log_prefixes = [p.strip() for p in prefixes_raw.split(",") if p.strip()]
+    else:
+        http_log_prefixes = [(os.getenv("HTTP_REQUEST_LOG_PATH_PREFIX") or "/admin").strip() or "/admin"]
+        # In VOZLIA_DEBUG, also trace assistant routing by default.
+        if is_debug() and "/assistant" not in http_log_prefixes:
+            http_log_prefixes.append("/assistant")
+
 
     capture_body_on_error = _truthy_env("HTTP_CAPTURE_BODY_ON_ERROR", "0")
     capture_body_prefix = (os.getenv("HTTP_CAPTURE_BODY_PATH_PREFIX") or "/admin").strip() or "/admin"
@@ -73,6 +81,17 @@ def create_app() -> FastAPI:
         )
         token = set_request_id(rid)
         t0 = perf_counter()
+        wants_http_log = bool(http_log_enabled and any(request.url.path.startswith(p) for p in http_log_prefixes))
+        if wants_http_log:
+            try:
+                logger.info(
+                    "HTTP_IN method=%s path=%s qs=%s",
+                    request.method,
+                    request.url.path,
+                    request.url.query,
+                )
+            except Exception:
+                pass
 
         # Optionally capture body (for admin debugging only).
         body_bytes: bytes | None = None
@@ -113,12 +132,12 @@ def create_app() -> FastAPI:
                 # (If we raised above, we won't reach here with a response.)
                 pass
             finally:
-                # Only log requests when enabled and path matches prefix.
-                if http_log_enabled and request.url.path.startswith(http_log_prefix):
+                # Only log requests when enabled and path matches prefixes.
+                if wants_http_log:
                     try:
                         status_code = getattr(locals().get("response"), "status_code", None)
                         logger.info(
-                            "HTTP_REQUEST method=%s path=%s status=%s ms=%.1f qs=%s",
+                            "HTTP_OUT method=%s path=%s status=%s ms=%.1f qs=%s",
                             request.method,
                             request.url.path,
                             status_code,
