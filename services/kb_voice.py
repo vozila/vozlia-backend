@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from core.logging import logger
+from core.logging import logger, env_flag
 from core import config as cfg
 
 try:

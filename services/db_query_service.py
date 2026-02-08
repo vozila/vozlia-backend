@@ -31,7 +31,7 @@ from sqlalchemy import and_, func, cast, String, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from core.logging import logger
+from core.logging import logger, env_flag
 
 # -------------------------
 # Debug flags (safe-by-default)
@@ -44,7 +44,8 @@ def _truthy_env(name: str, default: str = "0") -> bool:
 
 def _dbquery_trace_enabled() -> bool:
     # High-level per-query trace (no SQL, safe summaries).
-    return _truthy_env("DBQUERY_TRACE", "0")
+    # Inherit common VOZLIA_DEBUG when DBQUERY_TRACE is unset.
+    return env_flag("DBQUERY_TRACE", "0", inherit_debug=True)
 
 
 def _dbquery_trace_sql_enabled() -> bool:
@@ -736,6 +737,16 @@ def run_db_query(db: Session, *, tenant_uuid: str, spec: dict | DBQuerySpec) -> 
 
         spoken = _summarize_for_voice(entity_key, rows_out, aggregates)
 
+        if _dbquery_trace_enabled():
+            try:
+                logger.info(
+                    "DBQUERY_RESULT entity=%s count=%s aggregates_keys=%s",
+                    entity_key,
+                    int(cnt),
+                    (sorted(list((aggregates or {}).keys())) if isinstance(aggregates, dict) else None),
+                )
+            except Exception:
+                pass
         return DBQueryResult(ok=True, entity=entity_key, count=int(cnt), rows=rows_out, aggregates=aggregates, spoken_summary=spoken)
 
     except Exception as e:

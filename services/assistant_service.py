@@ -22,7 +22,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
-from core.logging import logger
+from core.logging import logger, env_flag
 from skills.registry import skill_registry
 from sqlalchemy.orm import Session
 from models import User
@@ -639,8 +639,22 @@ def run_assistant_route(
       4) Otherwise return FSM response
     """
     import time as _time
-    debug = (os.getenv("ASSISTANT_ROUTE_DEBUG_LOGS") or "").strip().lower() in ("1","true","yes","on")
+    debug = env_flag("ASSISTANT_ROUTE_DEBUG_LOGS", "0", inherit_debug=True)
     t0 = _time.perf_counter()
+    if debug:
+        try:
+            _snip = (raw_user_text or '').replace('\n', ' ').strip()
+            if len(_snip) > 240:
+                _snip = _snip[:240] + '…'
+            logger.info(
+                'ASSISTANT_ROUTE_IN tenant=%s caller=%s call_sid=%s text=%r',
+                tenant_id,
+                caller_id,
+                call_id,
+                _snip,
+            )
+        except Exception:
+            pass
     if debug:
         text_snip = (text[:200] + "…") if len(text or "") > 200 else (text or "")
     else:
@@ -1477,6 +1491,16 @@ def run_assistant_route(
         dyn_match = None
         try:
             dyn_match = match_dynamic_skill(db, current_user, raw_user_text)
+            if debug and dyn_match:
+                try:
+                    logger.info(
+                        'ASSISTANT_ROUTE_DECISION branch=dynamic_skill skill_id=%s score=%.1f reason=%s',
+                        getattr(dyn_match, 'skill_id', None),
+                        float(getattr(dyn_match, 'score', 0.0) or 0.0),
+                        getattr(dyn_match, 'reason', None),
+                    )
+                except Exception:
+                    pass
         except Exception:
             dyn_match = None
 
@@ -2096,6 +2120,15 @@ def run_assistant_route(
                 )
                 if kb_res and getattr(kb_res, "answer", None):
                     spoken_reply = str(kb_res.answer)
+                    if debug:
+                        try:
+                            logger.info(
+                                'ASSISTANT_ROUTE_DECISION branch=kb_voice strategy=%s sources=%s',
+                                getattr(kb_res, 'retrieval_strategy', None),
+                                len(getattr(kb_res, 'sources', []) or []),
+                            )
+                        except Exception:
+                            pass
 
                     # Add lightweight breadcrumbs for observability/debugging (doesn't affect voice output).
                     try:
@@ -2133,5 +2166,16 @@ def run_assistant_route(
                 logger.exception("KB_VOICE_FAIL tenant_id=%s", tenant_id)
 
     payload = {"spoken_reply": spoken_reply, "fsm": fsm_result, "gmail": gmail_data}
+    if debug:
+        try:
+            logger.info(
+                "ASSISTANT_ROUTE_OUT reply_len=%s has_fsm=%s has_gmail=%s ms=%.1f",
+                (len((spoken_reply or "")) if isinstance(spoken_reply, str) else None),
+                bool(fsm_result),
+                bool(gmail_data),
+                (_time.perf_counter() - t0) * 1000.0,
+            )
+        except Exception:
+            pass
     _capture_turn("assistant", payload.get("spoken_reply"))
     return payload
