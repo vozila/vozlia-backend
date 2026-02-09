@@ -155,7 +155,7 @@ def run_web_search(
             model=chosen_model,
             input=[{"role": "user", "content": q}],
             tools=[{"type": "web_search"}],
-            tool_choice={"type": "web_search"},
+            tool_choice={"type": "web_search_preview"},
             include=["web_search_call.action.sources"],
             timeout=timeout_s,
         )
