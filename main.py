@@ -58,7 +58,10 @@ def create_app() -> FastAPI:
     if prefixes_raw:
         http_log_prefixes = [p.strip() for p in prefixes_raw.split(",") if p.strip()]
     else:
-        http_log_prefixes = [(os.getenv("HTTP_REQUEST_LOG_PATH_PREFIX") or "/admin").strip() or "/admin"]
+        raw_prefixes = (os.getenv("HTTP_REQUEST_LOG_PATH_PREFIX") or "/admin/dbquery/run,/admin/websearch/search,/admin/metrics/run").strip()
+        http_log_prefixes = [p.strip() for p in raw_prefixes.split(",") if p.strip()]
+        if not http_log_prefixes:
+            http_log_prefixes = ["/admin/dbquery/run"]
         # In VOZLIA_DEBUG, also trace assistant routing by default.
         if is_debug() and "/assistant" not in http_log_prefixes:
             http_log_prefixes.append("/assistant")
