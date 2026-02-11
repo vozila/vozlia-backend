@@ -33,6 +33,18 @@ _CLIENT: OpenAI | None = None
 def web_search_enabled() -> bool:
     return (os.getenv("WEB_SEARCH_ENABLED") or "").strip().lower() in ("1", "true", "yes", "on")
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    v = (os.getenv(name, default) or default).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
+WEB_SEARCH_TOOL_TYPE = (os.getenv("WEB_SEARCH_TOOL_TYPE") or "web_search_preview").strip() or "web_search_preview"
+WEB_SEARCH_REQUIRE_SOURCES = _env_flag("WEB_SEARCH_REQUIRE_SOURCES", "1")
+WEB_SEARCH_MIN_SOURCES = int((os.getenv("WEB_SEARCH_MIN_SOURCES") or "1").strip() or "1")
+WEB_SEARCH_EMPTY_SOURCES_MESSAGE = (
+    (os.getenv("WEB_SEARCH_EMPTY_SOURCES_MESSAGE") or "").strip()
+    or "I couldn't find reliable sources for that right now."
+)
 
 def _get_client() -> OpenAI | None:
     global _CLIENT
@@ -151,21 +163,45 @@ def run_web_search(
 
     t0 = time.perf_counter()
     try:
-        resp = client.responses.create(
-            model=chosen_model,
-            input=[{"role": "user", "content": q}],
-            tools=[{"type": "web_search"}],
-            tool_choice={"type": "web_search_preview"},
-            include=["web_search_call.action.sources"],
-            timeout=timeout_s,
-        )
-    except TypeError:
-        resp = client.responses.create(
-            model=chosen_model,
-            input=[{"role": "user", "content": q}],
-            tools=[{"type": "web_search"}],
-            include=["web_search_call.action.sources"],
-        )
+        resp = None
+        last_err: Exception | None = None
+        # Try configured tool type first, then fall back between known variants.
+        tool_types: list[str] = []
+        for tt in [WEB_SEARCH_TOOL_TYPE, 'web_search_preview', 'web_search']:
+            if tt and tt not in tool_types:
+                tool_types.append(tt)
+
+        for tt in tool_types:
+            try:
+                resp = client.responses.create(
+                    model=chosen_model,
+                    input=[{'role': 'user', 'content': q}],
+                    tools=[{'type': tt}],
+                    tool_choice={'type': tt},
+                    include=['web_search_call.action.sources'],
+                    timeout=timeout_s,
+                )
+                break
+            except TypeError:
+                # Some SDK versions do not accept tool_choice/timeout.
+                try:
+                    resp = client.responses.create(
+                        model=chosen_model,
+                        input=[{'role': 'user', 'content': q}],
+                        tools=[{'type': tt}],
+                        tool_choice={'type': tt},
+                        include=['web_search_call.action.sources'],
+                    )
+                    break
+                except TypeError as e:
+                    last_err = e
+                    continue
+            except Exception as e:
+                last_err = e
+                continue
+
+        if resp is None:
+            raise last_err or RuntimeError('web_search_failed')
     except Exception as e:
         logger.exception("WEB_SEARCH_FAIL query=%r err=%s", q, e)
         return WebSearchResult(query=q, answer="I couldn't complete the web search due to an error.", sources=[], model=chosen_model)
@@ -177,5 +213,10 @@ def run_web_search(
     if max_sources and len(sources) > max_sources:
         sources = sources[:max_sources]
 
+
+    # Grounding guard: if we cannot produce any sources, do NOT return a freeform answer.
+    if WEB_SEARCH_REQUIRE_SOURCES and len(sources) < max(0, WEB_SEARCH_MIN_SOURCES):
+        logger.warning("WEB_SEARCH_NO_SOURCES q_len=%s model=%s", len(q), chosen_model)
+        return WebSearchResult(query=q, answer=WEB_SEARCH_EMPTY_SOURCES_MESSAGE, sources=[], latency_ms=dt_ms, model=chosen_model)
     logger.info("WEB_SEARCH_OK dt_ms=%s q_len=%s sources=%s", round(dt_ms, 1), len(q), len(sources))
     return WebSearchResult(query=q, answer=(answer or "").strip(), sources=sources, latency_ms=dt_ms, model=chosen_model)

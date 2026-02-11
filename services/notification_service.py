@@ -3,12 +3,26 @@ from __future__ import annotations
 
 import os
 import smtplib
+import time
 from email.message import EmailMessage
 from dataclasses import dataclass
 
 from twilio.rest import Client
 
 from core.logging import logger
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    v = (os.getenv(name, default) or default).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
+SMTP_CIRCUIT_BREAKER_ENABLED = _env_flag("SMTP_CIRCUIT_BREAKER_ENABLED", "1")
+SMTP_CIRCUIT_BREAKER_S = int((os.getenv("SMTP_CIRCUIT_BREAKER_S") or "900").strip() or "900")
+SMTP_CIRCUIT_BREAKER_LOG_S = int((os.getenv("SMTP_CIRCUIT_BREAKER_LOG_S") or "60").strip() or "60")
+
+_SMTP_BREAKER_OPEN_UNTIL: float = 0.0
+_SMTP_BREAKER_LAST_LOG: float = 0.0
+
 from services.sms_service import send_sms as _send_sms
 
 
@@ -76,23 +90,50 @@ def send_whatsapp(to_number: str, body: str) -> str:
 def send_email(to_email: str, subject: str, body: str) -> str:
     smtp = _load_smtp()
 
+    global _SMTP_BREAKER_OPEN_UNTIL, _SMTP_BREAKER_LAST_LOG
+    now = time.time()
+    if SMTP_CIRCUIT_BREAKER_ENABLED and now < _SMTP_BREAKER_OPEN_UNTIL:
+        # Throttle logs while breaker is open.
+        if (now - _SMTP_BREAKER_LAST_LOG) >= max(1, SMTP_CIRCUIT_BREAKER_LOG_S):
+            _SMTP_BREAKER_LAST_LOG = now
+            logger.warning(
+                "SMTP_BREAKER_OPEN remaining_s=%s host=%s",
+                round(_SMTP_BREAKER_OPEN_UNTIL - now, 1),
+                smtp.host,
+            )
+        raise RuntimeError("SMTP temporarily disabled due to repeated authentication errors. Retry later.")
+
     msg = EmailMessage()
     msg["From"] = smtp.from_email
     msg["To"] = to_email
     msg["Subject"] = subject
     msg.set_content(body or "")
 
-    with smtplib.SMTP(smtp.host, smtp.port, timeout=20) as server:
-        if smtp.use_tls:
-            server.starttls()
-        if smtp.username and smtp.password:
-            server.login(smtp.username, smtp.password)
-        server.send_message(msg)
+    try:
+        with smtplib.SMTP(smtp.host, smtp.port, timeout=20) as server:
+            if smtp.use_tls:
+                server.starttls()
+            if smtp.username and smtp.password:
+                server.login(smtp.username, smtp.password)
+            server.send_message(msg)
+    except smtplib.SMTPAuthenticationError as e:
+        if SMTP_CIRCUIT_BREAKER_ENABLED:
+            _SMTP_BREAKER_OPEN_UNTIL = time.time() + max(5, SMTP_CIRCUIT_BREAKER_S)
+            _SMTP_BREAKER_LAST_LOG = 0.0
+            logger.error(
+                "SMTP_AUTH_FAIL breaker_open_s=%s host=%s err=%s",
+                SMTP_CIRCUIT_BREAKER_S,
+                smtp.host,
+                e,
+            )
+        raise
+    except Exception as e:
+        # Do not open the breaker on all failures; log and bubble up.
+        logger.exception("SMTP_SEND_FAIL host=%s err=%s", smtp.host, e)
+        raise
 
     logger.info("EMAIL_SENT to=%s subject_len=%s", to_email, len(subject or ""))
     return "ok"
-
-
 def make_phone_call(to_number: str, body: str) -> str:
     cfg = _load_twilio()
     client = Client(cfg.account_sid, cfg.auth_token)
