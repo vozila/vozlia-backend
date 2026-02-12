@@ -43,6 +43,8 @@ WEB_SEARCH_EMPTY_SOURCES_MESSAGE = (
     (os.getenv("WEB_SEARCH_EMPTY_SOURCES_MESSAGE") or "").strip()
     or "I couldn't find reliable sources for that right now."
 )
+WEB_SEARCH_DEBUG_PROOF = _env_flag("WEB_SEARCH_DEBUG_PROOF", "0") or _env_flag("VOZLIA_DEBUG_PROOF", "0")
+
 
 def _get_client() -> OpenAI | None:
     global _CLIENT
@@ -132,6 +134,9 @@ def _extract_sources(resp: Any) -> List[WebSearchSource]:
                                     sample_non_dict_has_snippet = hasattr(s, "snippet")
                                 except Exception:
                                     pass
+                            url = getattr(s, "url", None)
+                            if url:
+                                sources.append(WebSearchSource(title=None, url=str(url), snippet=None))
     except Exception:
         return sources
 
@@ -145,8 +150,7 @@ def _extract_sources(resp: Any) -> List[WebSearchSource]:
             seen.add(u)
         dedup.append(s)
     if WEB_SEARCH_DEBUG_PROOF and raw_total > 0:
-        # This log line is intended to *prove* when the SDK returns non-dict ActionSearchSource objects
-        # (e.g. url-only) and our current extractor ignores them, yielding sources=[].
+        # (Proof) log what the SDK returned (dict vs object sources), plus extraction counts.
         logger.info(
             "WEB_SEARCH_SOURCES_EXTRACT raw_total=%s raw_dict=%s raw_non_dict=%s extracted=%s sample_non_dict_type=%s sample_non_dict_url=%s has_title=%s has_snippet=%s",
             raw_total,
