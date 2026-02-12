@@ -8,9 +8,7 @@ from typing import Any, List
 
 from openai import OpenAI
 
-from core.logging import logger
-
-
+from core.logging import logger, env_flag
 @dataclass(frozen=True)
 class WebSearchSource:
     title: str | None
@@ -93,6 +91,14 @@ def _safe_get_output_text(resp: Any) -> str:
 
 def _extract_sources(resp: Any) -> List[WebSearchSource]:
     sources: list[WebSearchSource] = []
+    raw_total = 0
+    raw_dict = 0
+    raw_non_dict = 0
+    sample_non_dict_type: str | None = None
+    sample_non_dict_url: str | None = None
+    sample_non_dict_has_title: bool | None = None
+    sample_non_dict_has_snippet: bool | None = None
+    # NOTE: We intentionally do not alter behavior here; this is proof logging only.
     try:
         output = getattr(resp, "output", None)
         if isinstance(output, list):
@@ -105,8 +111,10 @@ def _extract_sources(resp: Any) -> List[WebSearchSource]:
                     continue
                 srcs = action.get("sources") if isinstance(action, dict) else getattr(action, "sources", None)
                 if isinstance(srcs, list):
+                    raw_total += len(srcs)
                     for s in srcs:
                         if isinstance(s, dict):
+                            raw_dict += 1
                             sources.append(
                                 WebSearchSource(
                                     title=s.get("title"),
@@ -114,6 +122,16 @@ def _extract_sources(resp: Any) -> List[WebSearchSource]:
                                     snippet=s.get("snippet"),
                                 )
                             )
+                        else:
+                            raw_non_dict += 1
+                            if sample_non_dict_type is None:
+                                try:
+                                    sample_non_dict_type = type(s).__name__
+                                    sample_non_dict_url = str(getattr(s, "url", None) or "") or None
+                                    sample_non_dict_has_title = hasattr(s, "title")
+                                    sample_non_dict_has_snippet = hasattr(s, "snippet")
+                                except Exception:
+                                    pass
     except Exception:
         return sources
 
@@ -126,6 +144,21 @@ def _extract_sources(resp: Any) -> List[WebSearchSource]:
         if u:
             seen.add(u)
         dedup.append(s)
+    if WEB_SEARCH_DEBUG_PROOF and raw_total > 0:
+        # This log line is intended to *prove* when the SDK returns non-dict ActionSearchSource objects
+        # (e.g. url-only) and our current extractor ignores them, yielding sources=[].
+        logger.info(
+            "WEB_SEARCH_SOURCES_EXTRACT raw_total=%s raw_dict=%s raw_non_dict=%s extracted=%s sample_non_dict_type=%s sample_non_dict_url=%s has_title=%s has_snippet=%s",
+            raw_total,
+            raw_dict,
+            raw_non_dict,
+            len(dedup),
+            sample_non_dict_type,
+            sample_non_dict_url,
+            sample_non_dict_has_title,
+            sample_non_dict_has_snippet,
+        )
+
     return dedup
 
 
