@@ -8,9 +8,7 @@ from typing import Any, List
 
 from openai import OpenAI
 
-from core.logging import logger
-
-
+from core.logging import logger, env_flag
 @dataclass(frozen=True)
 class WebSearchSource:
     title: str | None
@@ -33,6 +31,18 @@ _CLIENT: OpenAI | None = None
 def web_search_enabled() -> bool:
     return (os.getenv("WEB_SEARCH_ENABLED") or "").strip().lower() in ("1", "true", "yes", "on")
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    v = (os.getenv(name, default) or default).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
+WEB_SEARCH_TOOL_TYPE = (os.getenv("WEB_SEARCH_TOOL_TYPE") or "web_search_preview").strip() or "web_search_preview"
+WEB_SEARCH_REQUIRE_SOURCES = _env_flag("WEB_SEARCH_REQUIRE_SOURCES", "1")
+WEB_SEARCH_MIN_SOURCES = int((os.getenv("WEB_SEARCH_MIN_SOURCES") or "1").strip() or "1")
+WEB_SEARCH_EMPTY_SOURCES_MESSAGE = (
+    (os.getenv("WEB_SEARCH_EMPTY_SOURCES_MESSAGE") or "").strip()
+    or "I couldn't find reliable sources for that right now."
+)
 
 def _get_client() -> OpenAI | None:
     global _CLIENT
@@ -80,31 +90,18 @@ def _safe_get_output_text(resp: Any) -> str:
 
 
 def _extract_sources(resp: Any) -> List[WebSearchSource]:
-    """Extract sources from a Responses API web_search tool call.
-
-    Primary: web_search_call.action.sources (when include=['web_search_call.action.sources'] works).
-    Fallback: message annotations (url_citation), which some SDK versions expose even when
-    action.sources isn't present.
-
-    Returns a de-duplicated list by URL.
-    """
-
     sources: list[WebSearchSource] = []
-
-    def _add(title: Any, url: Any, snippet: Any = None) -> None:
-        try:
-            t = title if isinstance(title, str) else None
-            u = url if isinstance(url, str) else None
-            s = snippet if isinstance(snippet, str) else None
-            if u or t or s:
-                sources.append(WebSearchSource(title=t, url=u, snippet=s))
-        except Exception:
-            return
-
+    raw_total = 0
+    raw_dict = 0
+    raw_non_dict = 0
+    sample_non_dict_type: str | None = None
+    sample_non_dict_url: str | None = None
+    sample_non_dict_has_title: bool | None = None
+    sample_non_dict_has_snippet: bool | None = None
+    # NOTE: We intentionally do not alter behavior here; this is proof logging only.
     try:
         output = getattr(resp, "output", None)
         if isinstance(output, list):
-            # 1) web_search_call.action.sources
             for item in output:
                 itype = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
                 if itype != "web_search_call":
@@ -114,35 +111,29 @@ def _extract_sources(resp: Any) -> List[WebSearchSource]:
                     continue
                 srcs = action.get("sources") if isinstance(action, dict) else getattr(action, "sources", None)
                 if isinstance(srcs, list):
+                    raw_total += len(srcs)
                     for s in srcs:
                         if isinstance(s, dict):
-                            _add(s.get("title"), s.get("url"), s.get("snippet"))
+                            raw_dict += 1
+                            sources.append(
+                                WebSearchSource(
+                                    title=s.get("title"),
+                                    url=s.get("url"),
+                                    snippet=s.get("snippet"),
+                                )
+                            )
                         else:
-                            _add(getattr(s, "title", None), getattr(s, "url", None), getattr(s, "snippet", None))
-
-            # 2) message annotations (url_citation)
-            for item in output:
-                itype = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
-                if itype != "message":
-                    continue
-                content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
-                if not isinstance(content, list):
-                    continue
-                for c in content:
-                    annotations = c.get("annotations") if isinstance(c, dict) else getattr(c, "annotations", None)
-                    if not isinstance(annotations, list):
-                        continue
-                    for a in annotations:
-                        atype = a.get("type") if isinstance(a, dict) else getattr(a, "type", None)
-                        if atype != "url_citation":
-                            continue
-                        if isinstance(a, dict):
-                            _add(a.get("title"), a.get("url"), a.get("snippet"))
-                        else:
-                            _add(getattr(a, "title", None), getattr(a, "url", None), getattr(a, "snippet", None))
+                            raw_non_dict += 1
+                            if sample_non_dict_type is None:
+                                try:
+                                    sample_non_dict_type = type(s).__name__
+                                    sample_non_dict_url = str(getattr(s, "url", None) or "") or None
+                                    sample_non_dict_has_title = hasattr(s, "title")
+                                    sample_non_dict_has_snippet = hasattr(s, "snippet")
+                                except Exception:
+                                    pass
     except Exception:
-        # Best-effort only.
-        pass
+        return sources
 
     dedup: list[WebSearchSource] = []
     seen: set[str] = set()
@@ -153,7 +144,23 @@ def _extract_sources(resp: Any) -> List[WebSearchSource]:
         if u:
             seen.add(u)
         dedup.append(s)
+    if WEB_SEARCH_DEBUG_PROOF and raw_total > 0:
+        # This log line is intended to *prove* when the SDK returns non-dict ActionSearchSource objects
+        # (e.g. url-only) and our current extractor ignores them, yielding sources=[].
+        logger.info(
+            "WEB_SEARCH_SOURCES_EXTRACT raw_total=%s raw_dict=%s raw_non_dict=%s extracted=%s sample_non_dict_type=%s sample_non_dict_url=%s has_title=%s has_snippet=%s",
+            raw_total,
+            raw_dict,
+            raw_non_dict,
+            len(dedup),
+            sample_non_dict_type,
+            sample_non_dict_url,
+            sample_non_dict_has_title,
+            sample_non_dict_has_snippet,
+        )
+
     return dedup
+
 
 def run_web_search(
     query: str,
@@ -189,21 +196,45 @@ def run_web_search(
 
     t0 = time.perf_counter()
     try:
-        resp = client.responses.create(
-            model=chosen_model,
-            input=[{"role": "user", "content": q}],
-            tools=[{"type": "web_search"}],
-            tool_choice={"type": "web_search"},
-            include=["web_search_call.action.sources"],
-            timeout=timeout_s,
-        )
-    except TypeError:
-        resp = client.responses.create(
-            model=chosen_model,
-            input=[{"role": "user", "content": q}],
-            tools=[{"type": "web_search"}],
-            include=["web_search_call.action.sources"],
-        )
+        resp = None
+        last_err: Exception | None = None
+        # Try configured tool type first, then fall back between known variants.
+        tool_types: list[str] = []
+        for tt in [WEB_SEARCH_TOOL_TYPE, 'web_search_preview', 'web_search']:
+            if tt and tt not in tool_types:
+                tool_types.append(tt)
+
+        for tt in tool_types:
+            try:
+                resp = client.responses.create(
+                    model=chosen_model,
+                    input=[{'role': 'user', 'content': q}],
+                    tools=[{'type': tt}],
+                    tool_choice={'type': tt},
+                    include=['web_search_call.action.sources'],
+                    timeout=timeout_s,
+                )
+                break
+            except TypeError:
+                # Some SDK versions do not accept tool_choice/timeout.
+                try:
+                    resp = client.responses.create(
+                        model=chosen_model,
+                        input=[{'role': 'user', 'content': q}],
+                        tools=[{'type': tt}],
+                        tool_choice={'type': tt},
+                        include=['web_search_call.action.sources'],
+                    )
+                    break
+                except TypeError as e:
+                    last_err = e
+                    continue
+            except Exception as e:
+                last_err = e
+                continue
+
+        if resp is None:
+            raise last_err or RuntimeError('web_search_failed')
     except Exception as e:
         logger.exception("WEB_SEARCH_FAIL query=%r err=%s", q, e)
         return WebSearchResult(query=q, answer="I couldn't complete the web search due to an error.", sources=[], model=chosen_model)
@@ -215,5 +246,10 @@ def run_web_search(
     if max_sources and len(sources) > max_sources:
         sources = sources[:max_sources]
 
+
+    # Grounding guard: if we cannot produce any sources, do NOT return a freeform answer.
+    if WEB_SEARCH_REQUIRE_SOURCES and len(sources) < max(0, WEB_SEARCH_MIN_SOURCES):
+        logger.warning("WEB_SEARCH_NO_SOURCES q_len=%s model=%s", len(q), chosen_model)
+        return WebSearchResult(query=q, answer=WEB_SEARCH_EMPTY_SOURCES_MESSAGE, sources=[], latency_ms=dt_ms, model=chosen_model)
     logger.info("WEB_SEARCH_OK dt_ms=%s q_len=%s sources=%s", round(dt_ms, 1), len(q), len(sources))
     return WebSearchResult(query=q, answer=(answer or "").strip(), sources=sources, latency_ms=dt_ms, model=chosen_model)
